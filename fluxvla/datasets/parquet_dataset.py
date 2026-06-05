@@ -36,7 +36,8 @@ class ParquetDataset(Dataset):
                  statistic_name: str = 'private',
                  window_start_idx: int = 1,
                  frame_window_size: int = 1,
-                 expose_index: bool = False) -> None:
+                 expose_index: bool = False,
+                 task_indices: List[int] = None) -> None:
         """Initialize the Parquet dataset.
 
         Args:
@@ -69,6 +70,10 @@ class ParquetDataset(Dataset):
                 Defaults to False.
         """
         super().__init__()
+
+        self.task_indices = (
+            set(task_indices) if task_indices is not None else None)
+
         self.action_window_size = action_window_size
         if isinstance(data_root_path, str):
             data_root_path = [data_root_path]
@@ -82,6 +87,7 @@ class ParquetDataset(Dataset):
         all_tasks = []
         all_episodes = []
         info_list = []
+        task_indices = self.task_indices
 
         for root in meta_root:
             info_path = os.path.join(root, 'info.json')
@@ -97,7 +103,14 @@ class ParquetDataset(Dataset):
                     os.path.join(root, 'episodes_stats.jsonl'),
                     'r',
                     encoding='utf-8') as f:
-                all_stats.extend([json.loads(line) for line in f])
+                stats = [json.loads(line) for line in f]
+                if task_indices is not None:
+                    stats = [
+                        stat for stat in stats
+                        if int(stat['stats']['task_index']['min'][0])
+                        in task_indices
+                    ]
+                all_stats.extend(stats)
 
             tasks_path = os.path.join(root, 'tasks.jsonl')
             assert os.path.exists(tasks_path), \
@@ -120,9 +133,21 @@ class ParquetDataset(Dataset):
         dataset_sizes = []  # Record the size of each dataset
         for root in data_root:
             hf_dataset = load_dataset('parquet', data_dir=root, split='train')
+            if task_indices is not None:
+                hf_dataset = hf_dataset.filter(
+                    lambda sample: sample['task_index'] in task_indices)
+                if len(hf_dataset) == 0:
+                    raise ValueError(
+                        f'No parquet samples found for task_indices='
+                        f'{sorted(task_indices)} in {root}')
             dataset_sizes.append(len(hf_dataset))
             datasets.append(hf_dataset)
+        if task_indices is not None and not all_stats:
+            raise ValueError(
+                f'No episode statistics found for task_indices='
+                f'{sorted(task_indices)}')
         hf_dataset = concatenate_datasets(datasets)
+
         # Compute cumulative sizes for fast index lookup
         self.dataset_cumulative_sizes = np.cumsum([0] + dataset_sizes)
         self.dataset = hf_dataset

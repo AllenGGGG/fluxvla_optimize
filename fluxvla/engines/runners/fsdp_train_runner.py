@@ -267,8 +267,8 @@ class FSDPTrainRunner(BaseTrainRunner):
                 self._cleanup_old_checkpoints(checkpoint_dir)
 
     def run_setup(self, n_train_examples: int) -> None:
-        self.vla.from_pretrained()
         torch.cuda.set_device(device_id := self.device_id)  # noqa: F841
+        self.vla.from_pretrained()
         torch.cuda.empty_cache()
 
         is_no_shard = (

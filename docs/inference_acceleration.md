@@ -100,6 +100,81 @@ PI0.5 uses a unified inference model class `PI05FlowMatchingInference` that repl
 
 ![VLA inference speedup](../assets/VLA_speedup.png)
 
+### Local PI0.5 Speed Comparison
+
+Use `scripts/benchmark_pi05_inference_speed.py` to reproduce a model-side
+baseline-vs-accelerated comparison on your own GPU. The script benchmarks only
+`predict_action`, excluding LIBERO environment stepping, video writing, and
+dataset I/O.
+
+```bash
+export CUDA_VISIBLE_DEVICES=4
+
+python scripts/benchmark_pi05_inference_speed.py \
+  --ckpt-path checkpoints/pi05_paligemma_libero_10_full_finetune_bs64/pi05_paligemma_libero_10_full_finetune_bs64/checkpoints/step-038064-epoch-24-loss=0.0170.safetensors \
+  --mode both \
+  --warmup-iters 10 \
+  --bench-iters 100
+```
+
+The benchmark writes JSON, CSV, and Markdown summaries under the checkpoint's
+`benchmarks/` directory by default. The Markdown report includes mean latency,
+p50/p90/p99 latency, inference Hz, cold-start latency, peak allocated GPU
+memory, baseline-vs-accelerated speedup, and output-difference statistics.
+
+For a three-GPU concurrent-serving throughput comparison, expose three GPUs and
+set `--num-workers 3`:
+
+```bash
+export CUDA_VISIBLE_DEVICES=5,6,7
+
+python scripts/benchmark_pi05_inference_speed.py \
+  --ckpt-path checkpoints/pi05_paligemma_libero_10_full_finetune_bs64/pi05_paligemma_libero_10_full_finetune_bs64/checkpoints/step-038064-epoch-24-loss=0.0170.safetensors \
+  --mode both \
+  --num-workers 3 \
+  --warmup-iters 10 \
+  --bench-iters 100 \
+  --tag 3gpu
+```
+
+In multi-worker mode, each visible GPU runs one independent model replica. The
+report separates total throughput (`Total Hz`) from average per-GPU throughput
+(`Per-worker Hz`).
+
+To generate one combined speed + LIBERO success-rate report, use
+`scripts/compare_pi05_speed_success.py`. The quick command below uses GPU 4 for
+single-GPU speed and success evaluation, and GPUs 5,6,7 for three-GPU
+throughput:
+
+```bash
+python scripts/compare_pi05_speed_success.py \
+  --single-gpus 4 \
+  --multi-gpus 5,6,7 \
+  --success-gpus 4 \
+  --speed-warmup-iters 3 \
+  --speed-bench-iters 10 \
+  --success-trials-per-task 1 \
+  --tag quick_speed_success
+```
+
+For a formal comparison, increase the sample counts:
+
+```bash
+python scripts/compare_pi05_speed_success.py \
+  --single-gpus 4 \
+  --multi-gpus 5,6,7 \
+  --success-gpus 4 \
+  --speed-warmup-iters 10 \
+  --speed-bench-iters 100 \
+  --success-trials-per-task 50 \
+  --success-seeds 7 \
+  --tag formal_speed_success
+```
+
+The combined report includes speed metrics and success rate in the same table.
+It keeps latency, throughput, and task success separate so the acceleration
+result is not conflated with LIBERO environment dynamics.
+
 ### On A100 Device (Inference Frequency)
 
 | Model | Baseline (Hz) | Accelerated (Hz) | Speedup |

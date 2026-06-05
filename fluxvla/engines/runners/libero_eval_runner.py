@@ -27,9 +27,6 @@ from libero.libero import benchmark
 from safetensors.torch import load_file
 
 from fluxvla.engines.utils import initialize_overwatch
-from fluxvla.engines.utils.eval_utils import (get_libero_dummy_action,
-                                              get_libero_env,
-                                              save_rollout_video)
 from fluxvla.engines.utils.name_map import str_to_dtype
 from fluxvla.engines.utils.torch_utils import set_seed_everywhere
 from ..utils.root import RUNNERS
@@ -81,6 +78,7 @@ class LiberoEvalRunner:
                  num_trials_per_task: int = 50,
                  num_steps_wait: int = 10,
                  mixed_precision_dtype: str = 'bf16',
+                 eval_task_ids=None,
                  enable_mixed_precision_training: bool = True):
         from fluxvla.engines import (build_dataset_from_cfg,
                                      build_transform_from_cfg,
@@ -131,6 +129,7 @@ class LiberoEvalRunner:
         self.cfg = cfg
         self.seed = seed
         self.ckpt_path = ckpt_path
+        self.eval_task_ids = eval_task_ids
         data_stat_path = os.path.join(
             Path(self.ckpt_path).resolve().parent.parent,
             'dataset_statistics.json')  # noqa: E501
@@ -182,14 +181,37 @@ class LiberoEvalRunner:
 
     def run(self):
         """Run the evaluation process."""
+        from fluxvla.engines.utils.eval_utils import (
+            get_libero_dummy_action, get_libero_env, save_rollout_video)
+
         benchmark_dict = benchmark.get_benchmark_dict()
         task_suite = benchmark_dict[self.task_suite_name]()
         num_tasks_in_suite = task_suite.n_tasks
-        global_episodes = list(
-            range(num_tasks_in_suite * self.num_trials_per_task))
+
+        if self.eval_task_ids is None:
+            eval_task_ids = list(range(num_tasks_in_suite))
+        else:
+            eval_task_ids = list(self.eval_task_ids)
+            invalid_task_ids = [
+                task_id for task_id in eval_task_ids
+                if task_id < 0 or task_id >= num_tasks_in_suite
+            ]
+            if invalid_task_ids:
+                raise ValueError(
+                    f'eval_task_ids contains invalid task ids '
+                    f'{invalid_task_ids}; valid range is '
+                    f'0..{num_tasks_in_suite - 1}')
+
+        global_episodes = [
+            task_id * self.num_trials_per_task + trial_id
+            for task_id in eval_task_ids
+            for trial_id in range(self.num_trials_per_task)
+        ]
         overwatch.info(f'Task suite: {self.task_suite_name}')
-        overwatch.info(f'Running evaluation on {num_tasks_in_suite} tasks '
+        overwatch.info(f'Running evaluation on {len(eval_task_ids)} tasks '
                        f'with {self.num_trials_per_task} trials each.')
+        if len(eval_task_ids) != num_tasks_in_suite:
+            overwatch.info(f'Evaluating task ids: {eval_task_ids}')
         overwatch.info(f'Using model family: {self.model_family}')
         overwatch.info(f'Using resize size: {self.resize_size}')
         overwatch.info(f'Using evaluation chunk size: {self.eval_chunk_size}')

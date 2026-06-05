@@ -415,6 +415,17 @@ class LiberoPromptFromInputs:
 
 
 @TRANSFORMS.register_module()
+class NoLanguagePrompt:
+    """Provide empty language inputs for vision-action ablations."""
+
+    def __call__(self, inputs: Dict) -> Dict:
+        inputs['prompt'] = ''
+        inputs['lang_tokens'] = np.empty((0,), dtype=np.int64)
+        inputs['lang_masks'] = np.empty((0,), dtype=np.bool_)
+        return inputs
+
+
+@TRANSFORMS.register_module()
 class TokenizeText:
     """Tokenize task text for CLIP-based SARM training and inference."""
 

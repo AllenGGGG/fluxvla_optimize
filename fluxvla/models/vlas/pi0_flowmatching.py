@@ -107,6 +107,7 @@ class PI0FlowMatching(BaseVLA):
                  max_action_dim: int = 7,
                  ori_action_dim: int = None,
                  num_steps: int = 10,
+                 use_language: bool = True,
                  rtc_training_config: Optional[Dict] = None,
                  **kwargs):
         super(PI0FlowMatching, self).__init__(
@@ -168,6 +169,7 @@ class PI0FlowMatching(BaseVLA):
         self.ori_action_dim = ori_action_dim
         self.num_steps = num_steps
         self.rtc_training_config = rtc_training_config
+        self.use_language = use_language
 
     def to_bfloat16(self):
         for name, param in self.named_parameters():
@@ -230,18 +232,22 @@ class PI0FlowMatching(BaseVLA):
 
             # Create attention masks so that image tokens attend to each other
             attn_masks += [0] * (num_img_embs // len(img_masks))
-        lang_emb = self.llm_backbone.embed_tokens(lang_tokens)
 
-        # Normalize language embeddings
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+        if (self.use_language and lang_tokens is not None
+                and lang_tokens.shape[1] > 0):
+            lang_emb = self.llm_backbone.embed_tokens(lang_tokens)
 
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
+            # Normalize language embeddings
+            lang_emb_dim = lang_emb.shape[-1]
+            lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
-        # full attention between image and language inputs
-        num_lang_embs = lang_emb.shape[1]
-        attn_masks += [0] * num_lang_embs
+            embs.append(lang_emb)
+            pad_masks.append(lang_masks)
+
+            # full attention between image and language inputs
+            num_lang_embs = lang_emb.shape[1]
+            attn_masks += [0] * num_lang_embs
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         attn_masks = torch.tensor(
