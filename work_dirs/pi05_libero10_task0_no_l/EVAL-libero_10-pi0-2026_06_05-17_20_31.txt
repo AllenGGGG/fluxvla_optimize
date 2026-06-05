@@ -1,0 +1,80 @@
+Evaluating Task 4, Trial 0
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 1...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_20_56--episode=200--success=False--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: False
+# episodes completed so far: 5.0
+# successes: 1.0 (20.0%)
+Evaluating Task 4, Trial 5
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 6...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_21_19--episode=205--success=False--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: False
+# episodes completed so far: 10.0
+# successes: 2.0 (20.0%)
+Evaluating Task 4, Trial 10
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 11...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_21_31--episode=210--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: True
+# episodes completed so far: 15.0
+# successes: 7.0 (46.7%)
+Evaluating Task 4, Trial 15
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 16...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_21_45--episode=215--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: True
+# episodes completed so far: 20.0
+# successes: 12.0 (60.0%)
+Evaluating Task 4, Trial 20
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 21...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_21_56--episode=220--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: True
+# episodes completed so far: 25.0
+# successes: 17.0 (68.0%)
+Evaluating Task 4, Trial 25
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 26...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_22_19--episode=225--success=False--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: False
+# episodes completed so far: 30.0
+# successes: 18.0 (60.0%)
+Evaluating Task 4, Trial 30
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 31...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_22_31--episode=230--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: True
+# episodes completed so far: 35.0
+# successes: 22.0 (62.9%)
+Evaluating Task 4, Trial 35
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 36...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_22_54--episode=235--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: True
+# episodes completed so far: 40.0
+# successes: 26.0 (65.0%)
+Evaluating Task 4, Trial 40
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 41...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_23_15--episode=240--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: True
+# episodes completed so far: 45.0
+# successes: 31.0 (68.9%)
+Evaluating Task 4, Trial 45
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 46...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_no_l/rollouts/2026_06_05/2026_06_05-17_23_35--episode=245--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Success: True
+# episodes completed so far: 50.0
+# successes: 34.0 (68.0%)
