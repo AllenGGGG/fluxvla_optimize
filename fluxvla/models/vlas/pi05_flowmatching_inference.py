@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 
@@ -532,11 +533,49 @@ class PI05FlowMatchingInference(PI05FlowMatching):
         pixel_values = images.unflatten(1, (-1, 3))[0]
         images_nhwc = pixel_values.permute(0, 2, 3, 1).contiguous().bfloat16()
 
-        prompt_len = (
-            int(lang_masks[0].sum().item())
-            if lang_masks is not None else lang_tokens.shape[1])
-        lang_emb = self.llm_backbone.embed_tokens(lang_tokens[0, :prompt_len])
-        lang_emb = (lang_emb * math.sqrt(lang_emb.shape[-1])).bfloat16()
+        if self.use_language and lang_tokens is not None:
+            prompt_len = (
+                int(lang_masks[0].sum().item())
+                if lang_masks is not None else lang_tokens.shape[1])
+            lang_emb = self.llm_backbone.embed_tokens(
+                lang_tokens[0, :prompt_len])
+            lang_emb = (lang_emb * math.sqrt(lang_emb.shape[-1])).bfloat16()
+        else:
+            prompt_len = 0
+            lang_emb = torch.empty(
+                0,
+                self.llm_backbone.config.hidden_size,
+                dtype=torch.bfloat16,
+                device=states.device)
+
+        if os.environ.get('FLUXVLA_DEBUG_TOKEN_COUNTS') == '1':
+            debug_count = getattr(self, '_debug_token_count_prints', 0) + 1
+            self._debug_token_count_prints = debug_count
+            debug_limit_raw = os.environ.get(
+                'FLUXVLA_DEBUG_TOKEN_COUNTS_LIMIT')
+            debug_limit = (
+                int(debug_limit_raw) if debug_limit_raw else None)
+            if debug_limit is None or debug_count <= debug_limit:
+                visual_patch_tokens = self.num_views * 256
+                valid_encoder_len = visual_patch_tokens + prompt_len
+                lang_mask_sum = None
+                if lang_masks is not None:
+                    lang_mask_sum = int(lang_masks[0].sum().item())
+                lang_tokens_shape = (
+                    tuple(lang_tokens.shape)
+                    if lang_tokens is not None else None)
+                print(
+                    '[PI05TokenDebug] '
+                    f'call={debug_count} '
+                    f'use_language={self.use_language} '
+                    f'visual_patch_tokens={visual_patch_tokens} '
+                    f'prompt_len={prompt_len} '
+                    f'language_embedding_rows={lang_emb.shape[0]} '
+                    f'valid_encoder_len={valid_encoder_len} '
+                    f'graph_encoder_seq_len={self._encoder_seq_len} '
+                    f'lang_tokens_shape={lang_tokens_shape} '
+                    f'lang_mask_sum={lang_mask_sum}',
+                    flush=True)
 
         chunk_size = self.n_action_steps
         if noise is None:
