@@ -110,6 +110,29 @@ def matmul_split_k_bias_res(x, weight, bias, res, out, buf, num_patches,
 
 
 # ---------------------------------------------------------------------------
+# Visual token reduction before the LLM encoder
+# ---------------------------------------------------------------------------
+
+
+def pixel_unshuffle_token_reduce(x, out, grid_size, downscale_factor):
+    """Reduce [view, H*W, C] ViT tokens with PixelUnshuffle + mean."""
+    if downscale_factor == 1:
+        out.copy_(x)
+        return
+
+    num_views, _, hidden = x.shape
+    out_grid = grid_size // downscale_factor
+    y = x.view(num_views, grid_size, grid_size, hidden)
+    y = y.permute(0, 3, 1, 2).contiguous()
+    y = F.pixel_unshuffle(y, downscale_factor)
+    y = y.view(num_views, hidden, downscale_factor * downscale_factor,
+               out_grid, out_grid)
+    y = y.mean(dim=2)
+    out.copy_(y.permute(0, 2, 3, 1).reshape(num_views,
+                                            out_grid * out_grid, hidden))
+
+
+# ---------------------------------------------------------------------------
 # LayerNorm + matmul + bias (e.g. vision→encoder projection)
 # ---------------------------------------------------------------------------
 

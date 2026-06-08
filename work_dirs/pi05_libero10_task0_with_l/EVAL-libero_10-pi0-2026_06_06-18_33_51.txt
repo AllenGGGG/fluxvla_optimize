@@ -1,0 +1,50 @@
+Evaluating Task 4, Trial 1
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 2...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_34_07--episode=201--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Evaluating Task 4, Trial 6
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 7...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_34_27--episode=206--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Evaluating Task 4, Trial 11
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 12...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_34_52--episode=211--success=False--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Evaluating Task 4, Trial 16
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 17...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_35_06--episode=216--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Evaluating Task 4, Trial 21
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 22...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_35_21--episode=221--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Evaluating Task 4, Trial 26
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 27...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_35_47--episode=226--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Evaluating Task 4, Trial 31
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 32...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_36_01--episode=231--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Evaluating Task 4, Trial 36
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 37...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_36_15--episode=236--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Evaluating Task 4, Trial 41
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 42...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_36_39--episode=241--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4
+Evaluating Task 4, Trial 46
+
+Task: put the white mug on the left plate and put the yellow and white mug on the right plate
+Starting episode 47...
+Saved rollout MP4 at path /home/guohao/FluxVLA/work_dirs/pi05_libero10_task0_with_l/rollouts/2026_06_06/2026_06_06-18_37_04--episode=246--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4

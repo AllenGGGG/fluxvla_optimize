@@ -1,0 +1,4 @@
+{
+  "tokenizer_class": "PaligemmaTokenizer",
+  "spm_file": "tokenizer.model"
+}

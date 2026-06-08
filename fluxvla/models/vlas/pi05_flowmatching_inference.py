@@ -13,6 +13,7 @@ from fluxvla.ops.atomic_ops import (AttnMultiKey, adarms_norm_style_proj,
                                     matmul_bias_small, matmul_gate,
                                     matmul_qkv_rope, matmul_res,
                                     matmul_res_gate, matmul_split_k_bias_res,
+                                    pixel_unshuffle_token_reduce,
                                     rms_matmul_gate, rms_matmul_qkv_rope)
 from fluxvla.ops.triton.attention_triton_ops import (
     matmul_abT_scale, softmax_kernel_masklen, softmax_kernel_prefix_suffix)
@@ -70,16 +71,29 @@ def vision_encoder(weights, buffers, num_views, num_vit_layers=27):
 def transformer_encoder(weights,
                         buffers,
                         encoder_seq_len,
-                        num_encoder_layers=18):
+                        num_encoder_layers=18,
+                        visual_tokens_per_view=256,
+                        visual_grid_size=16,
+                        visual_token_downscale_factor=1):
+    if visual_token_downscale_factor > 1:
+        pixel_unshuffle_token_reduce(
+            buffers['vision_x'], buffers['vision_projector_x'],
+            visual_grid_size, visual_token_downscale_factor)
+        vision_x = buffers['vision_projector_x']
+        vision_x_norm = buffers['vision_projector_x_norm']
+    else:
+        vision_x = buffers['vision_x']
+        vision_x_norm = buffers['vision_x_norm']
+
     layer_norm_matmul_bias(
-        buffers['vision_x'],
+        vision_x,
         weights['vision_final_norm_w'],
         weights['vision_final_norm_b'],
         weights['encoder_multi_modal_projector_w'],
         weights['encoder_multi_modal_projector_b'],
         buffers['encoder_x'],
-        buffers['vision_x_norm'],
-        num_patches=256,
+        vision_x_norm,
+        num_patches=visual_tokens_per_view,
         in_features=1152,
         out_features=2048,
         eps=1e-5)
@@ -320,9 +334,14 @@ def pi05_model(weights,
                num_vit_layers=27,
                num_encoder_layers=18,
                num_decoder_layers=18,
-               num_steps=10):
+               num_steps=10,
+               visual_tokens_per_view=256,
+               visual_grid_size=16,
+               visual_token_downscale_factor=1):
     vision_encoder(weights, buffers, num_views, num_vit_layers)
-    transformer_encoder(weights, buffers, encoder_seq_len, num_encoder_layers)
+    transformer_encoder(weights, buffers, encoder_seq_len, num_encoder_layers,
+                        visual_tokens_per_view, visual_grid_size,
+                        visual_token_downscale_factor)
     transformer_decoder(weights, buffers, encoder_seq_len, num_decoder_layers,
                         num_steps)
 
@@ -364,6 +383,7 @@ class PI05FlowMatchingInference(PI05FlowMatching):
 
         img = self._vit_image_size
         np_ = self._vit_num_patches
+        vtpv = self._visual_tokens_per_view
         vh = self._vit_hidden
         vi = self._vit_intermediate
         eh = self._enc_hidden
@@ -386,6 +406,10 @@ class PI05FlowMatchingInference(PI05FlowMatching):
             torch.zeros(nv, np_, 3 * vh, dtype=bf, device=dev),
             'vision_hidden':
             torch.zeros(nv, np_, vi, dtype=bf, device=dev),
+            'vision_projector_x':
+            torch.zeros(nv, vtpv, vh, dtype=bf, device=dev),
+            'vision_projector_x_norm':
+            torch.zeros(nv, vtpv, vh, dtype=bf, device=dev),
             'vision_x_split_k_buf':
             torch.zeros(nv * np_ * vh * 4, dtype=torch.float32, device=dev),
             'encoder_rope_weights':
@@ -443,7 +467,9 @@ class PI05FlowMatchingInference(PI05FlowMatching):
         }
 
     def _init_rope_table(self):
-        prefix_alloc = self.num_views * 256 + self._max_prompt_len
+        prefix_alloc = (
+            self.num_views * self._visual_tokens_per_view +
+            self._max_prompt_len)
         max_pos = prefix_alloc - 1 + self._decoder_seq_len
         position_ids = torch.arange(max_pos + 1, device='cuda')
         inv_freq = 1.0 / (10000**(
@@ -457,7 +483,8 @@ class PI05FlowMatchingInference(PI05FlowMatching):
             self._rope_table[:prefix_alloc])
 
     def _get_decoder_rope_weights(self, prompt_len):
-        start = self.num_views * 256 + prompt_len - 1
+        start = (
+            self.num_views * self._visual_tokens_per_view + prompt_len - 1)
         end = start + self._decoder_seq_len
         return self._rope_table[start:end]
 
@@ -465,7 +492,9 @@ class PI05FlowMatchingInference(PI05FlowMatching):
         pi05_model(self._triton_weights, self._triton_bufs, self.num_views,
                    self._encoder_seq_len, self._num_vit_layers,
                    self._num_encoder_layers, self._num_decoder_layers,
-                   self._num_steps)
+                   self._num_steps, self._visual_tokens_per_view,
+                   self._visual_grid_size,
+                   self._visual_token_downscale_factor)
 
     def _build_cuda_graph(self):
         print('[Triton Inference] Recording CUDA Graph ...')
@@ -498,7 +527,7 @@ class PI05FlowMatchingInference(PI05FlowMatching):
             Denoised actions [chunk_size, 32] bfloat16.
         """
         self._triton_bufs['observation_images_normalized'].copy_(images_nhwc)
-        start = self.num_views * 256
+        start = self.num_views * self._visual_tokens_per_view
         self._triton_bufs['encoder_x'][start:start +
                                        prompt_len].copy_(prompt_embeds)
         self._triton_bufs['valid_encoder_len'].fill_(start + prompt_len)
@@ -556,7 +585,8 @@ class PI05FlowMatchingInference(PI05FlowMatching):
             debug_limit = (
                 int(debug_limit_raw) if debug_limit_raw else None)
             if debug_limit is None or debug_count <= debug_limit:
-                visual_patch_tokens = self.num_views * 256
+                visual_patch_tokens = (
+                    self.num_views * self._visual_tokens_per_view)
                 valid_encoder_len = visual_patch_tokens + prompt_len
                 lang_mask_sum = None
                 if lang_masks is not None:
@@ -662,6 +692,16 @@ class PI05FlowMatchingInference(PI05FlowMatching):
         vit_cfg = self.vision_backbone.vision.vision_model.config
         self._vit_image_size = vit_cfg.image_size
         self._vit_num_patches = (vit_cfg.image_size // vit_cfg.patch_size)**2
+        self._visual_grid_size = vit_cfg.image_size // vit_cfg.patch_size
+        self._visual_token_downscale_factor = int(
+            getattr(self.projector, 'downscale_factor', 1))
+        if self._visual_grid_size % self._visual_token_downscale_factor != 0:
+            raise ValueError(
+                'visual grid size must be divisible by '
+                'visual_token_downscale_factor')
+        self._visual_tokens_per_view = (
+            self._visual_grid_size //
+            self._visual_token_downscale_factor)**2
         self._vit_hidden = vit_cfg.hidden_size
         self._vit_intermediate = vit_cfg.intermediate_size
         self._num_vit_layers = vit_cfg.num_hidden_layers
@@ -685,7 +725,7 @@ class PI05FlowMatchingInference(PI05FlowMatching):
         self._action_dim = self.max_action_dim
 
         self._encoder_seq_len = (
-            num_views * self._vit_num_patches + max_prompt_len)
+            num_views * self._visual_tokens_per_view + max_prompt_len)
         self._decoder_seq_len = chunk_size
 
         self._init_buffers()

@@ -1,0 +1,366 @@
+{
+  "eval": {
+    "dataset": {
+      "transforms": [
+        {
+          "img_keys": [
+            "agentview_image",
+            "robot0_eye_in_hand_image"
+          ],
+          "type": "ProcessLiberoEvalInputs"
+        },
+        {
+          "image_resize_strategy": "resize-naive",
+          "input_sizes": [
+            [
+              3,
+              224,
+              224
+            ],
+            [
+              3,
+              224,
+              224
+            ]
+          ],
+          "means": [
+            [
+              123.515625,
+              116.04492188,
+              103.59375
+            ],
+            [
+              123.515625,
+              116.04492188,
+              103.59375
+            ]
+          ],
+          "stds": [
+            [
+              58.27148438,
+              57.02636719,
+              57.27539062
+            ],
+            [
+              58.27148438,
+              57.02636719,
+              57.27539062
+            ]
+          ],
+          "type": "TransformImage"
+        },
+        {
+          "tokenizer": {
+            "type": "PaligemmaTokenizer"
+          },
+          "type": "LiberoPromptFromInputs",
+          "use_conversation": false
+        },
+        {
+          "gripper_key": "robot0_gripper_qpos",
+          "norm_type": "mean_std",
+          "out_key": "states",
+          "pos_key": "robot0_eef_pos",
+          "quat_key": "robot0_eef_quat",
+          "state_dim": 32,
+          "type": "LiberoProprioFromInputs"
+        }
+      ],
+      "type": "LiberoParquetEvalDataset"
+    },
+    "denormalize_action": {
+      "action_dim": 7,
+      "norm_type": "mean_std",
+      "type": "DenormalizeLiberoAction"
+    },
+    "eval_chunk_size": 10,
+    "eval_task_ids": [
+      4
+    ],
+    "model_family": "pi0",
+    "num_steps_wait": 10,
+    "num_trials_per_task": 50,
+    "resize_size": 224,
+    "seed": 7,
+    "task_suite_name": "libero_10",
+    "type": "LiberoEvalRunner"
+  },
+  "model": {
+    "action_in_proj": {
+      "in_dim": 32,
+      "out_dim": 1024,
+      "type": "LinearProjector"
+    },
+    "action_out_proj": {
+      "in_dim": 1024,
+      "out_dim": 32,
+      "type": "LinearProjector"
+    },
+    "freeze_llm_backbone": false,
+    "freeze_vision_backbone": false,
+    "llm_backbone": {
+      "adarms_cond_dim": null,
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "bos_token_id": 2,
+      "eos_token_id": 1,
+      "head_dim": 256,
+      "hidden_act": "gelu_pytorch_tanh",
+      "hidden_activation": "gelu_pytorch_tanh",
+      "hidden_size": 2048,
+      "initializer_range": 0.02,
+      "intermediate_size": 16384,
+      "max_position_embeddings": 8192,
+      "model_type": "gemma",
+      "num_attention_heads": 8,
+      "num_hidden_layers": 18,
+      "num_key_value_heads": 1,
+      "rms_norm_eps": 1e-06,
+      "rope_theta": 10000.0,
+      "torch_dtype": "float32",
+      "type": "ConditionGemmaModel",
+      "use_cache": true,
+      "vocab_size": 257152
+    },
+    "llm_expert": {
+      "adarms_cond_dim": 1024,
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "bos_token_id": 2,
+      "eos_token_id": 1,
+      "head_dim": 256,
+      "hidden_act": "gelu_pytorch_tanh",
+      "hidden_activation": "gelu_pytorch_tanh",
+      "hidden_size": 1024,
+      "initializer_range": 0.02,
+      "intermediate_size": 4096,
+      "max_position_embeddings": 8192,
+      "model_type": "gemma",
+      "num_attention_heads": 8,
+      "num_hidden_layers": 18,
+      "num_key_value_heads": 1,
+      "pad_token_id": 0,
+      "rms_norm_eps": 1e-06,
+      "rope_theta": 10000.0,
+      "torch_dtype": "float32",
+      "transformers_version": "4.48.1",
+      "type": "ConditionGemmaModel",
+      "use_adarms": true,
+      "use_cache": true,
+      "vocab_size": 257152
+    },
+    "max_action_dim": 32,
+    "n_action_steps": 10,
+    "name_mapping": {
+      "action_in_proj.projector": "action_in_proj",
+      "action_out_proj.projector": "action_out_proj",
+      "llm_backbone": "paligemma_with_expert.paligemma.model.language_model",
+      "llm_backbone.embed_tokens": "paligemma_with_expert.paligemma.lm_head",
+      "llm_expert": "paligemma_with_expert.gemma_expert.model",
+      "projector.projector": "paligemma_with_expert.paligemma.model.multi_modal_projector.linear",
+      "time_mlp_in.projector": "time_mlp_in",
+      "time_mlp_out.projector": "time_mlp_out",
+      "vision_backbone.vision": "paligemma_with_expert.paligemma.model.vision_tower"
+    },
+    "ori_action_dim": 7,
+    "pretrained_name_or_path": "./checkpoints/pi05_base/model.safetensors",
+    "proj_width": 1024,
+    "projector": {
+      "downscale_factor": 2,
+      "grid_size": 16,
+      "in_dim": 1152,
+      "out_dim": 2048,
+      "reduction": "mean",
+      "type": "PixelUnshuffleProjector"
+    },
+    "time_mlp_in": {
+      "in_dim": 1024,
+      "out_dim": 1024,
+      "type": "LinearProjector"
+    },
+    "time_mlp_out": {
+      "in_dim": 1024,
+      "out_dim": 1024,
+      "type": "LinearProjector"
+    },
+    "type": "PI05FlowMatching",
+    "use_language": true,
+    "vision_backbone": {
+      "type": "SigLIPViTBackbone",
+      "vision_backbone_id": "siglip_224",
+      "vision_config": {
+        "attention_dropout": 0.0,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1152,
+        "image_size": 224,
+        "intermediate_size": 4304,
+        "layer_norm_eps": 1e-06,
+        "model_type": "siglip_vision_model",
+        "num_attention_heads": 16,
+        "num_channels": 3,
+        "num_hidden_layers": 27,
+        "patch_size": 14,
+        "projection_dim": 2048,
+        "projector_hidden_act": "gelu_fast",
+        "torch_dtype": "float32",
+        "vision_use_head": false
+      }
+    }
+  },
+  "runner": {
+    "change_key_name": false,
+    "collator": {
+      "keys": [
+        "states",
+        "observation.eepose",
+        "timestamp",
+        "images",
+        "img_masks",
+        "lang_tokens",
+        "lang_masks",
+        "actions",
+        "action_masks"
+      ],
+      "meta_keys": [
+        "task_description",
+        "prompt",
+        "info",
+        "stats"
+      ],
+      "type": "DictCollator"
+    },
+    "enable_gradient_checkpointing": true,
+    "enable_mixed_precision_training": true,
+    "learning_rate": 5e-05,
+    "lr_scheduler_type": "linear-warmup+cosine-decay",
+    "max_epochs": 240,
+    "max_grad_norm": 1.0,
+    "metric": {
+      "active_trackers": [
+        "jsonl",
+        "wandb"
+      ],
+      "grad_accumulation_steps": 1,
+      "run_dir": "work_dirs",
+      "type": "VLAMetric",
+      "window_size": 1
+    },
+    "mixed_precision_dtype": "bf16",
+    "sampler": null,
+    "sharding_strategy": "no-shard",
+    "tokenizer": {
+      "type": "PaligemmaTokenizer"
+    },
+    "type": "FSDPTrainRunner",
+    "warmup_ratio": 0.03,
+    "weight_decay": 0.0
+  },
+  "train_dataloader": {
+    "dataset": {
+      "datasets": {
+        "action_key": "action",
+        "action_window_size": 10,
+        "data_root_path": "./datasets/libero_10_no_noops_lerobotv2.1",
+        "statistic_name": "libero_10_no_noops",
+        "task_indices": [
+          0
+        ],
+        "transforms": [
+          {
+            "name_mappings": {
+              "actions": [
+                "actions"
+              ],
+              "observation.state": [
+                "states"
+              ]
+            },
+            "parquet_keys": [
+              "observation.state",
+              "timestamp",
+              "actions",
+              "info",
+              "stats",
+              "action_masks"
+            ],
+            "type": "ProcessParquetInputs",
+            "video_keys": [
+              "observation.images.image",
+              "observation.images.wrist_image"
+            ]
+          },
+          {
+            "type": "ParquetPrompter",
+            "use_conversation": false
+          },
+          {
+            "tokenizer": {
+              "type": "PaligemmaTokenizer"
+            },
+            "type": "ProcessPrompts"
+          },
+          {
+            "height": 224,
+            "type": "ResizeImages",
+            "width": 224
+          },
+          {
+            "means": [
+              [
+                123.515625,
+                116.04492188,
+                103.59375
+              ],
+              [
+                123.515625,
+                116.04492188,
+                103.59375
+              ]
+            ],
+            "stds": [
+              [
+                58.27148438,
+                57.02636719,
+                57.27539062
+              ],
+              [
+                58.27148438,
+                57.02636719,
+                57.27539062
+              ]
+            ],
+            "type": "NormalizeImages"
+          },
+          {
+            "action_dim": 32,
+            "action_key": "action",
+            "norm_type": "mean_std",
+            "state_dim": 32,
+            "state_key": "proprio",
+            "type": "NormalizeStatesAndActions"
+          }
+        ],
+        "type": "ParquetDataset",
+        "use_delta": false,
+        "window_start_idx": 0
+      },
+      "name_mappings": {
+        "action": [
+          "action"
+        ],
+        "observation.state": [
+          "proprio"
+        ]
+      },
+      "statistic_keys": [
+        "observation.state",
+        "timestamp",
+        "action"
+      ],
+      "statistic_name": "libero_10_no_noops",
+      "type": "DistributedRepeatingDataset"
+    },
+    "per_device_batch_size": 14,
+    "per_device_num_workers": 4
+  }
+}
