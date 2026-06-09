@@ -114,3 +114,59 @@ class PixelUnshuffleProjectorInference(PixelUnshuffleProjector):
             f'{prefix}_b':
             self.projector.bias.data.bfloat16().cuda(),
         }
+
+
+@PROJECTORS.register_module()
+class PixelUnshuffleMLPProjector(PixelUnshuffleProjector):
+    """Pixel-unshuffle concat, channel MLP, then the original projector."""
+
+    def __init__(self,
+                 in_dim: int,
+                 out_dim: int,
+                 grid_size: int = 16,
+                 downscale_factor: int = 2,
+                 reduction: str = 'concat',
+                 hidden_dim: int = None) -> None:
+        super().__init__(
+            in_dim=in_dim,
+            out_dim=out_dim,
+            grid_size=grid_size,
+            downscale_factor=downscale_factor,
+            reduction=reduction)
+        if reduction != 'concat':
+            raise ValueError(
+                'PixelUnshuffleMLPProjector expects reduction="concat"')
+
+        hidden_dim = hidden_dim or in_dim
+        concat_dim = in_dim * downscale_factor * downscale_factor
+        self.channel_mlp = nn.Sequential(
+            nn.Linear(concat_dim, hidden_dim, bias=True),
+            nn.GELU(),
+            nn.Linear(hidden_dim, in_dim, bias=True),
+        )
+        self.projector = nn.Linear(in_dim, out_dim, bias=True)
+
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
+        x = self._reduce_tokens(input_features)
+        x = self.channel_mlp(x)
+        return self.projector(x)
+
+
+@PROJECTORS.register_module()
+class PixelUnshuffleMLPProjectorInference(PixelUnshuffleMLPProjector):
+
+    def prepare_triton(self, prefix='') -> dict:
+        return {
+            f'{prefix}_channel_mlp_up_w':
+            self.channel_mlp[0].weight.data.T.contiguous().bfloat16().cuda(),
+            f'{prefix}_channel_mlp_up_b':
+            self.channel_mlp[0].bias.data.bfloat16().cuda(),
+            f'{prefix}_channel_mlp_down_w':
+            self.channel_mlp[2].weight.data.T.contiguous().bfloat16().cuda(),
+            f'{prefix}_channel_mlp_down_b':
+            self.channel_mlp[2].bias.data.bfloat16().cuda(),
+            f'{prefix}_w':
+            self.projector.weight.data.T.contiguous().bfloat16().cuda(),
+            f'{prefix}_b':
+            self.projector.bias.data.bfloat16().cuda(),
+        }

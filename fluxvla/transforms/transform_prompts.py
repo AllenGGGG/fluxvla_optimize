@@ -368,7 +368,9 @@ class LiberoPromptFromInputs:
                  prompt_suffix: str = '',
                  use_conversation: bool = True,
                  negative_prompt: str = None,
-                 add_new_line: bool = False) -> None:
+                 add_new_line: bool = False,
+                 speed: float = None,
+                 speed_prompt_template: str = '{task_description} at {speed:g}x speed') -> None:
         from fluxvla.engines import build_tokenizer_from_cfg
         self.tokenizer = build_tokenizer_from_cfg(tokenizer)
         self.max_len = max_len
@@ -377,6 +379,8 @@ class LiberoPromptFromInputs:
         self.use_conversation = use_conversation
         self.negative_prompt = negative_prompt
         self.add_new_line = add_new_line
+        self.speed = speed
+        self.speed_prompt_template = speed_prompt_template
 
     def _tokenize_single_prompt(self, prompt: str):
         token_ids = self.tokenizer(prompt)['input_ids']
@@ -394,6 +398,9 @@ class LiberoPromptFromInputs:
     def __call__(self, inputs: Dict) -> Dict:
         assert 'task_description' in inputs, "inputs must contain 'task_description'"  # noqa: E501
         task_description = inputs['task_description']
+        if self.speed is not None:
+            task_description = self.speed_prompt_template.format(
+                task_description=task_description, speed=float(self.speed))
         if self.use_conversation:
             prompt = ('In: What action should the robot take to ' +
                       str(task_description).lower() + '?\nOut:' +

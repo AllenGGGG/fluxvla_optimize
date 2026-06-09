@@ -194,6 +194,8 @@ class ParquetPrompter:
                  action_tokenizer: Optional[dict] = None,
                  use_conversation: bool = True,
                  add_new_line: bool = False,
+                 speed_key: Optional[str] = None,
+                 speed_prompt_template: str = '{task_description} at {speed:g}x speed',
                  *args,
                  **kwargs):
         self.prompt = ''
@@ -207,11 +209,17 @@ class ParquetPrompter:
             self.action_tokenizer = None
         self.use_conversation = use_conversation
         self.add_new_line = add_new_line
+        self.speed_key = speed_key
+        self.speed_prompt_template = speed_prompt_template
 
     def __call__(self, inputs):
         assert 'task_description' in inputs, \
             "Data must contain 'task_description' key."
         task_description = inputs['task_description']
+        if self.speed_key is not None and self.speed_key in inputs:
+            speed = float(inputs[self.speed_key])
+            task_description = self.speed_prompt_template.format(
+                task_description=task_description, speed=speed)
         if not self.use_conversation:
             prompt = task_description
         else:

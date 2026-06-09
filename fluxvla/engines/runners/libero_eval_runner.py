@@ -202,6 +202,23 @@ class LiberoEvalRunner:
                     f'{invalid_task_ids}; valid range is '
                     f'0..{num_tasks_in_suite - 1}')
 
+        init_state_counts = {
+            task_id: len(task_suite.get_task_init_states(task_id))
+            for task_id in eval_task_ids
+        }
+        insufficient_init_states = {
+            task_id: count
+            for task_id, count in init_state_counts.items()
+            if self.num_trials_per_task > count
+        }
+        if insufficient_init_states:
+            raise ValueError(
+                f'num_trials_per_task={self.num_trials_per_task} exceeds '
+                f'available LIBERO initial states per task: '
+                f'{insufficient_init_states}. Use at most the listed count '
+                'per task, or run multiple seeds instead of requesting more '
+                'trials than LIBERO provides.')
+
         global_episodes = [
             task_id * self.num_trials_per_task + trial_id
             for task_id in eval_task_ids

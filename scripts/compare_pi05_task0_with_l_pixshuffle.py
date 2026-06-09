@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare PI0.5 task0 with_l vs pixshuffle using accelerated inference."""
+"""Compare PI0.5 task0 accelerated inference variants."""
 
 from __future__ import annotations
 
@@ -19,30 +19,40 @@ from mmengine import Config
 DEFAULT_WITH_L_CONFIG = 'configs/pi05/pi05_paligemma_libero_10_full_inference.py'
 DEFAULT_PIXSHUFFLE_CONFIG = (
     'configs/pi05/pi05_libero10_task0_with_l_pixshuffle_inference.py')
+DEFAULT_PIXSHUFFLE_MLP_CONFIG = (
+    'configs/pi05/pi05_libero10_task0_with_l_pixshuffle_mlp_inference.py')
 DEFAULT_WITH_L_CKPT = (
     'work_dirs/pi05_libero10_task0_with_l/checkpoints/'
     'step-008460-epoch-60-loss=0.0910.safetensors')
 DEFAULT_PIXSHUFFLE_CKPT = (
     'work_dirs/pi05_libero10_task0_with_l_pixshuffle/checkpoints/'
     'step-008460-epoch-60-loss=0.0918.safetensors')
+DEFAULT_PIXSHUFFLE_MLP_CKPT = (
+    'work_dirs/pi05_libero10_task0_with_l_pixshuffle_mlp/checkpoints/'
+    'latest-checkpoint.safetensors')
 
 SUCCESS_RE = re.compile(r'# successes:\s*([0-9.]+)\s*\(([0-9.]+)%\)')
 EPISODES_RE = re.compile(r'# episodes completed so far:\s*([0-9.]+)')
+LIBERO_INIT_STATES_PER_TASK = 50
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            'Compare trained PI0.5 task0 with_l and pixshuffle checkpoints '
+            'Compare trained PI0.5 task0 with_l/pixshuffle checkpoints '
             'with accelerated inference speed and LIBERO success rate.'))
     parser.add_argument('--with-l-config', default=DEFAULT_WITH_L_CONFIG)
     parser.add_argument('--pixshuffle-config', default=DEFAULT_PIXSHUFFLE_CONFIG)
+    parser.add_argument(
+        '--pixshuffle-mlp-config', default=DEFAULT_PIXSHUFFLE_MLP_CONFIG)
     parser.add_argument('--with-l-ckpt', default=DEFAULT_WITH_L_CKPT)
     parser.add_argument('--pixshuffle-ckpt', default=DEFAULT_PIXSHUFFLE_CKPT)
     parser.add_argument(
+        '--pixshuffle-mlp-ckpt', default=DEFAULT_PIXSHUFFLE_MLP_CKPT)
+    parser.add_argument(
         '--variants',
         default='with_l,pixshuffle',
-        help='Comma-separated built-in variants to run: with_l,pixshuffle. Ignored when --variant is used.')
+        help='Comma-separated built-in variants to run: with_l,pixshuffle,pixshuffle_mlp. Ignored when --variant is used.')
     parser.add_argument(
         '--variant',
         nargs=3,
@@ -88,6 +98,16 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help='Print accelerated path token counts during benchmark/eval.')
     return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.success_trials_per_task > LIBERO_INIT_STATES_PER_TASK:
+        raise ValueError(
+            '--success-trials-per-task cannot exceed '
+            f'{LIBERO_INIT_STATES_PER_TASK} for LIBERO evaluation because '
+            'each task only provides 50 initial states. Use multiple '
+            '--success-seeds values if you want repeated evaluations, or set '
+            '--success-trials-per-task 50 for the standard LIBERO protocol.')
 
 
 def split_csv(value: str) -> List[str]:
@@ -182,7 +202,7 @@ def parse_best_success(paths: Iterable[Path],
 
 
 def requested_variants(args: argparse.Namespace) -> List[str]:
-    allowed = {'with_l', 'pixshuffle'}
+    allowed = {'with_l', 'pixshuffle', 'pixshuffle_mlp'}
     requested = split_csv(args.variants)
     if not requested:
         raise ValueError('--variants must select at least one variant.')
@@ -240,6 +260,11 @@ def variants(args: argparse.Namespace, output_dir: Path) -> List[Dict[str, str]]
             'variant': 'pixshuffle',
             'source_config': args.pixshuffle_config,
             'ckpt': args.pixshuffle_ckpt,
+        },
+        {
+            'variant': 'pixshuffle_mlp',
+            'source_config': args.pixshuffle_mlp_config,
+            'ckpt': args.pixshuffle_mlp_ckpt,
         },
     ]
     selected = set(requested_variants(args))
@@ -375,7 +400,7 @@ def write_markdown(path: Path, speed_rows: List[Dict],
                    success_rows: List[Dict], errors: List[Dict],
                    args: argparse.Namespace) -> None:
     lines = [
-        '# PI0.5 Task0 With-L vs Pixshuffle',
+        '# PI0.5 Task0 Accelerated Variants',
         '',
         'Both variants use accelerated `PI05FlowMatchingInference`.',
         '',
@@ -383,6 +408,7 @@ def write_markdown(path: Path, speed_rows: List[Dict],
         '',
         f'- with_l: `{args.with_l_ckpt}`',
         f'- pixshuffle: `{args.pixshuffle_ckpt}`',
+        f'- pixshuffle_mlp: `{args.pixshuffle_mlp_ckpt}`',
         f'- Selected variants: `{args.variants}`',
         '',
         '## Speed',
@@ -453,6 +479,7 @@ def write_markdown(path: Path, speed_rows: List[Dict],
         f'- Speed warmup/bench iters: `{args.speed_warmup_iters}` / `{args.speed_bench_iters}`',
         f'- with_l config: `{args.with_l_config}`',
         f'- pixshuffle config: `{args.pixshuffle_config}`',
+        f'- pixshuffle_mlp config: `{args.pixshuffle_mlp_config}`',
         f'- Base weights used for success eval construction: `{args.base_weights}`',
     ]
     path.write_text('\n'.join(lines) + '\n')
@@ -460,6 +487,7 @@ def write_markdown(path: Path, speed_rows: List[Dict],
 
 def main() -> None:
     args = parse_args()
+    validate_args(args)
     if args.tag is None:
         args.tag = time.strftime('%Y%m%d_%H%M%S')
     output_dir = (

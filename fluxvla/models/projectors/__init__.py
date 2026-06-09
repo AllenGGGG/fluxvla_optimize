@@ -17,6 +17,6 @@ from .linear_projector import LinearProjector  # noqa: F401, F403
 from .linear_projector_inference import \
     LinearProjectorInference  # noqa: F401, F403
 from .mlp_projector import MLPProjector  # noqa: F401, F403
-from .pixel_unshuffle_projector import (PixelUnshuffleProjector,  # noqa: F401
-                                        PixelUnshuffleProjectorInference  # noqa: F401
-                                        )
+from .pixel_unshuffle_projector import (  # noqa: F401
+    PixelUnshuffleMLPProjector, PixelUnshuffleMLPProjectorInference,
+    PixelUnshuffleProjector, PixelUnshuffleProjectorInference)

@@ -8,11 +8,14 @@ from fluxvla.engines import VLAS
 from fluxvla.ops.atomic_ops import (AttnMultiKey, adarms_norm_style_proj,
                                     conv2d_embed_res, layer_norm_matmul_bias,
                                     layer_norm_matmul_bias_gelu,
-                                    layer_norm_QKV_matmul_bias, matmul_attn_v,
-                                    matmul_bias_res, matmul_bias_silu,
-                                    matmul_bias_small, matmul_gate,
+                                    layer_norm_QKV_matmul_bias,
+                                    layer_norm_tokens, matmul_attn_v,
+                                    matmul_bias_gelu, matmul_bias_res,
+                                    matmul_bias_silu, matmul_bias_small,
+                                    matmul_gate,
                                     matmul_qkv_rope, matmul_res,
                                     matmul_res_gate, matmul_split_k_bias_res,
+                                    pixel_unshuffle_token_concat,
                                     pixel_unshuffle_token_reduce,
                                     rms_matmul_gate, rms_matmul_qkv_rope)
 from fluxvla.ops.triton.attention_triton_ops import (
@@ -75,28 +78,90 @@ def transformer_encoder(weights,
                         visual_tokens_per_view=256,
                         visual_grid_size=16,
                         visual_token_downscale_factor=1):
-    if visual_token_downscale_factor > 1:
+    if 'encoder_multi_modal_projector_channel_mlp_up_w' in weights:
+        full_tokens_per_view = visual_grid_size * visual_grid_size
+        visual_token_count = buffers['vision_x'].shape[0] * visual_tokens_per_view
+        layer_norm_tokens(
+            buffers['vision_x'],
+            weights['vision_final_norm_w'],
+            weights['vision_final_norm_b'],
+            buffers['vision_x_norm'],
+            num_patches=full_tokens_per_view,
+            features=1152,
+            eps=1e-5)
+        if visual_token_downscale_factor > 1:
+            pixel_unshuffle_token_concat(
+                buffers['vision_x_norm'],
+                buffers['vision_projector_x_concat'],
+                visual_grid_size,
+                visual_token_downscale_factor)
+            channel_x = buffers['vision_projector_x_concat']
+        else:
+            channel_x = buffers['vision_x_norm']
+
+        channel_in_features = weights[
+            'encoder_multi_modal_projector_channel_mlp_up_w'].shape[0]
+        matmul_bias_gelu(
+            channel_x.view(visual_token_count, channel_in_features),
+            weights['encoder_multi_modal_projector_channel_mlp_up_w'],
+            weights['encoder_multi_modal_projector_channel_mlp_up_b'],
+            buffers['vision_projector_x'].view(visual_token_count, 1152),
+            in_features=channel_in_features,
+            out_features=1152,
+            BLOCK_SIZE_N=64,
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_K=64)
+        matmul_bias_small(
+            buffers['vision_projector_x'].view(visual_token_count, 1152),
+            weights['encoder_multi_modal_projector_channel_mlp_down_w'],
+            weights['encoder_multi_modal_projector_channel_mlp_down_b'],
+            buffers['vision_projector_x_norm'].view(visual_token_count, 1152),
+            in_features=1152,
+            out_features=1152,
+            BLOCK_SIZE_N=64,
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_K=64)
+        matmul_bias_small(
+            buffers['vision_projector_x_norm'].view(visual_token_count, 1152),
+            weights['encoder_multi_modal_projector_w'],
+            weights['encoder_multi_modal_projector_b'],
+            buffers['encoder_x'][:visual_token_count],
+            in_features=1152,
+            out_features=2048,
+            BLOCK_SIZE_N=64,
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_K=64)
+    elif visual_token_downscale_factor > 1:
         pixel_unshuffle_token_reduce(
             buffers['vision_x'], buffers['vision_projector_x'],
             visual_grid_size, visual_token_downscale_factor)
         vision_x = buffers['vision_projector_x']
         vision_x_norm = buffers['vision_projector_x_norm']
+        layer_norm_matmul_bias(
+            vision_x,
+            weights['vision_final_norm_w'],
+            weights['vision_final_norm_b'],
+            weights['encoder_multi_modal_projector_w'],
+            weights['encoder_multi_modal_projector_b'],
+            buffers['encoder_x'],
+            vision_x_norm,
+            num_patches=visual_tokens_per_view,
+            in_features=1152,
+            out_features=2048,
+            eps=1e-5)
     else:
-        vision_x = buffers['vision_x']
-        vision_x_norm = buffers['vision_x_norm']
-
-    layer_norm_matmul_bias(
-        vision_x,
-        weights['vision_final_norm_w'],
-        weights['vision_final_norm_b'],
-        weights['encoder_multi_modal_projector_w'],
-        weights['encoder_multi_modal_projector_b'],
-        buffers['encoder_x'],
-        vision_x_norm,
-        num_patches=visual_tokens_per_view,
-        in_features=1152,
-        out_features=2048,
-        eps=1e-5)
+        layer_norm_matmul_bias(
+            buffers['vision_x'],
+            weights['vision_final_norm_w'],
+            weights['vision_final_norm_b'],
+            weights['encoder_multi_modal_projector_w'],
+            weights['encoder_multi_modal_projector_b'],
+            buffers['encoder_x'],
+            buffers['vision_x_norm'],
+            num_patches=visual_tokens_per_view,
+            in_features=1152,
+            out_features=2048,
+            eps=1e-5)
 
     for i in range(num_encoder_layers):
         rms_matmul_qkv_rope(
@@ -385,6 +450,7 @@ class PI05FlowMatchingInference(PI05FlowMatching):
         np_ = self._vit_num_patches
         vtpv = self._visual_tokens_per_view
         vh = self._vit_hidden
+        vcd = vh * self._visual_token_downscale_factor * self._visual_token_downscale_factor
         vi = self._vit_intermediate
         eh = self._enc_hidden
         ei = self._enc_intermediate
@@ -410,6 +476,8 @@ class PI05FlowMatchingInference(PI05FlowMatching):
             torch.zeros(nv, vtpv, vh, dtype=bf, device=dev),
             'vision_projector_x_norm':
             torch.zeros(nv, vtpv, vh, dtype=bf, device=dev),
+            'vision_projector_x_concat':
+            torch.zeros(nv, vtpv, vcd, dtype=bf, device=dev),
             'vision_x_split_k_buf':
             torch.zeros(nv * np_ * vh * 4, dtype=torch.float32, device=dev),
             'encoder_rope_weights':

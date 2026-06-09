@@ -132,6 +132,35 @@ def pixel_unshuffle_token_reduce(x, out, grid_size, downscale_factor):
                                             out_grid * out_grid, hidden))
 
 
+def pixel_unshuffle_token_concat(x, out, grid_size, downscale_factor):
+    """Reduce spatial tokens and concatenate channels with PixelUnshuffle."""
+    if downscale_factor == 1:
+        out.copy_(x)
+        return
+
+    num_views, _, hidden = x.shape
+    out_grid = grid_size // downscale_factor
+    y = x.view(num_views, grid_size, grid_size, hidden)
+    y = y.permute(0, 3, 1, 2).contiguous()
+    y = F.pixel_unshuffle(y, downscale_factor)
+    out.copy_(y.permute(0, 2, 3, 1).reshape(
+        num_views, out_grid * out_grid,
+        hidden * downscale_factor * downscale_factor))
+
+
+def layer_norm_tokens(x,
+                      norm_w,
+                      norm_b,
+                      out,
+                      num_patches,
+                      features,
+                      eps=1e-5):
+    """LayerNorm over token features without a following projection."""
+    seq_len = x.shape[0] * num_patches
+    layer_norm_small_kernel[seq_len, ](
+        x, out, norm_w, norm_b, seq_len=seq_len, features=features, eps=eps)
+
+
 # ---------------------------------------------------------------------------
 # LayerNorm + matmul + bias (e.g. vision→encoder projection)
 # ---------------------------------------------------------------------------
@@ -291,6 +320,31 @@ def matmul_bias_small(x,
                           BLOCK_SIZE_N=BLOCK_SIZE_N,
                           BLOCK_SIZE_M=BLOCK_SIZE_M,
                           BLOCK_SIZE_K=BLOCK_SIZE_K)
+
+
+def matmul_bias_gelu(x,
+                     weight,
+                     bias,
+                     out,
+                     in_features,
+                     out_features,
+                     BLOCK_SIZE_N=64,
+                     BLOCK_SIZE_M=64,
+                     BLOCK_SIZE_K=64):
+    seq_len = x.numel() // in_features
+    matmul_small_bias_gelu[((seq_len + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N) *
+                           ((out_features + BLOCK_SIZE_M - 1) //
+                            BLOCK_SIZE_M), ](
+                                x.view(seq_len, in_features),
+                                weight,
+                                out.view(seq_len, out_features),
+                                bias,
+                                seq_len=seq_len,
+                                features=in_features,
+                                hidden=out_features,
+                                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                                BLOCK_SIZE_K=BLOCK_SIZE_K)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,42 @@
+{
+  "results": [
+    {
+      "variant": "accelerated",
+      "worker_rank": 0,
+      "num_workers": 1,
+      "config": "work_dirs/pi05_task0_with_l_pixshuffle_compare/mlp_vs_base/configs/pi05_task0_with_l_last_accelerated.py",
+      "ckpt_path": "work_dirs/pi05_libero10_task0_with_l/checkpoints/latest-checkpoint.safetensors",
+      "device": "cuda:0",
+      "cuda_visible_devices": "7",
+      "dtype": "bfloat16",
+      "warmup_iters": 10,
+      "bench_iters": 100,
+      "prompt_len": 32,
+      "num_views": 2,
+      "image_size": 224,
+      "action_steps_per_call": 10,
+      "load_seconds": 148.57873679301701,
+      "cold_start_ms": 3509.432373046875,
+      "mean_ms": 38.890567741394044,
+      "std_ms": 0.10120942013549422,
+      "min_ms": 38.76044845581055,
+      "p50_ms": 38.89152145385742,
+      "p90_ms": 38.99064178466797,
+      "p95_ms": 39.111527061462404,
+      "p99_ms": 39.226838989257814,
+      "max_ms": 39.27347183227539,
+      "chunk_hz": 25.713175663815978,
+      "action_step_hz": 257.1317566381598,
+      "model_allocated_gib_after_load": 6.736800193786621,
+      "peak_allocated_gib_during_benchmark": 12.075607776641846,
+      "output_shape": [
+        1,
+        10,
+        32
+      ],
+      "output_mean": 0.026171786710619926,
+      "output_std": 0.20067548751831055
+    }
+  ],
+  "comparison": null
+}
