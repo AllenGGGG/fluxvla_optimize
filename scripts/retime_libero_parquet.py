@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """Create retimed LIBERO/LeRobot parquet datasets.
 
-This script keeps the original task prompts and videos, but rewrites the
-tabular trajectory rows at different temporal rates. It is intended for
-experiments where a VLA learns from a single faster/slower retimed dataset, or
-from multiple speed-conditioned variants generated from the same source.
-
-For LIBERO EEF_POS-style actions, the default behavior treats actions as
-absolute targets and interpolates the first action dimensions while keeping the
-last gripper dimension nearest-neighbor. If your action is a delta command,
-use this script as a starting point and implement task-specific action
-composition before training.
+This script keeps the original task prompts, but rewrites trajectories and,
+by default, renders matching speed-specific videos. For LIBERO actions, the
+default VSTA-style behavior treats the first action dimensions as delta
+commands: fast variants merge delta actions over a longer source interval,
+while slow variants split a delta action across shorter intervals. The final
+gripper dimension is not accumulated.
 """
 
 from __future__ import annotations
@@ -23,8 +19,9 @@ import shutil
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
+import imageio.v2 as imageio
 import numpy as np
 
 
@@ -83,13 +80,31 @@ def parse_args() -> argparse.Namespace:
         help='Dataset split to load from input data/.')
     parser.add_argument(
         '--video-mode',
-        choices=('symlink', 'copy', 'absolute', 'none'),
-        default='symlink',
+        choices=('retime', 'symlink', 'copy', 'absolute', 'none'),
+        default='retime',
         help=(
-            'How output roots access original videos. symlink/copy preserve '
-            'the original relative info["video_path"]; absolute rewrites '
+            'How output roots access videos. retime writes speed-specific '
+            'mp4 files under each output root; symlink/copy preserve the '
+            'original relative info["video_path"]; absolute rewrites '
             'info["video_path"] to the input root; none leaves videos absent.'
         ))
+    parser.add_argument(
+        '--action-retime-mode',
+        choices=('delta_vsta', 'absolute_interp'),
+        default='delta_vsta',
+        help=(
+            'delta_vsta merges/splits delta actions over each retimed time '
+            'interval. absolute_interp preserves the old behavior for action '
+            'columns that are absolute targets.'))
+    parser.add_argument(
+        '--video-codec',
+        default='libx264',
+        help='Codec used when --video-mode retime writes mp4 files.')
+    parser.add_argument(
+        '--video-quality',
+        type=int,
+        default=8,
+        help='imageio ffmpeg quality for retimed mp4 files.')
     parser.add_argument(
         '--data-file',
         default='retimed.parquet',
@@ -191,18 +206,52 @@ def source_positions(num_rows: int, speed: float) -> np.ndarray:
     return positions
 
 
+def integrate_delta_action(rows: Sequence[dict], action_key: str,
+                           start: float, speed: float,
+                           keep_last_dim_nearest: bool) -> Any:
+    """Merge/split delta actions over [start, start + speed)."""
+    first = as_float_array(rows[min(int(math.floor(start)), len(rows) - 1)]
+                           [action_key])
+    out = np.zeros_like(first, dtype=np.float32)
+    if len(rows) <= 1:
+        return first.tolist() if first.ndim > 0 else float(first)
+
+    end = min(float(start + speed), float(len(rows) - 1))
+    cur = float(start)
+    while cur < end - 1e-8:
+        idx = min(int(math.floor(cur)), len(rows) - 1)
+        nxt = min(float(idx + 1), end)
+        weight = max(0.0, nxt - cur)
+        action = as_float_array(rows[idx][action_key])
+        out += action * weight
+        cur = nxt
+
+    if keep_last_dim_nearest and out.ndim > 0 and out.shape[-1] > 0:
+        grip_pos = min(max(end - 1e-6, start), float(len(rows) - 1))
+        grip_idx = min(int(math.floor(grip_pos)), len(rows) - 1)
+        out[..., -1] = as_float_array(rows[grip_idx][action_key])[..., -1]
+
+    if out.ndim == 0:
+        return float(out)
+    return out.tolist()
+
+
 def retime_episode(rows: Sequence[dict], speed: float, state_key: str,
                    action_key: str, interpolate_keys: Sequence[str],
                    nearest_keys: Sequence[str],
                    keep_last_action_dim_nearest: bool,
                    episode_index: int,
-                   speed_key: str) -> List[dict]:
+                   speed_key: str,
+                   fps: float,
+                   action_retime_mode: str) -> Tuple[List[dict], np.ndarray]:
     positions = source_positions(len(rows), speed)
     retimed = []
 
     interpolate_set = set(interpolate_keys)
     nearest_set = set(nearest_keys)
-    interpolate_set.update([state_key, action_key, 'timestamp'])
+    interpolate_set.update([state_key])
+    if action_retime_mode == 'absolute_interp':
+        interpolate_set.add(action_key)
 
     for new_frame_idx, pos in enumerate(positions):
         lo = int(math.floor(float(pos)))
@@ -222,19 +271,89 @@ def retime_episode(rows: Sequence[dict], speed: float, state_key: str,
             elif is_numeric_value(row_lo[key]) and is_numeric_value(row_hi[key]):
                 out[key] = interp_numeric(row_lo[key], row_hi[key], alpha)
 
+        if action_retime_mode == 'delta_vsta':
+            out[action_key] = integrate_delta_action(
+                rows, action_key, float(pos), speed,
+                keep_last_action_dim_nearest)
+
         for key in nearest_set:
             if key in row_lo and key in row_hi:
                 out[key] = nearest_value(row_lo[key], row_hi[key], alpha)
 
         out['episode_index'] = int(episode_index)
         out[speed_key] = float(speed)
+        out['timestamp'] = float(new_frame_idx / fps)
         if 'frame_index' in out:
             out['frame_index'] = int(new_frame_idx)
         if 'index' in out:
             out.pop('index', None)
         retimed.append(out)
 
-    return retimed
+    return retimed, positions
+
+
+def sample_video_frame(frames: Sequence[np.ndarray], position: float) -> np.ndarray:
+    lo = int(math.floor(float(position)))
+    hi = min(lo + 1, len(frames) - 1)
+    alpha = float(position - lo)
+    if alpha <= 1e-6 or lo == hi:
+        return frames[lo]
+    blended = (
+        (1.0 - alpha) * frames[lo].astype(np.float32) +
+        alpha * frames[hi].astype(np.float32))
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def write_retimed_video(src_path: Path, dst_path: Path,
+                        positions: Sequence[float], fps: float,
+                        codec: str, quality: int) -> None:
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    if (len(positions) > 1 and np.allclose(positions, np.arange(len(positions)))
+            and src_path.resolve() != dst_path.resolve()):
+        shutil.copy2(src_path, dst_path)
+        return
+    reader = imageio.get_reader(str(src_path))
+    try:
+        frames = [frame for frame in reader.iter_data()]
+    finally:
+        reader.close()
+    if not frames:
+        raise ValueError(f'No frames decoded from {src_path}')
+    with imageio.get_writer(
+            str(dst_path),
+            fps=fps,
+            codec=codec,
+            quality=quality,
+            macro_block_size=None,
+            pixelformat='yuv420p') as writer:
+        for pos in positions:
+            clipped = min(max(float(pos), 0.0), float(len(frames) - 1))
+            writer.append_data(sample_video_frame(frames, clipped))
+
+
+def retime_episode_videos(input_root: Path, output_root: Path, info: dict,
+                          episode_positions: Dict[int, np.ndarray],
+                          fps: float, codec: str, quality: int) -> None:
+    video_path_template = info.get('video_path')
+    if not video_path_template:
+        raise ValueError('info.json does not define video_path')
+    video_keys = [
+        key for key, feature in info.get('features', {}).items()
+        if isinstance(feature, dict) and feature.get('dtype') == 'video'
+    ]
+    for episode_index, positions in episode_positions.items():
+        episode_chunk = episode_index // int(info.get('chunks_size', 1000))
+        for video_key in video_keys:
+            rel_path = video_path_template.format(
+                episode_chunk=episode_chunk,
+                video_key=video_key,
+                episode_index=episode_index)
+            src_path = input_root / rel_path
+            dst_path = output_root / rel_path
+            if not src_path.exists():
+                raise FileNotFoundError(f'Video file not found: {src_path}')
+            write_retimed_video(src_path, dst_path, positions, fps, codec,
+                                quality)
 
 
 def stat_block(values: Sequence[Any]) -> Dict[str, Any]:
@@ -285,7 +404,7 @@ def copy_meta(input_meta: Path, output_meta: Path, info: dict) -> None:
 def prepare_videos(input_root: Path, output_root: Path, info: dict,
                    mode: str) -> dict:
     out_info = deepcopy(info)
-    if mode == 'none':
+    if mode in ('none', 'retime'):
         return out_info
     if mode == 'absolute':
         video_path = out_info.get('video_path')
@@ -308,7 +427,8 @@ def prepare_videos(input_root: Path, output_root: Path, info: dict,
 
 
 def update_info_counts(info: dict, rows: Sequence[dict],
-                       episodes: Sequence[dict], speed_key: str) -> dict:
+                       episodes: Sequence[dict], speed_key: str,
+                       video_codec_label: str = None) -> dict:
     out_info = deepcopy(info)
     out_info['total_episodes'] = len(episodes)
     out_info['total_frames'] = len(rows)
@@ -327,6 +447,14 @@ def update_info_counts(info: dict, rows: Sequence[dict],
                     'shape': [1],
                     'names': None,
                 }
+    fps = float(out_info.get('fps', 20))
+    for feature in out_info.get('features', {}).values():
+        if isinstance(feature, dict) and feature.get('dtype') == 'video':
+            feature.setdefault('info', {})['video.fps'] = fps
+            if video_codec_label is not None:
+                feature.setdefault('info',
+                                   {})['video.codec'] = video_codec_label
+                feature.setdefault('info', {})['video.pix_fmt'] = 'yuv420p'
     return out_info
 
 
@@ -386,6 +514,7 @@ def main() -> None:
         for idx, row in enumerate(read_jsonl(input_meta / 'episodes.jsonl'))
     }
     source_info = load_info(input_root)
+    fps = float(source_info.get('fps', 20))
 
     output_base.mkdir(parents=True, exist_ok=True)
     summary = []
@@ -406,9 +535,10 @@ def main() -> None:
         all_rows: List[dict] = []
         all_stats: List[dict] = []
         all_episodes: List[dict] = []
+        episode_positions: Dict[int, np.ndarray] = {}
 
         for old_episode_index, episode_rows in source_by_episode.items():
-            retimed_rows = retime_episode(
+            retimed_rows, positions = retime_episode(
                 episode_rows,
                 speed=speed,
                 state_key=args.state_key,
@@ -417,7 +547,10 @@ def main() -> None:
                 nearest_keys=extra_nearest,
                 keep_last_action_dim_nearest=args.keep_last_action_dim_nearest,
                 episode_index=old_episode_index,
-                speed_key=args.speed_key)
+                speed_key=args.speed_key,
+                fps=fps,
+                action_retime_mode=args.action_retime_mode)
+            episode_positions[old_episode_index] = positions
             all_rows.extend(retimed_rows)
             all_stats.append(
                 episode_stats(retimed_rows, args.state_key, args.action_key))
@@ -434,15 +567,28 @@ def main() -> None:
             stats_rows=all_stats,
             episode_rows=all_episodes,
             info=update_info_counts(out_info, all_rows, all_episodes,
-                                    args.speed_key),
+                                    args.speed_key, 'h264'
+                                    if args.video_mode == 'retime' else None),
             input_meta=input_meta,
             data_file=args.data_file)
+
+        if args.video_mode == 'retime':
+            retime_episode_videos(
+                input_root=input_root,
+                output_root=out_root,
+                info=source_info,
+                episode_positions=episode_positions,
+                fps=fps,
+                codec=args.video_codec,
+                quality=args.video_quality)
 
         record = {
             'speed': speed,
             'output_root': str(out_root),
             'num_rows': len(all_rows),
             'num_episodes': len(all_episodes),
+            'action_retime_mode': args.action_retime_mode,
+            'video_mode': args.video_mode,
         }
         summary.append(record)
         print(

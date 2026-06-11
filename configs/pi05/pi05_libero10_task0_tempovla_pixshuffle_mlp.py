@@ -69,6 +69,12 @@ train_dataloader = dict(
                     norm_type='mean_std')
             ])))
 
+runner = dict(
+    collator=dict(
+        meta_keys=['task_description', 'prompt', 'info', 'stats',
+                   'tempo_speed']),
+    metric=dict(active_trackers=('jsonl', )))
+
 eval = dict(
     dataset=dict(
         transforms=[

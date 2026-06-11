@@ -70,6 +70,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='Override inference_model.triton_max_prompt_len for speed and success runs.')
     parser.add_argument(
+        '--eval-speeds',
+        default=None,
+        help=(
+            'Comma-separated eval prompt speeds. When set, each selected '
+            'variant is expanded once per speed by overriding '
+            'LiberoPromptFromInputs.speed. Example: 1.0,1.5,2.0.'))
+    parser.add_argument(
         '--output-dir',
         default=None,
         help='Defaults to work_dirs/pi05_task0_with_l_pixshuffle_compare/<tag>.')
@@ -112,6 +119,35 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def split_csv(value: str) -> List[str]:
     return [item.strip() for item in value.split(',') if item.strip()]
+
+
+def speed_tag(speed: float) -> str:
+    return str(speed).replace('.', '_')
+
+
+def parse_eval_speeds(value: Optional[str]) -> List[float]:
+    if value is None:
+        return []
+    speeds = [float(item) for item in split_csv(value)]
+    if not speeds:
+        raise ValueError('--eval-speeds was provided but no speeds parsed.')
+    invalid = [speed for speed in speeds if speed <= 0]
+    if invalid:
+        raise ValueError(f'--eval-speeds must be positive, got: {invalid}')
+    return speeds
+
+
+def set_eval_prompt_speed(cfg: Config, speed: float) -> None:
+    transforms = cfg.eval.dataset.transforms
+    for transform in transforms:
+        if transform.get('type') == 'LiberoPromptFromInputs':
+            transform.speed = float(speed)
+            transform.speed_prompt_template = (
+                '{task_description} at {speed:g}x speed')
+            return
+    raise ValueError(
+        'Could not find LiberoPromptFromInputs in eval.dataset.transforms; '
+        'cannot apply --eval-speeds.')
 
 
 def repo_path(path: str) -> Path:
@@ -222,12 +258,16 @@ def materialize_config(args: argparse.Namespace, output_dir: Path,
     if hasattr(cfg, 'model'):
         cfg.model.use_language = True
         cfg.model.pretrained_name_or_path = args.base_weights
+    if item.get('eval_speed') is not None:
+        set_eval_prompt_speed(cfg, float(item['eval_speed']))
 
     config_dir = output_dir / 'configs'
     config_dir.mkdir(parents=True, exist_ok=True)
     suffix = (
         f'_prompt{args.triton_max_prompt_len}'
         if args.triton_max_prompt_len is not None else '')
+    if item.get('eval_speed') is not None:
+        suffix += f'_speed{speed_tag(float(item["eval_speed"]))}'
     path = config_dir / f'pi05_task0_{item["variant"]}_accelerated{suffix}.py'
     cfg.dump(str(path))
 
@@ -236,7 +276,21 @@ def materialize_config(args: argparse.Namespace, output_dir: Path,
     return item
 
 
+def expand_eval_speed_items(items: List[Dict[str, str]],
+                            eval_speeds: List[float]) -> List[Dict[str, str]]:
+    expanded = []
+    for item in items:
+        for speed in eval_speeds:
+            speed_item = dict(item)
+            speed_item['eval_speed'] = speed
+            speed_item['variant'] = (
+                f'{item["variant"]}_speed_{speed_tag(speed)}')
+            expanded.append(speed_item)
+    return expanded
+
+
 def variants(args: argparse.Namespace, output_dir: Path) -> List[Dict[str, str]]:
+    eval_speeds = parse_eval_speeds(args.eval_speeds)
     if args.variant:
         custom_items = [
             {
@@ -245,6 +299,8 @@ def variants(args: argparse.Namespace, output_dir: Path) -> List[Dict[str, str]]
                 'ckpt': ckpt,
             } for name, config, ckpt in args.variant
         ]
+        if eval_speeds:
+            custom_items = expand_eval_speed_items(custom_items, eval_speeds)
         return [
             materialize_config(args, output_dir, item)
             for item in custom_items
@@ -268,9 +324,14 @@ def variants(args: argparse.Namespace, output_dir: Path) -> List[Dict[str, str]]
         },
     ]
     selected = set(requested_variants(args))
+    selected_items = [
+        item for item in all_items if item['variant'] in selected
+    ]
+    if eval_speeds:
+        selected_items = expand_eval_speed_items(selected_items, eval_speeds)
     return [
         materialize_config(args, output_dir, item)
-        for item in all_items if item['variant'] in selected
+        for item in selected_items
     ]
 
 
@@ -310,6 +371,7 @@ def run_speed(args: argparse.Namespace, output_dir: Path, logs_dir: Path,
     result = data['results'][0]
     result.update({
         'requested_variant': item['variant'],
+        'eval_speed': item.get('eval_speed'),
         'scenario': scenario,
         'result_path': str(result_path),
         'config_path': item['config'],
@@ -365,6 +427,7 @@ def run_success(args: argparse.Namespace, output_dir: Path, logs_dir: Path,
     eval_file, parsed = parse_best_success(candidates, log_path)
     parsed.update({
         'requested_variant': item['variant'],
+        'eval_speed': item.get('eval_speed'),
         'seed': seed,
         'ckpt_path': item['ckpt'],
         'config_path': item['config'],
@@ -413,15 +476,16 @@ def write_markdown(path: Path, speed_rows: List[Dict],
         '',
         '## Speed',
         '',
-        '| Variant | Scenario | GPUs | Workers | Prompt len | Mean ms | P90 ms | Chunk Hz | Action-step Hz | Peak GiB |',
-        '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+        '| Variant | Eval speed | Scenario | GPUs | Workers | Prompt len | Mean ms | P90 ms | Chunk Hz | Action-step Hz | Peak GiB |',
+        '| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
     ]
     for row in speed_rows:
         lines.append(
-            '| {variant} | {scenario} | `{gpus}` | {workers} | {prompt_len} | '
+            '| {variant} | {eval_speed} | {scenario} | `{gpus}` | {workers} | {prompt_len} | '
             '{mean_ms} | {p90_ms} | {chunk_hz} | {action_hz} | {peak} |'.
             format(
                 variant=row['requested_variant'],
+                eval_speed=fmt(row.get('eval_speed')),
                 scenario=row['scenario'],
                 gpus=row.get('cuda_visible_devices', ''),
                 workers=row.get('num_workers', 1),
@@ -437,14 +501,15 @@ def write_markdown(path: Path, speed_rows: List[Dict],
         '',
         '## Success',
         '',
-        '| Variant | Seed | GPUs | Episodes | Successes | Success Rate | Eval File |',
-        '| --- | ---: | --- | ---: | ---: | ---: | --- |',
+        '| Variant | Eval speed | Seed | GPUs | Episodes | Successes | Success Rate | Eval File |',
+        '| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |',
     ]
     for row in success_rows:
         lines.append(
-            '| {variant} | {seed} | `{gpus}` | {episodes} | {successes} | '
+            '| {variant} | {eval_speed} | {seed} | `{gpus}` | {episodes} | {successes} | '
             '{rate}% | `{eval_file}` |'.format(
                 variant=row['requested_variant'],
+                eval_speed=fmt(row.get('eval_speed')),
                 seed=row['seed'],
                 gpus=row['cuda_visible_devices'],
                 episodes=fmt(float(row['episodes']), 0),
@@ -476,6 +541,7 @@ def write_markdown(path: Path, speed_rows: List[Dict],
         f'- Triton max prompt len override: `{args.triton_max_prompt_len}`',
         f'- Success trials per task: `{args.success_trials_per_task}`',
         f'- Success seeds: `{args.success_seeds}`',
+        f'- Eval prompt speeds: `{args.eval_speeds}`',
         f'- Speed warmup/bench iters: `{args.speed_warmup_iters}` / `{args.speed_bench_iters}`',
         f'- with_l config: `{args.with_l_config}`',
         f'- pixshuffle config: `{args.pixshuffle_config}`',
