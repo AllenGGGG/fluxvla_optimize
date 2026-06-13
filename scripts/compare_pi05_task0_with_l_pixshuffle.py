@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -104,6 +105,18 @@ def parse_args() -> argparse.Namespace:
         '--debug-token-counts',
         action='store_true',
         help='Print accelerated path token counts during benchmark/eval.')
+    parser.add_argument(
+        '--organize-rollouts',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Copy newly generated rollout videos into per-variant/per-speed '
+            'folders under the comparison output directory.'))
+    parser.add_argument(
+        '--rollout-organize-mode',
+        choices=('copy', 'move'),
+        default='copy',
+        help='Whether organized rollout videos are copied or moved.')
     return parser.parse_args()
 
 
@@ -156,6 +169,45 @@ def repo_path(path: str) -> Path:
 
 def ckpt_root(ckpt_path: str) -> Path:
     return repo_path(ckpt_path).parent.parent
+
+
+def rollout_paths(work_root: Path) -> set[Path]:
+    rollout_root = work_root / 'rollouts'
+    if not rollout_root.exists():
+        return set()
+    return {path.resolve() for path in rollout_root.rglob('*.mp4')}
+
+
+def organize_rollouts(args: argparse.Namespace, output_dir: Path,
+                      item: Dict[str, str], seed: int,
+                      new_paths: Iterable[Path]) -> List[str]:
+    if not args.organize_rollouts:
+        return []
+    speed = item.get('eval_speed')
+    speed_dir = (
+        f'speed_{speed_tag(float(speed))}' if speed is not None else
+        'speed_unspecified')
+    target_dir = output_dir / 'rollouts_by_speed' / speed_dir / item[
+        'variant'] / f'seed_{seed}'
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    organized = []
+    for src in sorted(new_paths):
+        src = Path(src)
+        dst = target_dir / src.name
+        if dst.exists():
+            stem = dst.stem
+            suffix = dst.suffix
+            counter = 1
+            while dst.exists():
+                dst = target_dir / f'{stem}_{counter}{suffix}'
+                counter += 1
+        if args.rollout_organize_mode == 'move':
+            shutil.move(str(src), str(dst))
+        else:
+            shutil.copy2(src, dst)
+        organized.append(str(dst))
+    return organized
 
 
 def run_logged(cmd: List[str], env: Dict[str, str], log_path: Path) -> None:
@@ -388,6 +440,7 @@ def run_success(args: argparse.Namespace, output_dir: Path, logs_dir: Path,
     port = args.master_port + command_index
     work_root = ckpt_root(item['ckpt'])
     before = {p.resolve() for p in work_root.glob('EVAL-*.txt')}
+    rollout_before = rollout_paths(work_root)
     tag = f'{args.tag}_{item["variant"]}_success_seed{seed}'
     log_path = logs_dir / f'{tag}.log'
     cmd = [
@@ -421,6 +474,9 @@ def run_success(args: argparse.Namespace, output_dir: Path, logs_dir: Path,
     run_logged(cmd, env, log_path)
 
     after = list(work_root.glob('EVAL-*.txt'))
+    rollout_after = rollout_paths(work_root)
+    organized_rollouts = organize_rollouts(
+        args, output_dir, item, seed, rollout_after - rollout_before)
     candidates = [p for p in after if p.resolve() not in before]
     if not candidates:
         candidates = after
@@ -437,6 +493,10 @@ def run_success(args: argparse.Namespace, output_dir: Path, logs_dir: Path,
         'triton_max_prompt_len': args.triton_max_prompt_len,
         'eval_file': str(eval_file),
         'log_path': str(log_path),
+        'organized_rollout_count': len(organized_rollouts),
+        'organized_rollout_dir': (
+            str(Path(organized_rollouts[0]).parent)
+            if organized_rollouts else ''),
     })
     return parsed
 
