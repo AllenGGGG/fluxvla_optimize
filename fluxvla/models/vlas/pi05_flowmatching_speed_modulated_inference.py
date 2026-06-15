@@ -29,8 +29,9 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
     """Inference variant of PI05FlowMatchingSpeedModulated with Triton acceleration.
 
     Extends PI05FlowMatchingInference to support TempoVLA speed conditioning.
-    The speed MLP is evaluated before CUDA graph replay and folded into the
-    precomputed decoder timestep embeddings used by the Triton pipeline.
+    The speed MLP is evaluated before CUDA graph replay and added to the
+    decoder timestep conditioning after the time MLP, matching the training
+    implementation in PI05FlowMatchingSpeedModulated.embed_suffix().
 
     Args:
         speed_mlp_hidden_dim (int): Hidden dimension for speed MLP. Default: 256.
@@ -105,7 +106,7 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
         return speed_emb
 
     def _prepare_adarms_cond(self, num_steps, tempo_speed=None):
-        """Pre-compute time embeddings with speed modulation.
+        """Pre-compute base time embeddings and cache speed modulation.
 
         Args:
             num_steps (int): Number of denoising steps.
@@ -113,21 +114,16 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
                 If None, uses self.default_tempo_speed.
 
         Returns:
-            torch.Tensor: Time embeddings with speed modulation,
+            torch.Tensor: Base sinusoidal time embeddings,
                 shape (num_steps, proj_width).
         """
-        # Get base time embeddings
+        # Parent returns raw sinusoidal embeddings. The accelerated decoder
+        # applies time_mlp_in/out inside the graph, so speed must be added
+        # after that MLP to match the training path.
         time_embs = super()._prepare_adarms_cond(num_steps)
 
-        # Add speed modulation
         tempo_speed = self._tempo_speed_to_float(tempo_speed)
-
         speed_emb = self._compute_speed_embedding(tempo_speed)
-
-        # Broadcast and add speed embedding to all time steps
-        # time_embs: (num_steps, proj_width)
-        # speed_emb: (1, proj_width)
-        time_embs = time_embs + speed_emb
 
         # Cache for later use
         self._current_tempo_speed = tempo_speed
@@ -168,9 +164,10 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
                 prefix='encoder_multi_modal_projector'))
         self._triton_weights.update(self._prepare_action_time_triton())
 
-        # Prepare time embeddings with speed modulation
+        decoder_time_embeds = self._prepare_adarms_cond(num_steps, tempo_speed)
         self._triton_weights.update({
-            'decoder_time_embeds': self._prepare_adarms_cond(num_steps, tempo_speed)
+            'decoder_time_embeds': decoder_time_embeds,
+            'decoder_speed_emb': self._speed_emb_buffer,
         })
 
         self._max_prompt_len = max_prompt_len
@@ -249,8 +246,8 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
 
         # Re-compute time embeddings with new speed
         self._triton_weights['decoder_time_embeds'] = self._prepare_adarms_cond(
-            self._num_steps, tempo_speed
-        )
+            self._num_steps, tempo_speed)
+        self._triton_weights['decoder_speed_emb'] = self._speed_emb_buffer
 
         # Invalidate CUDA graph (needs rebuild with new embeddings)
         self._cuda_graph_ready = False

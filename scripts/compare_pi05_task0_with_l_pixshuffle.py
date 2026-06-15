@@ -74,9 +74,9 @@ def parse_args() -> argparse.Namespace:
         '--eval-speeds',
         default=None,
         help=(
-            'Comma-separated eval prompt speeds. When set, each selected '
-            'variant is expanded once per speed by overriding '
-            'LiberoPromptFromInputs.speed. Example: 1.0,1.5,2.0.'))
+            'Comma-separated eval speeds. SpeedModulated variants override '
+            'inference_model.default_tempo_speed; prompt-speed variants '
+            'override LiberoPromptFromInputs.speed. Example: 1.0,1.5,2.0.'))
     parser.add_argument(
         '--output-dir',
         default=None,
@@ -150,17 +150,21 @@ def parse_eval_speeds(value: Optional[str]) -> List[float]:
     return speeds
 
 
-def set_eval_prompt_speed(cfg: Config, speed: float) -> None:
+def set_eval_speed(cfg: Config, speed: float) -> None:
+    model_type = ''
+    if hasattr(cfg, 'inference_model'):
+        model_type = str(cfg.inference_model.get('type', ''))
+        cfg.inference_model.default_tempo_speed = float(speed)
+    if 'SpeedModulated' in model_type:
+        return
+
     transforms = cfg.eval.dataset.transforms
     for transform in transforms:
         if transform.get('type') == 'LiberoPromptFromInputs':
             transform.speed = float(speed)
             transform.speed_prompt_template = (
                 '{task_description} at {speed:g}x speed')
-            return
-    raise ValueError(
-        'Could not find LiberoPromptFromInputs in eval.dataset.transforms; '
-        'cannot apply --eval-speeds.')
+            break
 
 
 def repo_path(path: str) -> Path:
@@ -311,7 +315,7 @@ def materialize_config(args: argparse.Namespace, output_dir: Path,
         cfg.model.use_language = True
         cfg.model.pretrained_name_or_path = args.base_weights
     if item.get('eval_speed') is not None:
-        set_eval_prompt_speed(cfg, float(item['eval_speed']))
+        set_eval_speed(cfg, float(item['eval_speed']))
 
     config_dir = output_dir / 'configs'
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -601,7 +605,7 @@ def write_markdown(path: Path, speed_rows: List[Dict],
         f'- Triton max prompt len override: `{args.triton_max_prompt_len}`',
         f'- Success trials per task: `{args.success_trials_per_task}`',
         f'- Success seeds: `{args.success_seeds}`',
-        f'- Eval prompt speeds: `{args.eval_speeds}`',
+        f'- Eval speeds: `{args.eval_speeds}`',
         f'- Speed warmup/bench iters: `{args.speed_warmup_iters}` / `{args.speed_bench_iters}`',
         f'- with_l config: `{args.with_l_config}`',
         f'- pixshuffle config: `{args.pixshuffle_config}`',

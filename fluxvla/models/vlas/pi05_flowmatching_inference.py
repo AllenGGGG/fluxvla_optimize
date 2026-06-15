@@ -252,6 +252,8 @@ def transformer_decoder(weights,
             buffers['decoder_time_emb'],
             in_features=1024,
             out_features=1024)
+        if 'decoder_speed_emb' in weights:
+            buffers['decoder_time_emb'].add_(weights['decoder_speed_emb'])
         matmul_bias_small(
             buffers['diffusion_noise'],
             weights['decoder_action_in_proj_w'],
