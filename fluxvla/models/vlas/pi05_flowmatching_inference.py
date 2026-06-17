@@ -236,24 +236,46 @@ def transformer_decoder(weights,
                         buffers,
                         encoder_seq_len,
                         num_decoder_layers=18,
-                        num_steps=10):
+                        num_steps=10,
+                        use_ultra_fusion=True):
+    """Transformer decoder with optional ultra-optimized fusion.
+
+    Args:
+        use_ultra_fusion: If True, uses aggressive RealTimeVLA-style fusion kernels.
+    """
     for step in range(num_steps):
-        matmul_bias_silu(
-            weights['decoder_time_embeds'][step].view(1, -1),
-            weights['decoder_time_mlp_in_w'],
-            weights['decoder_time_mlp_in_b'],
-            buffers['decoder_x_buf'],
-            in_features=1024,
-            out_features=1024)
-        matmul_bias_silu(
-            buffers['decoder_x_buf'],
-            weights['decoder_time_mlp_out_w'],
-            weights['decoder_time_mlp_out_b'],
-            buffers['decoder_time_emb'],
-            in_features=1024,
-            out_features=1024)
-        if 'decoder_speed_emb' in weights:
-            buffers['decoder_time_emb'].add_(weights['decoder_speed_emb'])
+        # Time MLP + speed conditioning
+        if use_ultra_fusion and 'decoder_speed_emb' in weights:
+            # OPTIMIZED: Fused time MLP + speed in one kernel
+            from fluxvla.ops.atomic_ops import time_mlp_with_speed_optimized
+            time_mlp_with_speed_optimized(
+                weights['decoder_time_embeds'][step].view(1, -1),
+                weights['decoder_time_mlp_in_w'],
+                weights['decoder_time_mlp_in_b'],
+                weights['decoder_time_mlp_out_w'],
+                weights['decoder_time_mlp_out_b'],
+                weights['decoder_speed_emb'],
+                buffers['decoder_time_emb'],
+                hidden_dim=1024
+            )
+        else:
+            # Standard path
+            matmul_bias_silu(
+                weights['decoder_time_embeds'][step].view(1, -1),
+                weights['decoder_time_mlp_in_w'],
+                weights['decoder_time_mlp_in_b'],
+                buffers['decoder_x_buf'],
+                in_features=1024,
+                out_features=1024)
+            matmul_bias_silu(
+                buffers['decoder_x_buf'],
+                weights['decoder_time_mlp_out_w'],
+                weights['decoder_time_mlp_out_b'],
+                buffers['decoder_time_emb'],
+                in_features=1024,
+                out_features=1024)
+            if 'decoder_speed_emb' in weights:
+                buffers['decoder_time_emb'].add_(weights['decoder_speed_emb'])
         matmul_bias_small(
             buffers['diffusion_noise'],
             weights['decoder_action_in_proj_w'],
@@ -326,16 +348,33 @@ def transformer_decoder(weights,
                 buffers['decoder_q_buf'],
                 head_dim=256)
 
-            matmul_res_gate(
-                buffers['decoder_q_buf'].view(-1, 2048),
-                weights['decoder_attn_o_w'][i],
-                buffers['decoder_x'],
-                buffers['gate_buf'],
-                in_features=2048,
-                out_features=1024,
-                BLOCK_SIZE_N=32,
-                BLOCK_SIZE_M=32,
-                BLOCK_SIZE_K=128)
+            # Attention output projection with residual and gate
+            if use_ultra_fusion:
+                # OPTIMIZED: Fused matmul + residual + gate
+                from fluxvla.ops.atomic_ops import matmul_res_gate_optimized
+                matmul_res_gate_optimized(
+                    buffers['decoder_q_buf'].view(-1, 2048),
+                    weights['decoder_attn_o_w'][i],
+                    buffers['decoder_x'],
+                    buffers['decoder_x'],  # residual
+                    buffers['gate_buf'],
+                    in_features=2048,
+                    out_features=1024,
+                    BLOCK_SIZE_N=32,
+                    BLOCK_SIZE_M=32,
+                    BLOCK_SIZE_K=128)
+            else:
+                # Standard path
+                matmul_res_gate(
+                    buffers['decoder_q_buf'].view(-1, 2048),
+                    weights['decoder_attn_o_w'][i],
+                    buffers['decoder_x'],
+                    buffers['gate_buf'],
+                    in_features=2048,
+                    out_features=1024,
+                    BLOCK_SIZE_N=32,
+                    BLOCK_SIZE_M=32,
+                    BLOCK_SIZE_K=128)
 
             adarms_norm_style_proj(
                 buffers['decoder_x'],
@@ -356,16 +395,33 @@ def transformer_decoder(weights,
                 in_features=1024,
                 intermediate_dim=4096)
 
-            matmul_res_gate(
-                buffers['decoder_hidden'],
-                weights['decoder_ffn_down_w'][i],
-                buffers['decoder_x'],
-                buffers['gate_buf'],
-                in_features=4096,
-                out_features=1024,
-                BLOCK_SIZE_N=16,
-                BLOCK_SIZE_M=32,
-                BLOCK_SIZE_K=256)
+            # FFN output projection with residual and gate
+            if use_ultra_fusion:
+                # OPTIMIZED: Fused matmul + residual + gate
+                from fluxvla.ops.atomic_ops import matmul_res_gate_optimized
+                matmul_res_gate_optimized(
+                    buffers['decoder_hidden'],
+                    weights['decoder_ffn_down_w'][i],
+                    buffers['decoder_x'],
+                    buffers['decoder_x'],  # residual
+                    buffers['gate_buf'],
+                    in_features=4096,
+                    out_features=1024,
+                    BLOCK_SIZE_N=16,
+                    BLOCK_SIZE_M=32,
+                    BLOCK_SIZE_K=256)
+            else:
+                # Standard path
+                matmul_res_gate(
+                    buffers['decoder_hidden'],
+                    weights['decoder_ffn_down_w'][i],
+                    buffers['decoder_x'],
+                    buffers['gate_buf'],
+                    in_features=4096,
+                    out_features=1024,
+                    BLOCK_SIZE_N=16,
+                    BLOCK_SIZE_M=32,
+                    BLOCK_SIZE_K=256)
 
         seq_len = buffers['decoder_x'].shape[0]
         adarms_norm_style_proj(
@@ -404,13 +460,14 @@ def pi05_model(weights,
                num_steps=10,
                visual_tokens_per_view=256,
                visual_grid_size=16,
-               visual_token_downscale_factor=1):
+               visual_token_downscale_factor=1,
+               use_ultra_fusion=False):
     vision_encoder(weights, buffers, num_views, num_vit_layers)
     transformer_encoder(weights, buffers, encoder_seq_len, num_encoder_layers,
                         visual_tokens_per_view, visual_grid_size,
                         visual_token_downscale_factor)
     transformer_decoder(weights, buffers, encoder_seq_len, num_decoder_layers,
-                        num_steps)
+                        num_steps, use_ultra_fusion=use_ultra_fusion)
 
 
 @VLAS.register_module()

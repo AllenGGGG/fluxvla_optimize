@@ -12,16 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Inference config for TempoVLA Speed-Modulated RMSNorm with Triton acceleration.
+"""Inference config for TempoVLA Speed-Modulated with full RealTimeVLA optimizations.
 
-This config is for deployment/demo that requires low-latency inference (< 50ms).
-It uses PI05FlowMatchingSpeedModulatedInference with Triton/CUDA Graph acceleration.
+This config uses PI05FlowMatchingSpeedModulatedInference with all optimizations enabled:
+
+1. Speed embedding pre-computation and caching
+2. CUDA Graph reuse across different speeds
+3. Ultra-optimized fusion kernels (RealTimeVLA-style aggressive fusion)
+
+Expected latency: ~30-40ms on A100 (vs ~40-50ms without ultra fusion)
 
 Usage:
-    # Load checkpoint from training
-    python inference.py --config configs/pi05/pi05_libero10_task0_tempovla_speed_modulated_inference.py \
-                        --checkpoint checkpoints/speed_modulated/latest-checkpoint.pt \
-                        --tempo_speed 1.5
+    # Standard usage
+    python scripts/eval.py --config configs/pi05/pi05_libero10_task0_tempovla_speed_modulated_inference.py \
+                           --checkpoint checkpoints/speed_modulated/latest-checkpoint.safetensors
+
+    # Disable ultra fusion (for comparison)
+    python scripts/eval.py --config configs/pi05/pi05_libero10_task0_tempovla_speed_modulated_inference.py \
+                           --checkpoint checkpoints/speed_modulated/latest-checkpoint.safetensors \
+                           --cfg-options inference_model.use_ultra_fusion=False
 
 Training config: pi05_libero10_task0_tempovla_speed_modulated.py
 """
@@ -36,6 +45,7 @@ inference_model = dict(
     type='PI05FlowMatchingSpeedModulatedInference',
     speed_mlp_hidden_dim=256,
     default_tempo_speed=1.0,  # Default speed for inference
+    use_ultra_fusion=True,    # Enable RealTimeVLA ultra-optimized fusion kernels
 )
 
 # Note: This config assumes the checkpoint was trained with

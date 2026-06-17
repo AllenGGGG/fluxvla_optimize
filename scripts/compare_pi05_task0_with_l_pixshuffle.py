@@ -34,6 +34,13 @@ DEFAULT_PIXSHUFFLE_MLP_CKPT = (
 
 SUCCESS_RE = re.compile(r'# successes:\s*([0-9.]+)\s*\(([0-9.]+)%\)')
 EPISODES_RE = re.compile(r'# episodes completed so far:\s*([0-9.]+)')
+PREDICT_CALLS_RE = re.compile(r'# predict_action calls:\s*([0-9.]+)')
+PREDICT_MEAN_MS_RE = re.compile(
+    r'# predict_action mean ms:\s*([0-9.]+)')
+PREDICT_CALL_HZ_RE = re.compile(
+    r'# predict_action call Hz:\s*([0-9.]+)')
+PREDICT_ACTION_STEP_HZ_RE = re.compile(
+    r'# predict_action action-step Hz:\s*([0-9.]+)')
 LIBERO_INIT_STATES_PER_TASK = 50
 
 
@@ -61,6 +68,16 @@ def parse_args() -> argparse.Namespace:
         metavar=('NAME', 'CONFIG', 'CKPT'),
         default=[],
         help='Custom variant triple. Can be repeated: --variant NAME CONFIG CKPT.')
+    parser.add_argument(
+        '--speed-variant',
+        nargs=3,
+        action='append',
+        metavar=('NAME', 'CONFIG', 'CKPT'),
+        default=[],
+        help=(
+            'Additional speed-only variant triple. Use this for realtime '
+            'frequency comparisons without running duplicate LIBERO success '
+            'evals, e.g. --speed-variant tempovla_realtime CONFIG CKPT.'))
     parser.add_argument(
         '--base-weights',
         default='./checkpoints/pi05_base/model.safetensors',
@@ -117,6 +134,14 @@ def parse_args() -> argparse.Namespace:
         choices=('copy', 'move'),
         default='copy',
         help='Whether organized rollout videos are copied or moved.')
+    parser.add_argument(
+        '--measure-task-inference-frequency',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'During LIBERO success eval, measure model-side predict_action '
+            'latency on real task rollouts and write task Hz into success '
+            'statistics.'))
     return parser.parse_args()
 
 
@@ -148,6 +173,37 @@ def parse_eval_speeds(value: Optional[str]) -> List[float]:
     if invalid:
         raise ValueError(f'--eval-speeds must be positive, got: {invalid}')
     return speeds
+
+
+def infer_inference_mode(name: str, config_path: str) -> str:
+    text = f'{name} {config_path}'.lower()
+    if 'realtime' in text or '_rt' in text:
+        return 'realtime'
+    return 'standard'
+
+
+def infer_base_variant(name: str) -> str:
+    base = name
+    for suffix in ('_realtime', '-realtime', '_rt', '-rt',
+                   '_standard', '-standard', '_normal', '-normal'):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    return base
+
+
+def make_variant_item(name: str,
+                      config: str,
+                      ckpt: str,
+                      speed_only: bool = False) -> Dict[str, str]:
+    return {
+        'variant': name,
+        'base_variant': infer_base_variant(name),
+        'inference_mode': infer_inference_mode(name, config),
+        'source_config': config,
+        'ckpt': ckpt,
+        'speed_only': speed_only,
+    }
 
 
 def set_eval_speed(cfg: Config, speed: float) -> None:
@@ -254,6 +310,10 @@ def parse_success_text(text: str, source: Path) -> Dict[str, float]:
     episodes: Optional[float] = None
     successes: Optional[float] = None
     success_rate: Optional[float] = None
+    predict_calls: Optional[float] = None
+    predict_mean_ms: Optional[float] = None
+    predict_call_hz: Optional[float] = None
+    predict_action_step_hz: Optional[float] = None
     for line in text.splitlines():
         ep_match = EPISODES_RE.search(line)
         if ep_match:
@@ -262,13 +322,33 @@ def parse_success_text(text: str, source: Path) -> Dict[str, float]:
         if success_match:
             successes = float(success_match.group(1))
             success_rate = float(success_match.group(2))
+        calls_match = PREDICT_CALLS_RE.search(line)
+        if calls_match:
+            predict_calls = float(calls_match.group(1))
+        mean_match = PREDICT_MEAN_MS_RE.search(line)
+        if mean_match:
+            predict_mean_ms = float(mean_match.group(1))
+        call_hz_match = PREDICT_CALL_HZ_RE.search(line)
+        if call_hz_match:
+            predict_call_hz = float(call_hz_match.group(1))
+        action_hz_match = PREDICT_ACTION_STEP_HZ_RE.search(line)
+        if action_hz_match:
+            predict_action_step_hz = float(action_hz_match.group(1))
     if episodes is None or successes is None or success_rate is None:
         raise ValueError(f'Could not parse success stats from {source}')
-    return {
+    parsed = {
         'episodes': episodes,
         'successes': successes,
         'success_rate_pct': success_rate,
     }
+    if predict_calls is not None:
+        parsed.update({
+            'task_predict_calls': predict_calls,
+            'task_predict_mean_ms': predict_mean_ms,
+            'task_predict_call_hz': predict_call_hz,
+            'task_predict_action_step_hz': predict_action_step_hz,
+        })
+    return parsed
 
 
 def parse_success_file(path: Path) -> Dict[str, float]:
@@ -349,12 +429,12 @@ def variants(args: argparse.Namespace, output_dir: Path) -> List[Dict[str, str]]
     eval_speeds = parse_eval_speeds(args.eval_speeds)
     if args.variant:
         custom_items = [
-            {
-                'variant': name,
-                'source_config': config,
-                'ckpt': ckpt,
-            } for name, config, ckpt in args.variant
+            make_variant_item(name, config, ckpt)
+            for name, config, ckpt in args.variant
         ]
+        custom_items.extend(
+            make_variant_item(name, config, ckpt, speed_only=True)
+            for name, config, ckpt in args.speed_variant)
         if eval_speeds:
             custom_items = expand_eval_speed_items(custom_items, eval_speeds)
         return [
@@ -363,26 +443,19 @@ def variants(args: argparse.Namespace, output_dir: Path) -> List[Dict[str, str]]
         ]
 
     all_items = [
-        {
-            'variant': 'with_l',
-            'source_config': args.with_l_config,
-            'ckpt': args.with_l_ckpt,
-        },
-        {
-            'variant': 'pixshuffle',
-            'source_config': args.pixshuffle_config,
-            'ckpt': args.pixshuffle_ckpt,
-        },
-        {
-            'variant': 'pixshuffle_mlp',
-            'source_config': args.pixshuffle_mlp_config,
-            'ckpt': args.pixshuffle_mlp_ckpt,
-        },
+        make_variant_item('with_l', args.with_l_config, args.with_l_ckpt),
+        make_variant_item('pixshuffle', args.pixshuffle_config,
+                          args.pixshuffle_ckpt),
+        make_variant_item('pixshuffle_mlp', args.pixshuffle_mlp_config,
+                          args.pixshuffle_mlp_ckpt),
     ]
     selected = set(requested_variants(args))
     selected_items = [
         item for item in all_items if item['variant'] in selected
     ]
+    selected_items.extend(
+        make_variant_item(name, config, ckpt, speed_only=True)
+        for name, config, ckpt in args.speed_variant)
     if eval_speeds:
         selected_items = expand_eval_speed_items(selected_items, eval_speeds)
     return [
@@ -427,6 +500,9 @@ def run_speed(args: argparse.Namespace, output_dir: Path, logs_dir: Path,
     result = data['results'][0]
     result.update({
         'requested_variant': item['variant'],
+        'base_variant': item.get('base_variant', item['variant']),
+        'inference_mode': item.get('inference_mode', 'standard'),
+        'speed_only': item.get('speed_only', False),
         'eval_speed': item.get('eval_speed'),
         'scenario': scenario,
         'result_path': str(result_path),
@@ -468,6 +544,8 @@ def run_success(args: argparse.Namespace, output_dir: Path, logs_dir: Path,
         f'eval.num_trials_per_task={args.success_trials_per_task}',
         f'eval.seed={seed}',
         f'eval.eval_task_ids=[{args.task_id}]',
+        f'eval.measure_predict_latency='
+        f'{args.measure_task_inference_frequency}',
         'inference_model.use_language=True',
         f'inference_model.pretrained_name_or_path={args.base_weights}',
     ]
@@ -487,6 +565,8 @@ def run_success(args: argparse.Namespace, output_dir: Path, logs_dir: Path,
     eval_file, parsed = parse_best_success(candidates, log_path)
     parsed.update({
         'requested_variant': item['variant'],
+        'base_variant': item.get('base_variant', item['variant']),
+        'inference_mode': item.get('inference_mode', 'standard'),
         'eval_speed': item.get('eval_speed'),
         'seed': seed,
         'ckpt_path': item['ckpt'],
@@ -515,6 +595,116 @@ def write_csv(path: Path, rows: List[Dict]) -> None:
         writer.writerows(rows)
 
 
+def speed_frequency_comparisons(speed_rows: List[Dict]) -> List[Dict]:
+    grouped: Dict[Tuple[str, object, str], Dict[str, Dict]] = {}
+    for row in speed_rows:
+        key = (
+            row.get('base_variant', row.get('requested_variant')),
+            row.get('eval_speed'),
+            row.get('scenario'),
+        )
+        grouped.setdefault(key, {})[row.get('inference_mode', 'standard')] = row
+
+    comparisons = []
+    for (base_variant, eval_speed, scenario), modes in sorted(
+            grouped.items(), key=lambda item: tuple(str(x) for x in item[0])):
+        standard = modes.get('standard')
+        realtime = modes.get('realtime')
+        if standard is None or realtime is None:
+            continue
+
+        standard_hz = float(standard['chunk_hz'])
+        realtime_hz = float(realtime['chunk_hz'])
+        standard_action_hz = float(standard['action_step_hz'])
+        realtime_action_hz = float(realtime['action_step_hz'])
+        standard_ms = float(standard['mean_ms'])
+        realtime_ms = float(realtime['mean_ms'])
+        comparisons.append({
+            'base_variant': base_variant,
+            'eval_speed': eval_speed,
+            'scenario': scenario,
+            'standard_variant': standard['requested_variant'],
+            'realtime_variant': realtime['requested_variant'],
+            'standard_config': standard['config_path'],
+            'realtime_config': realtime['config_path'],
+            'standard_mean_ms': standard_ms,
+            'realtime_mean_ms': realtime_ms,
+            'latency_delta_ms': realtime_ms - standard_ms,
+            'latency_ratio_realtime_over_standard':
+            realtime_ms / standard_ms,
+            'standard_chunk_hz': standard_hz,
+            'realtime_chunk_hz': realtime_hz,
+            'chunk_hz_delta': realtime_hz - standard_hz,
+            'chunk_hz_speedup': realtime_hz / standard_hz,
+            'standard_action_step_hz': standard_action_hz,
+            'realtime_action_step_hz': realtime_action_hz,
+            'action_step_hz_delta':
+            realtime_action_hz - standard_action_hz,
+            'action_step_hz_speedup':
+            realtime_action_hz / standard_action_hz,
+            'standard_peak_gib':
+            float(standard['peak_allocated_gib_during_benchmark']),
+            'realtime_peak_gib':
+            float(realtime['peak_allocated_gib_during_benchmark']),
+        })
+    return comparisons
+
+
+def task_frequency_comparisons(success_rows: List[Dict]) -> List[Dict]:
+    grouped: Dict[Tuple[str, object, object], Dict[str, Dict]] = {}
+    for row in success_rows:
+        if row.get('task_predict_call_hz') is None:
+            continue
+        key = (
+            row.get('base_variant', row.get('requested_variant')),
+            row.get('eval_speed'),
+            row.get('seed'),
+        )
+        grouped.setdefault(key, {})[row.get('inference_mode', 'standard')] = row
+
+    comparisons = []
+    for (base_variant, eval_speed, seed), modes in sorted(
+            grouped.items(), key=lambda item: tuple(str(x) for x in item[0])):
+        standard = modes.get('standard')
+        realtime = modes.get('realtime')
+        if standard is None or realtime is None:
+            continue
+
+        standard_hz = float(standard['task_predict_call_hz'])
+        realtime_hz = float(realtime['task_predict_call_hz'])
+        standard_action_hz = float(standard['task_predict_action_step_hz'])
+        realtime_action_hz = float(realtime['task_predict_action_step_hz'])
+        standard_ms = float(standard['task_predict_mean_ms'])
+        realtime_ms = float(realtime['task_predict_mean_ms'])
+        comparisons.append({
+            'base_variant': base_variant,
+            'eval_speed': eval_speed,
+            'seed': seed,
+            'standard_variant': standard['requested_variant'],
+            'realtime_variant': realtime['requested_variant'],
+            'standard_success_rate_pct': standard['success_rate_pct'],
+            'realtime_success_rate_pct': realtime['success_rate_pct'],
+            'standard_task_predict_calls': standard['task_predict_calls'],
+            'realtime_task_predict_calls': realtime['task_predict_calls'],
+            'standard_task_mean_ms': standard_ms,
+            'realtime_task_mean_ms': realtime_ms,
+            'task_latency_delta_ms': realtime_ms - standard_ms,
+            'task_latency_ratio_realtime_over_standard':
+            realtime_ms / standard_ms,
+            'standard_task_call_hz': standard_hz,
+            'realtime_task_call_hz': realtime_hz,
+            'task_call_hz_delta': realtime_hz - standard_hz,
+            'task_call_hz_speedup': realtime_hz / standard_hz,
+            'standard_task_action_step_hz': standard_action_hz,
+            'realtime_task_action_step_hz': realtime_action_hz,
+            'task_action_step_hz_delta':
+            realtime_action_hz - standard_action_hz,
+            'task_action_step_hz_speedup':
+            realtime_action_hz / standard_action_hz,
+        })
+    return comparisons
+
+
 def fmt(value, digits: int = 3) -> str:
     if value is None:
         return 'n/a'
@@ -524,6 +714,8 @@ def fmt(value, digits: int = 3) -> str:
 
 
 def write_markdown(path: Path, speed_rows: List[Dict],
+                   frequency_rows: List[Dict],
+                   task_frequency_rows: List[Dict],
                    success_rows: List[Dict], errors: List[Dict],
                    args: argparse.Namespace) -> None:
     lines = [
@@ -540,15 +732,17 @@ def write_markdown(path: Path, speed_rows: List[Dict],
         '',
         '## Speed',
         '',
-        '| Variant | Eval speed | Scenario | GPUs | Workers | Prompt len | Mean ms | P90 ms | Chunk Hz | Action-step Hz | Peak GiB |',
-        '| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+        '| Variant | Base | Mode | Eval speed | Scenario | GPUs | Workers | Prompt len | Mean ms | P90 ms | Chunk Hz | Action-step Hz | Peak GiB |',
+        '| --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |',
     ]
     for row in speed_rows:
         lines.append(
-            '| {variant} | {eval_speed} | {scenario} | `{gpus}` | {workers} | {prompt_len} | '
+            '| {variant} | {base} | {mode} | {eval_speed} | {scenario} | `{gpus}` | {workers} | {prompt_len} | '
             '{mean_ms} | {p90_ms} | {chunk_hz} | {action_hz} | {peak} |'.
             format(
                 variant=row['requested_variant'],
+                base=row.get('base_variant', row['requested_variant']),
+                mode=row.get('inference_mode', 'standard'),
                 eval_speed=fmt(row.get('eval_speed')),
                 scenario=row['scenario'],
                 gpus=row.get('cuda_visible_devices', ''),
@@ -561,17 +755,66 @@ def write_markdown(path: Path, speed_rows: List[Dict],
                 peak=fmt(float(row['peak_allocated_gib_during_benchmark'])),
             ))
 
+    if frequency_rows:
+        lines += [
+            '',
+            '## Synthetic Realtime Frequency Comparison',
+            '',
+            '| Base | Eval speed | Scenario | Standard Hz | Realtime Hz | Hz speedup | Standard ms | Realtime ms |',
+            '| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |',
+        ]
+        for row in frequency_rows:
+            lines.append(
+                '| {base} | {eval_speed} | {scenario} | {standard_hz} | '
+                '{realtime_hz} | {speedup} | {standard_ms} | {realtime_ms} |'
+                .format(
+                    base=row['base_variant'],
+                    eval_speed=fmt(row.get('eval_speed')),
+                    scenario=row['scenario'],
+                    standard_hz=fmt(row['standard_chunk_hz']),
+                    realtime_hz=fmt(row['realtime_chunk_hz']),
+                    speedup=fmt(row['chunk_hz_speedup']),
+                    standard_ms=fmt(row['standard_mean_ms']),
+                    realtime_ms=fmt(row['realtime_mean_ms']),
+                ))
+
+    if task_frequency_rows:
+        lines += [
+            '',
+            '## Task Rollout Realtime Frequency Comparison',
+            '',
+            '| Base | Eval speed | Seed | Standard task Hz | Realtime task Hz | Hz speedup | Standard ms | Realtime ms | Standard success | Realtime success |',
+            '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+        ]
+        for row in task_frequency_rows:
+            lines.append(
+                '| {base} | {eval_speed} | {seed} | {standard_hz} | '
+                '{realtime_hz} | {speedup} | {standard_ms} | '
+                '{realtime_ms} | {standard_success}% | {realtime_success}% |'
+                .format(
+                    base=row['base_variant'],
+                    eval_speed=fmt(row.get('eval_speed')),
+                    seed=row['seed'],
+                    standard_hz=fmt(row['standard_task_call_hz']),
+                    realtime_hz=fmt(row['realtime_task_call_hz']),
+                    speedup=fmt(row['task_call_hz_speedup']),
+                    standard_ms=fmt(row['standard_task_mean_ms']),
+                    realtime_ms=fmt(row['realtime_task_mean_ms']),
+                    standard_success=fmt(row['standard_success_rate_pct']),
+                    realtime_success=fmt(row['realtime_success_rate_pct']),
+                ))
+
     lines += [
         '',
         '## Success',
         '',
-        '| Variant | Eval speed | Seed | GPUs | Episodes | Successes | Success Rate | Eval File |',
-        '| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |',
+        '| Variant | Eval speed | Seed | GPUs | Episodes | Successes | Success Rate | Task call Hz | Task mean ms | Eval File |',
+        '| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |',
     ]
     for row in success_rows:
         lines.append(
             '| {variant} | {eval_speed} | {seed} | `{gpus}` | {episodes} | {successes} | '
-            '{rate}% | `{eval_file}` |'.format(
+            '{rate}% | {task_hz} | {task_ms} | `{eval_file}` |'.format(
                 variant=row['requested_variant'],
                 eval_speed=fmt(row.get('eval_speed')),
                 seed=row['seed'],
@@ -579,6 +822,8 @@ def write_markdown(path: Path, speed_rows: List[Dict],
                 episodes=fmt(float(row['episodes']), 0),
                 successes=fmt(float(row['successes']), 0),
                 rate=fmt(float(row['success_rate_pct'])),
+                task_hz=fmt(row.get('task_predict_call_hz')),
+                task_ms=fmt(row.get('task_predict_mean_ms')),
                 eval_file=row['eval_file'],
             ))
 
@@ -607,6 +852,8 @@ def write_markdown(path: Path, speed_rows: List[Dict],
         f'- Success seeds: `{args.success_seeds}`',
         f'- Eval speeds: `{args.eval_speeds}`',
         f'- Speed warmup/bench iters: `{args.speed_warmup_iters}` / `{args.speed_bench_iters}`',
+        f'- Task rollout inference frequency: `{args.measure_task_inference_frequency}`',
+        f'- Extra speed-only variants: `{args.speed_variant}`',
         f'- with_l config: `{args.with_l_config}`',
         f'- pixshuffle config: `{args.pixshuffle_config}`',
         f'- pixshuffle_mlp config: `{args.pixshuffle_mlp_config}`',
@@ -667,6 +914,8 @@ def main() -> None:
     if not args.skip_success:
         for seed in [int(seed) for seed in split_csv(args.success_seeds)]:
             for item in variant_items:
+                if item.get('speed_only', False):
+                    continue
                 try:
                     success_results.append(
                         run_success(args, output_dir, logs_dir, item, seed,
@@ -675,15 +924,24 @@ def main() -> None:
                     handle_error('success', item, exc, seed=seed)
                 command_index += 1
 
+    frequency_results = speed_frequency_comparisons(speed_results)
+    task_frequency_results = task_frequency_comparisons(success_results)
+
     write_csv(output_dir / 'speed.csv', speed_results)
+    write_csv(output_dir / 'frequency_comparison.csv', frequency_results)
+    write_csv(output_dir / 'task_frequency_comparison.csv',
+              task_frequency_results)
     write_csv(output_dir / 'success.csv', success_results)
     write_csv(output_dir / 'errors.csv', errors)
-    write_markdown(output_dir / 'summary.md', speed_results, success_results,
+    write_markdown(output_dir / 'summary.md', speed_results,
+                   frequency_results, task_frequency_results, success_results,
                    errors, args)
     with (output_dir / 'summary.json').open('w') as f:
         json.dump(
             {
                 'speed': speed_results,
+                'frequency_comparison': frequency_results,
+                'task_frequency_comparison': task_frequency_results,
                 'success': success_results,
                 'errors': errors,
                 'args': vars(args),

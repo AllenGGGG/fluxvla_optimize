@@ -79,6 +79,7 @@ class LiberoEvalRunner:
                  num_steps_wait: int = 10,
                  mixed_precision_dtype: str = 'bf16',
                  eval_task_ids=None,
+                 measure_predict_latency: bool = False,
                  enable_mixed_precision_training: bool = True):
         from fluxvla.engines import (build_dataset_from_cfg,
                                      build_transform_from_cfg,
@@ -130,6 +131,7 @@ class LiberoEvalRunner:
         self.seed = seed
         self.ckpt_path = ckpt_path
         self.eval_task_ids = eval_task_ids
+        self.measure_predict_latency = measure_predict_latency
         data_stat_path = os.path.join(
             Path(self.ckpt_path).resolve().parent.parent,
             'dataset_statistics.json')  # noqa: E501
@@ -246,6 +248,10 @@ class LiberoEvalRunner:
         total_episodes, total_successes = torch.zeros(
             1, device=torch.cuda.current_device()), torch.zeros(
                 1, device=torch.cuda.current_device())
+        latency_count = torch.zeros(1, device=torch.cuda.current_device())
+        latency_sum_ms = torch.zeros(1, device=torch.cuda.current_device())
+        latency_action_steps = torch.zeros(
+            1, device=torch.cuda.current_device())
         unnorm_key = self.task_suite_name
         if rank == 0:
             pbar = tqdm.tqdm(
@@ -339,19 +345,33 @@ class LiberoEvalRunner:
                         next_batch = None
                     is_new_episode = False
                     batch['unnorm_key'] = unnorm_key
+                    if self.measure_predict_latency:
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        start_event.record()
                     with torch.autocast(
                             'cuda',
                             dtype=self.mixed_precision_dtype,
                             enabled=self.enable_mixed_precision_training):
                         with torch.no_grad():
                             actions = self.vla.predict_action(**batch)
+                    if self.measure_predict_latency:
+                        end_event.record()
+                        torch.cuda.synchronize()
+                        latency_sum_ms += start_event.elapsed_time(end_event)
+                        latency_count += 1
                     if len(actions.shape) == 3:
+                        action_steps_this_call = min(self.eval_chunk_size,
+                                                     actions.shape[1])
                         actions = actions[
                             0, :self.eval_chunk_size, :].float().cpu().numpy()
                     else:
                         assert len(actions.shape) == 2, \
                             f'Unexpected action shape: {actions.shape}'
+                        action_steps_this_call = 1
                         actions = actions[0, None, :].float().cpu().numpy()
+                    if self.measure_predict_latency:
+                        latency_action_steps += action_steps_this_call
                     for action in actions:
                         inputs = dict(
                             action=action,
@@ -395,8 +415,15 @@ class LiberoEvalRunner:
 
             global_episodes = total_episodes.clone()
             global_successes = total_successes.clone()
+            global_latency_count = latency_count.clone()
+            global_latency_sum_ms = latency_sum_ms.clone()
+            global_latency_action_steps = latency_action_steps.clone()
             dist.all_reduce(global_episodes, op=dist.ReduceOp.SUM)
             dist.all_reduce(global_successes, op=dist.ReduceOp.SUM)
+            dist.all_reduce(global_latency_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(global_latency_sum_ms, op=dist.ReduceOp.SUM)
+            dist.all_reduce(
+                global_latency_action_steps, op=dist.ReduceOp.SUM)
             done = done.item() if isinstance(done, torch.Tensor) else done
             if rank == 0:
                 # Log current results
@@ -412,6 +439,25 @@ class LiberoEvalRunner:
                 success_log = (f'# successes: {global_successes[0]} '
                                f'({success_rate:.1f}%)\n')  # noqa: E231
                 log_file.write(success_log)
+                if (self.measure_predict_latency
+                        and global_latency_count.item() > 0):
+                    mean_ms = (
+                        global_latency_sum_ms / global_latency_count).item()
+                    call_hz = 1000.0 / mean_ms
+                    action_step_hz = (
+                        global_latency_action_steps /
+                        (global_latency_sum_ms / 1000.0)).item()
+                    latency_lines = [
+                        f'# predict_action calls: '
+                        f'{int(global_latency_count.item())}',
+                        f'# predict_action mean ms: {mean_ms:.3f}',
+                        f'# predict_action call Hz: {call_hz:.3f}',
+                        f'# predict_action action-step Hz: '
+                        f'{action_step_hz:.3f}',
+                    ]
+                    for line in latency_lines:
+                        overwatch.info(line)
+                        log_file.write(line + '\n')
                 log_file.flush()
         dist.barrier()
         exit(0)

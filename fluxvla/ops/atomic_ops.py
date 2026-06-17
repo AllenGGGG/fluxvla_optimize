@@ -23,6 +23,8 @@ from fluxvla.ops.triton.norm_triton_ops import (ada_layer_norm_kernel,
                                                 adarms_norm_kernel,
                                                 rms_norm_kernel,
                                                 rmsnorm_factor_kernel)
+from fluxvla.ops.triton.realtime_fusion_ops import (
+    adarms_norm_gate_fused, matmul_res_gate_fused, time_mlp_speed_fused)
 
 # yapf: enable
 
@@ -577,3 +579,70 @@ def dit_block_cross(x, enc, temb, n1_w, n1_b, q_w, q_b, kv_w, kv_b, o_w, o_b,
     x = ff_gelu(h, ff_up_w_T, ff_up_b, ff_dn_w, ff_dn_b, ff_features,
                 ff_hidden) + x
     return x
+
+
+# ---------------------------------------------------------------------------
+# RealTimeVLA enhanced fusion ops
+# ---------------------------------------------------------------------------
+
+
+def adarms_norm_gate_optimized(x, style, normed_x, gate, hidden_dim):
+    """Optimized AdaRMSNorm + gate extraction in single kernel.
+
+    Replaces separate adarms_norm + style projection with fused operation.
+
+    Args:
+        x: Input [seq_len, hidden_dim]
+        style: Style embedding [1, style_dim] where style_dim >= 2*hidden_dim
+        normed_x: Output normalized x
+        gate: Output gate values
+        hidden_dim: Hidden dimension
+    """
+    adarms_norm_gate_fused(x, style, normed_x, gate, hidden_dim)
+
+
+def matmul_res_gate_optimized(inp, weight, out, res, gate,
+                              in_features, out_features,
+                              BLOCK_SIZE_N=32, BLOCK_SIZE_M=32, BLOCK_SIZE_K=128):
+    """Optimized matmul + residual + gate in single kernel.
+
+    Replaces: out = res + (inp @ weight) * gate
+    With a single fused kernel avoiding intermediate buffers.
+
+    Args:
+        inp: Input [seq_len, in_features]
+        weight: Weight [in_features, out_features]
+        out: Output buffer
+        res: Residual connection
+        gate: Gate values
+        in_features, out_features: Dimensions
+        BLOCK_SIZE_*: Tile sizes
+    """
+    matmul_res_gate_fused(inp, weight, out, res, gate,
+                         in_features, out_features,
+                         BLOCK_SIZE_N, BLOCK_SIZE_M, BLOCK_SIZE_K)
+
+
+def time_mlp_with_speed_optimized(time_embed, time_mlp_in_w, time_mlp_in_b,
+                                  time_mlp_out_w, time_mlp_out_b,
+                                  speed_emb, out, hidden_dim):
+    """Optimized time MLP + speed embedding in single kernel.
+
+    Replaces:
+      1. matmul_bias_silu(time_embed, time_mlp_in_w, time_mlp_in_b, buf)
+      2. matmul_bias_silu(buf, time_mlp_out_w, time_mlp_out_b, time_emb)
+      3. time_emb.add_(speed_emb)
+
+    With a single fused kernel.
+
+    Args:
+        time_embed: Time embedding [1, hidden_dim]
+        time_mlp_in_w/b: First MLP layer weights/bias
+        time_mlp_out_w/b: Second MLP layer weights/bias
+        speed_emb: Speed embedding [1, hidden_dim]
+        out: Output buffer
+        hidden_dim: Hidden dimension
+    """
+    time_mlp_speed_fused(time_embed, time_mlp_in_w, time_mlp_in_b,
+                        time_mlp_out_w, time_mlp_out_b, speed_emb, out, hidden_dim)
+

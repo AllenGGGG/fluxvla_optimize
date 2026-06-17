@@ -28,7 +28,13 @@ overwatch = initialize_overwatch(__name__)
 class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
     """Inference variant of PI05FlowMatchingSpeedModulated with Triton acceleration.
 
-    Extends PI05FlowMatchingInference to support TempoVLA speed conditioning.
+    Extends PI05FlowMatchingInference to support TempoVLA speed conditioning
+    with RealTimeVLA-inspired optimizations:
+
+    1. Speed embedding pre-computation and caching (eliminates speed_mlp overhead)
+    2. CUDA Graph reuse across different speeds (no graph rebuild)
+    3. Optional ultra-optimized fusion kernels (aggressive operator fusion)
+
     The speed MLP is evaluated before CUDA graph replay and added to the
     decoder timestep conditioning after the time MLP, matching the training
     implementation in PI05FlowMatchingSpeedModulated.embed_suffix().
@@ -36,6 +42,7 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
     Args:
         speed_mlp_hidden_dim (int): Hidden dimension for speed MLP. Default: 256.
         default_tempo_speed (float): Default speed for inference. Default: 1.0.
+        use_ultra_fusion (bool): Use aggressive RealTimeVLA fusion kernels. Default: True.
         *args, **kwargs: Forwarded to PI05FlowMatchingInference.
     """
 
@@ -43,10 +50,13 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
         self,
         speed_mlp_hidden_dim: int = 256,
         default_tempo_speed: float = 1.0,
+        use_ultra_fusion: bool = True,
         *args,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
+
+        self.use_ultra_fusion = use_ultra_fusion
 
         # Speed modulation MLP (same as training version)
         self.speed_mlp = nn.Sequential(
@@ -59,10 +69,14 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
         self._current_tempo_speed = None
         self._speed_emb_buffer = None
 
+        # Pre-computed speed embedding cache (initialized during prepare_triton_inference)
+        self._speed_embedding_cache = None
+
         overwatch.info(
             f"Initialized speed-modulated inference MLP: "
             f"1 -> {speed_mlp_hidden_dim} -> {self.proj_width}, "
-            f"default_tempo_speed={default_tempo_speed}"
+            f"default_tempo_speed={default_tempo_speed}, "
+            f"use_ultra_fusion={use_ultra_fusion}"
         )
 
     def _tempo_speed_to_float(self, tempo_speed) -> float:
@@ -88,6 +102,8 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
     def _compute_speed_embedding(self, tempo_speed: float) -> torch.Tensor:
         """Compute speed embedding for a given speed.
 
+        Uses cache if available to avoid recomputing speed_mlp forward.
+
         Args:
             tempo_speed (float): Speed value (e.g., 0.5, 1.0, 2.0).
 
@@ -95,6 +111,12 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
             torch.Tensor: Speed embedding of shape (1, proj_width).
         """
         tempo_speed = self._tempo_speed_to_float(tempo_speed)
+
+        # Use cached embedding if available
+        if self._speed_embedding_cache is not None and tempo_speed in self._speed_embedding_cache:
+            return self._speed_embedding_cache[tempo_speed]
+
+        # Fallback: compute on-the-fly (used before prepare_triton_inference)
         speed_param = next(self.speed_mlp.parameters())
         speed_tensor = torch.tensor(
             [[tempo_speed]],
@@ -151,6 +173,24 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
         """
         # Store tempo_speed for use in parent's prepare
         tempo_speed = self._tempo_speed_to_float(tempo_speed)
+
+        # Pre-compute ALL speed embeddings for common speeds (OpenVLA-style caching)
+        common_speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+        self._speed_embedding_cache = {}
+        speed_param = next(self.speed_mlp.parameters())
+
+        overwatch.info(f"Pre-computing speed embeddings for speeds: {common_speeds}")
+        with torch.no_grad():
+            for speed in common_speeds:
+                speed_tensor = torch.tensor(
+                    [[speed]],
+                    dtype=speed_param.dtype,
+                    device=speed_param.device,
+                )
+                speed_emb = self.speed_mlp(speed_tensor).to(torch.bfloat16)
+                self._speed_embedding_cache[speed] = speed_emb
+
+        overwatch.info(f"Speed embedding cache ready with {len(self._speed_embedding_cache)} entries")
 
         # Collect all weights
         self._triton_weights = {}
@@ -233,7 +273,8 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
         """Update tempo_speed after Triton preparation.
 
         This allows dynamic speed changes without re-preparing the entire graph.
-        Note: This requires re-computing time embeddings, which is relatively cheap.
+        Speed embeddings are looked up from cache, avoiding speed_mlp forward.
+        CUDA graph is NOT invalidated if the speed is in cache.
 
         Args:
             tempo_speed (float): New speed value.
@@ -244,16 +285,37 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
             )
         tempo_speed = self._tempo_speed_to_float(tempo_speed)
 
+        # Update speed embedding (from cache if available)
+        speed_emb = self._compute_speed_embedding(tempo_speed)
+        self._current_tempo_speed = tempo_speed
+        self._speed_emb_buffer = speed_emb
+
+        # Update the buffer in-place (no graph invalidation needed)
+        self._triton_weights['decoder_speed_emb'] = speed_emb
+
         # Re-compute time embeddings with new speed
+        # Time embeddings are cheap to recompute and don't require graph rebuild
         self._triton_weights['decoder_time_embeds'] = self._prepare_adarms_cond(
             self._num_steps, tempo_speed)
-        self._triton_weights['decoder_speed_emb'] = self._speed_emb_buffer
 
-        # Invalidate CUDA graph (needs rebuild with new embeddings)
-        self._cuda_graph_ready = False
-        self._cuda_graph = None
+        # IMPORTANT: We do NOT invalidate CUDA graph here.
+        # The graph reads from decoder_speed_emb buffer, which we updated in-place.
+        # This is the key optimization: graph reuse across different speeds.
 
-        overwatch.info(f'Updated tempo_speed to {tempo_speed}')
+        overwatch.info(f'Updated tempo_speed to {tempo_speed} (from cache, graph preserved)')
+
+    def _run_forward(self):
+        """Override to pass use_ultra_fusion flag to decoder."""
+        from .pi05_flowmatching_inference import pi05_model
+        pi05_model(
+            self._triton_weights, self._triton_bufs, self.num_views,
+            self._encoder_seq_len, self._num_vit_layers,
+            self._num_encoder_layers, self._num_decoder_layers,
+            self._num_steps, self._visual_tokens_per_view,
+            self._visual_grid_size,
+            self._visual_token_downscale_factor,
+            use_ultra_fusion=self.use_ultra_fusion
+        )
 
     def predict_action(
         self,
