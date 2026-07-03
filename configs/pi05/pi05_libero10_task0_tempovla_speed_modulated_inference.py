@@ -45,7 +45,10 @@ inference_model = dict(
     type='PI05FlowMatchingSpeedModulatedInference',
     speed_mlp_hidden_dim=256,
     default_tempo_speed=1.0,  # Default speed for inference
-    use_ultra_fusion=True,    # Enable RealTimeVLA ultra-optimized fusion kernels
+    # Ultra fusion verified to give NO speedup with CUDA Graph (it targets
+    # kernel-launch overhead that CUDA Graph already eliminates). Off by
+    # default; flip to True only for A/B comparison.
+    use_ultra_fusion=False,
 )
 
 # Note: This config assumes the checkpoint was trained with

@@ -42,7 +42,11 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
     Args:
         speed_mlp_hidden_dim (int): Hidden dimension for speed MLP. Default: 256.
         default_tempo_speed (float): Default speed for inference. Default: 1.0.
-        use_ultra_fusion (bool): Use aggressive RealTimeVLA fusion kernels. Default: True.
+        use_ultra_fusion (bool): Use aggressive RealTimeVLA fusion kernels.
+            Default: False. NOTE: verified to give NO speedup (slightly slower)
+            when CUDA Graph is enabled, because CUDA Graph already eliminates
+            kernel-launch overhead — the very thing fusion targets. Kept for
+            A/B comparison only. Numerically identical to the standard path.
         *args, **kwargs: Forwarded to PI05FlowMatchingInference.
     """
 
@@ -50,7 +54,7 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
         self,
         speed_mlp_hidden_dim: int = 256,
         default_tempo_speed: float = 1.0,
-        use_ultra_fusion: bool = True,
+        use_ultra_fusion: bool = False,
         *args,
         **kwargs
     ):
@@ -205,9 +209,17 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
         self._triton_weights.update(self._prepare_action_time_triton())
 
         decoder_time_embeds = self._prepare_adarms_cond(num_steps, tempo_speed)
+
+        # Allocate a STABLE speed-embedding buffer that the CUDA graph will
+        # capture by pointer. set_tempo_speed() writes into this buffer in
+        # place (copy_), so graph replay always reads the current speed without
+        # a rebuild. Rebinding the dict entry (the previous approach) does NOT
+        # work: a recorded graph captures the device pointer, not the dict.
+        self._speed_emb_graph_buf = torch.zeros_like(self._speed_emb_buffer)
+        self._speed_emb_graph_buf.copy_(self._speed_emb_buffer)
         self._triton_weights.update({
             'decoder_time_embeds': decoder_time_embeds,
-            'decoder_speed_emb': self._speed_emb_buffer,
+            'decoder_speed_emb': self._speed_emb_graph_buf,
         })
 
         self._max_prompt_len = max_prompt_len
@@ -290,17 +302,19 @@ class PI05FlowMatchingSpeedModulatedInference(PI05FlowMatchingInference):
         self._current_tempo_speed = tempo_speed
         self._speed_emb_buffer = speed_emb
 
-        # Update the buffer in-place (no graph invalidation needed)
-        self._triton_weights['decoder_speed_emb'] = speed_emb
+        # Write into the graph-captured buffer IN PLACE. The recorded CUDA
+        # graph reads decoder_speed_emb by pointer, so copy_ (not rebind) is
+        # what makes the new speed take effect on the next replay.
+        self._speed_emb_graph_buf.copy_(speed_emb)
 
-        # Re-compute time embeddings with new speed
-        # Time embeddings are cheap to recompute and don't require graph rebuild
-        self._triton_weights['decoder_time_embeds'] = self._prepare_adarms_cond(
-            self._num_steps, tempo_speed)
+        # NOTE: decoder_time_embeds is speed-INDEPENDENT (it is the raw
+        # sinusoidal timestep embedding; speed is added separately via
+        # decoder_speed_emb inside the decoder). It must NOT be recomputed or
+        # rebound here — doing so would swap in a fresh tensor the graph never
+        # captured, silently breaking time conditioning after the first speed
+        # change.
 
-        # IMPORTANT: We do NOT invalidate CUDA graph here.
-        # The graph reads from decoder_speed_emb buffer, which we updated in-place.
-        # This is the key optimization: graph reuse across different speeds.
+        # CUDA graph is preserved: it reads decoder_speed_emb in place.
 
         overwatch.info(f'Updated tempo_speed to {tempo_speed} (from cache, graph preserved)')
 

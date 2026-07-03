@@ -1,73 +1,24 @@
-"""Enhanced fusion kernels from RealTimeVLA for aggressive optimization.
+"""Enhanced fusion kernel from RealTimeVLA for aggressive optimization.
 
-These kernels provide more aggressive fusion than the standard ops, targeting
-sub-50ms inference latency for PI0.5 models.
+Only the verified `matmul_res_gate_fused` kernel lives here. Two earlier
+hand-written kernels were removed after profiling/verification:
+
+- ``adarms_norm_gate_fused``: had wrong normalization semantics (dropped the
+  ``(1 + scale)`` term and the shift, read the gate at the wrong style offset).
+  The ``adarms_norm_gate_optimized`` wrapper in ``atomic_ops`` now delegates to
+  the proven ``adarms_norm_kernel`` instead.
+- ``time_mlp_speed_fused``: had a broken matmul tiling (shape-broadcast crash,
+  truncated reduction dimension). The time MLP is a tiny per-step GEMM whose
+  cost is negligible, so ``time_mlp_with_speed_optimized`` now uses the verified
+  ``matmul_small_bias_silu`` kernels.
+
+``matmul_res_gate_fused`` fuses matmul + residual + gate into a single kernel
+and matches the reference ``matmul_small_res_gate`` semantics. It is on the hot
+path (2x per decoder layer x num_steps), so the fusion is worth keeping.
 """
 
-import torch
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def adarms_norm_gate_fused_kernel(
-    x_ptr,
-    style_ptr,
-    normed_x_ptr,
-    gate_ptr,
-    seq_len: tl.constexpr,
-    features: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
-):
-    """Fused AdaRMSNorm + gate computation.
-
-    This is more aggressive than standard adarms_norm_kernel because it
-    computes both the normalized output AND the gate values in a single pass,
-    avoiding a separate style projection kernel call.
-
-    Args:
-        x_ptr: Input tensor [seq_len, features]
-        style_ptr: Style embedding [1, style_dim] where style_dim >= 2*features
-        normed_x_ptr: Output normalized tensor [seq_len, features]
-        gate_ptr: Output gate values [seq_len, features]
-        seq_len: Sequence length
-        features: Hidden dimension
-        BLOCK_SIZE: Tile size for reduction
-    """
-    pid = tl.program_id(0)
-    psize = tl.num_programs(0)
-
-    for i in range(pid, seq_len, psize):
-        row_x_offset = i * features
-
-        # Compute RMS
-        sum_sq = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-        for j in range(0, features, BLOCK_SIZE):
-            cols = j + tl.arange(0, BLOCK_SIZE)
-            mask = cols < features
-            x_val = tl.load(x_ptr + row_x_offset + cols, mask=mask, other=0.0).to(tl.float32)
-            sum_sq += x_val * x_val
-
-        rms_factor = tl.rsqrt(tl.sum(sum_sq) / features + 1e-6)
-
-        # Load style (scale at [0:features], gate at [features:2*features])
-        for j in range(0, features, BLOCK_SIZE):
-            cols = j + tl.arange(0, BLOCK_SIZE)
-            mask = cols < features
-
-            # Load input
-            x_val = tl.load(x_ptr + row_x_offset + cols, mask=mask, other=0.0).to(tl.float32)
-
-            # Load scale and gate from style
-            scale = tl.load(style_ptr + cols, mask=mask, other=1.0).to(tl.float32)
-            gate = tl.load(style_ptr + features + cols, mask=mask, other=1.0).to(tl.float32)
-
-            # Normalize with style scale
-            normed = x_val * rms_factor * scale
-
-            # Store normalized output and gate
-            tl.store(normed_x_ptr + row_x_offset + cols, normed.to(tl.bfloat16), mask=mask)
-            tl.store(gate_ptr + row_x_offset + cols, gate.to(tl.bfloat16), mask=mask)
 
 
 @triton.jit
@@ -88,7 +39,8 @@ def matmul_res_gate_fused_kernel(
 
     Computes: out = res + (inp @ weight) * gate
 
-    This eliminates separate add and multiply operations after matmul.
+    Matches the reference matmul_small_res_gate semantics. This eliminates
+    separate add and multiply operations after matmul.
     """
     pid = tl.program_id(0)
     psize = tl.num_programs(0)
@@ -138,27 +90,6 @@ def matmul_res_gate_fused_kernel(
         )
 
 
-def adarms_norm_gate_fused(x, style, normed_x, gate, hidden_dim):
-    """Wrapper for fused AdaRMSNorm + gate kernel.
-
-    Args:
-        x: Input [seq_len, hidden_dim]
-        style: Style embedding [1, style_dim] where style_dim >= 2*hidden_dim
-        normed_x: Output buffer for normalized x
-        gate: Output buffer for gate values
-        hidden_dim: Hidden dimension
-    """
-    seq_len = x.shape[0]
-    BLOCK_SIZE = 128
-
-    adarms_norm_gate_fused_kernel[seq_len,](
-        x, style, normed_x, gate,
-        seq_len=seq_len,
-        features=hidden_dim,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-
-
 def matmul_res_gate_fused(inp, weight, out, res, gate, in_features, out_features,
                           BLOCK_SIZE_N=32, BLOCK_SIZE_M=32, BLOCK_SIZE_K=128):
     """Wrapper for fused matmul + residual + gate kernel.
@@ -185,83 +116,4 @@ def matmul_res_gate_fused(inp, weight, out, res, gate, in_features, out_features
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_K=BLOCK_SIZE_K
-    )
-
-
-@triton.jit
-def time_mlp_speed_fused_kernel(
-    time_embed_ptr,
-    time_mlp_in_w_ptr,
-    time_mlp_in_b_ptr,
-    time_mlp_out_w_ptr,
-    time_mlp_out_b_ptr,
-    speed_emb_ptr,
-    out_ptr,
-    hidden_dim: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr
-):
-    """Fused time MLP + speed addition in one kernel.
-
-    Computes: out = time_mlp_out(silu(time_mlp_in(time_embed))) + speed_emb
-
-    This eliminates multiple kernel launches for time conditioning.
-    """
-    # Single-row processing (batch size 1 for time embedding)
-    tid = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = tid < hidden_dim
-
-    # Load time embedding
-    time_val = tl.load(time_embed_ptr + tid, mask=mask, other=0.0).to(tl.float32)
-
-    # First MLP layer with SiLU
-    mlp_hidden = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    for k in range(0, hidden_dim, BLOCK_SIZE):
-        k_idx = k + tl.arange(0, BLOCK_SIZE)
-        k_mask = k_idx < hidden_dim
-        w = tl.load(time_mlp_in_w_ptr + k_idx * hidden_dim + tid[None, :],
-                   mask=k_mask[:, None] & mask[None, :], other=0.0)
-        mlp_hidden += tl.sum(time_val[None, :] * w, axis=0)
-
-    bias = tl.load(time_mlp_in_b_ptr + tid, mask=mask, other=0.0).to(tl.float32)
-    mlp_hidden = mlp_hidden + bias
-    mlp_hidden = mlp_hidden * tl.sigmoid(mlp_hidden)  # SiLU
-
-    # Second MLP layer
-    mlp_out = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    for k in range(0, hidden_dim, BLOCK_SIZE):
-        k_idx = k + tl.arange(0, BLOCK_SIZE)
-        k_mask = k_idx < hidden_dim
-        w = tl.load(time_mlp_out_w_ptr + k_idx * hidden_dim + tid[None, :],
-                   mask=k_mask[:, None] & mask[None, :], other=0.0)
-        mlp_out += tl.sum(mlp_hidden[None, :] * w, axis=0)
-
-    bias = tl.load(time_mlp_out_b_ptr + tid, mask=mask, other=0.0).to(tl.float32)
-    mlp_out = mlp_out + bias
-
-    # Add speed embedding
-    speed = tl.load(speed_emb_ptr + tid, mask=mask, other=0.0).to(tl.float32)
-    mlp_out = mlp_out + speed
-
-    tl.store(out_ptr + tid, mlp_out.to(tl.bfloat16), mask=mask)
-
-
-def time_mlp_speed_fused(time_embed, time_mlp_in_w, time_mlp_in_b,
-                        time_mlp_out_w, time_mlp_out_b, speed_emb, out, hidden_dim):
-    """Wrapper for fused time MLP + speed kernel.
-
-    This replaces the sequence:
-      1. matmul_bias_silu(time_embed, time_mlp_in_w, time_mlp_in_b, buf)
-      2. matmul_bias_silu(buf, time_mlp_out_w, time_mlp_out_b, time_emb)
-      3. time_emb.add_(speed_emb)
-
-    With a single kernel call.
-    """
-    BLOCK_SIZE = 128
-    grid = (hidden_dim + BLOCK_SIZE - 1) // BLOCK_SIZE
-
-    time_mlp_speed_fused_kernel[grid,](
-        time_embed, time_mlp_in_w, time_mlp_in_b,
-        time_mlp_out_w, time_mlp_out_b, speed_emb, out,
-        hidden_dim=hidden_dim,
-        BLOCK_SIZE=BLOCK_SIZE
     )

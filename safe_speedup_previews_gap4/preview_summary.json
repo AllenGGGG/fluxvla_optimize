@@ -1,0 +1,52 @@
+[
+  {
+    "episode_index": 0,
+    "task_index": 0,
+    "input_frames": 214,
+    "output_frames": 131,
+    "speedup": 1.633587786259542,
+    "protected_frames": 99,
+    "protected_kept": 99,
+    "video": "/home/guohao/FluxVLA/safe_speedup_previews_gap4/episode_000000_safe_speed2_image.mp4"
+  },
+  {
+    "episode_index": 18,
+    "task_index": 0,
+    "input_frames": 276,
+    "output_frames": 160,
+    "speedup": 1.725,
+    "protected_frames": 108,
+    "protected_kept": 108,
+    "video": "/home/guohao/FluxVLA/safe_speedup_previews_gap4/episode_000018_safe_speed2_image.mp4"
+  },
+  {
+    "episode_index": 22,
+    "task_index": 0,
+    "input_frames": 263,
+    "output_frames": 156,
+    "speedup": 1.685897435897436,
+    "protected_frames": 103,
+    "protected_kept": 103,
+    "video": "/home/guohao/FluxVLA/safe_speedup_previews_gap4/episode_000022_safe_speed2_image.mp4"
+  },
+  {
+    "episode_index": 33,
+    "task_index": 0,
+    "input_frames": 259,
+    "output_frames": 153,
+    "speedup": 1.6928104575163399,
+    "protected_frames": 112,
+    "protected_kept": 112,
+    "video": "/home/guohao/FluxVLA/safe_speedup_previews_gap4/episode_000033_safe_speed2_image.mp4"
+  },
+  {
+    "episode_index": 58,
+    "task_index": 0,
+    "input_frames": 253,
+    "output_frames": 149,
+    "speedup": 1.6979865771812082,
+    "protected_frames": 111,
+    "protected_kept": 111,
+    "video": "/home/guohao/FluxVLA/safe_speedup_previews_gap4/episode_000058_safe_speed2_image.mp4"
+  }
+]

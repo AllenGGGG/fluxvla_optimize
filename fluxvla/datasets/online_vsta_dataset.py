@@ -448,6 +448,18 @@ class OnlineVSTATempoParquetDataset(ParquetDataset):
                     frame_masks.append(0)
             data['frame_timestamps'] = frame_timestamps
             data['frame_masks'] = np.array(frame_masks, dtype=np.float32)
+
+        visual_delay = self._sample_visual_delay()
+        if visual_delay > 0:
+            frame_count = len(data.get('frame_timestamps',
+                                       [data['timestamp']]))
+            visual_timestamps, visual_delay = self._visual_timestamps_for_delay(
+                chosen_src_idx, visual_delay, dataset_idx, frame_count)
+            data['visual_frame_timestamps'] = visual_timestamps
+            data['visual_delay_steps'] = np.array(visual_delay, dtype=np.int64)
+        elif self.visual_delay_max_steps > 0:
+            data['visual_delay_steps'] = np.array(0, dtype=np.int64)
+
         data[self.tempo_speed_key] = float(speed)
         data['info'] = self.info[dataset_idx]
         data['stats'] = dataset_statistics[self.statistic_name]

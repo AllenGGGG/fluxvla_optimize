@@ -41,6 +41,26 @@ PREDICT_CALL_HZ_RE = re.compile(
     r'# predict_action call Hz:\s*([0-9.]+)')
 PREDICT_ACTION_STEP_HZ_RE = re.compile(
     r'# predict_action action-step Hz:\s*([0-9.]+)')
+ACTION_SUCCESS_EPISODES_RE = re.compile(
+    r'# action_postprocess success episodes:\s*([0-9.]+)')
+ACTION_RAW_MEAN_RE = re.compile(
+    r'# action_postprocess success raw_chunk_steps_if_uncompressed '
+    r'mean:\s*([0-9.]+)')
+ACTION_SELECTED_MEAN_RE = re.compile(
+    r'# action_postprocess success postprocess_selected_steps '
+    r'mean:\s*([0-9.]+)')
+ACTION_EXECUTED_MEAN_RE = re.compile(
+    r'# action_postprocess success env_control_steps_executed '
+    r'mean:\s*([0-9.]+)')
+ACTION_COMPRESSION_SPEEDUP_RE = re.compile(
+    r'# action_postprocess success chunk_compression_speedup '
+    r'mean:\s*([0-9.]+)')
+ACTION_EXECUTED_SPEEDUP_RE = re.compile(
+    r'# action_postprocess success executed_speedup mean:\s*([0-9.]+)')
+ACTION_SELECTED_HIST_RE = re.compile(
+    r'# action_postprocess success selected_step_hist:\s*(.*)')
+ACTION_SCHEDULED_MIN_HIST_RE = re.compile(
+    r'# action_postprocess success scheduled_min_step_hist:\s*(.*)')
 LIBERO_INIT_STATES_PER_TASK = 50
 
 
@@ -142,6 +162,14 @@ def parse_args() -> argparse.Namespace:
             'During LIBERO success eval, measure model-side predict_action '
             'latency on real task rollouts and write task Hz into success '
             'statistics.'))
+    parser.add_argument(
+        '--success-cfg-options',
+        nargs='*',
+        default=[],
+        help=(
+            'Extra cfg-options appended to scripts/eval.py success runs, e.g. '
+            '--success-cfg-options eval.eval_chunk_size=5. These override '
+            'earlier generated options when the same key is repeated.'))
     return parser.parse_args()
 
 
@@ -207,11 +235,16 @@ def make_variant_item(name: str,
 
 
 def set_eval_speed(cfg: Config, speed: float) -> None:
+    if (hasattr(cfg, 'eval') and hasattr(cfg.eval, 'action_postprocess')
+            and cfg.eval.action_postprocess is not None):
+        cfg.eval.action_postprocess.speed = float(speed)
+
     model_type = ''
     if hasattr(cfg, 'inference_model'):
         model_type = str(cfg.inference_model.get('type', ''))
+    if ('SpeedModulated' in model_type
+            or model_type == 'PI05FlowMatchingUltraV2Inference'):
         cfg.inference_model.default_tempo_speed = float(speed)
-    if 'SpeedModulated' in model_type:
         return
 
     transforms = cfg.eval.dataset.transforms
@@ -314,6 +347,14 @@ def parse_success_text(text: str, source: Path) -> Dict[str, float]:
     predict_mean_ms: Optional[float] = None
     predict_call_hz: Optional[float] = None
     predict_action_step_hz: Optional[float] = None
+    action_success_episodes: Optional[float] = None
+    action_raw_mean: Optional[float] = None
+    action_selected_mean: Optional[float] = None
+    action_executed_mean: Optional[float] = None
+    action_compression_speedup: Optional[float] = None
+    action_executed_speedup: Optional[float] = None
+    action_selected_hist: Optional[str] = None
+    action_scheduled_min_hist: Optional[str] = None
     for line in text.splitlines():
         ep_match = EPISODES_RE.search(line)
         if ep_match:
@@ -334,6 +375,31 @@ def parse_success_text(text: str, source: Path) -> Dict[str, float]:
         action_hz_match = PREDICT_ACTION_STEP_HZ_RE.search(line)
         if action_hz_match:
             predict_action_step_hz = float(action_hz_match.group(1))
+        action_success_match = ACTION_SUCCESS_EPISODES_RE.search(line)
+        if action_success_match:
+            action_success_episodes = float(action_success_match.group(1))
+        raw_mean_match = ACTION_RAW_MEAN_RE.search(line)
+        if raw_mean_match:
+            action_raw_mean = float(raw_mean_match.group(1))
+        selected_mean_match = ACTION_SELECTED_MEAN_RE.search(line)
+        if selected_mean_match:
+            action_selected_mean = float(selected_mean_match.group(1))
+        executed_mean_match = ACTION_EXECUTED_MEAN_RE.search(line)
+        if executed_mean_match:
+            action_executed_mean = float(executed_mean_match.group(1))
+        compression_match = ACTION_COMPRESSION_SPEEDUP_RE.search(line)
+        if compression_match:
+            action_compression_speedup = float(compression_match.group(1))
+        executed_speedup_match = ACTION_EXECUTED_SPEEDUP_RE.search(line)
+        if executed_speedup_match:
+            action_executed_speedup = float(executed_speedup_match.group(1))
+        hist_match = ACTION_SELECTED_HIST_RE.search(line)
+        if hist_match:
+            action_selected_hist = hist_match.group(1).strip()
+        scheduled_min_hist_match = ACTION_SCHEDULED_MIN_HIST_RE.search(line)
+        if scheduled_min_hist_match:
+            action_scheduled_min_hist = (
+                scheduled_min_hist_match.group(1).strip())
     if episodes is None or successes is None or success_rate is None:
         raise ValueError(f'Could not parse success stats from {source}')
     parsed = {
@@ -347,6 +413,19 @@ def parse_success_text(text: str, source: Path) -> Dict[str, float]:
             'task_predict_mean_ms': predict_mean_ms,
             'task_predict_call_hz': predict_call_hz,
             'task_predict_action_step_hz': predict_action_step_hz,
+        })
+    if action_success_episodes is not None:
+        parsed.update({
+            'action_success_episodes': action_success_episodes,
+            'action_success_raw_chunk_steps_mean': action_raw_mean,
+            'action_success_selected_steps_mean': action_selected_mean,
+            'action_success_executed_steps_mean': action_executed_mean,
+            'action_success_chunk_compression_speedup':
+            action_compression_speedup,
+            'action_success_executed_speedup': action_executed_speedup,
+            'action_success_selected_step_hist': action_selected_hist,
+            'action_success_scheduled_min_step_hist':
+            action_scheduled_min_hist,
         })
     return parsed
 
@@ -549,6 +628,7 @@ def run_success(args: argparse.Namespace, output_dir: Path, logs_dir: Path,
         'inference_model.use_language=True',
         f'inference_model.pretrained_name_or_path={args.base_weights}',
     ]
+    cmd.extend(args.success_cfg_options)
     if args.triton_max_prompt_len is not None:
         cmd.append(f'inference_model.triton_max_prompt_len={args.triton_max_prompt_len}')
     env = base_env(args.success_gpus, args)
@@ -808,13 +888,16 @@ def write_markdown(path: Path, speed_rows: List[Dict],
         '',
         '## Success',
         '',
-        '| Variant | Eval speed | Seed | GPUs | Episodes | Successes | Success Rate | Task call Hz | Task mean ms | Eval File |',
-        '| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |',
+        '| Variant | Eval speed | Seed | GPUs | Episodes | Successes | Success Rate | Task call Hz | Task mean ms | Raw steps mean | Selected steps mean | Chunk speedup | Selected hist | Scheduled min hist | Eval File |',
+        '| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |',
     ]
     for row in success_rows:
         lines.append(
             '| {variant} | {eval_speed} | {seed} | `{gpus}` | {episodes} | {successes} | '
-            '{rate}% | {task_hz} | {task_ms} | `{eval_file}` |'.format(
+            '{rate}% | {task_hz} | {task_ms} | {raw_steps} | '
+            '{selected_steps} | {chunk_speedup} | {selected_hist} | '
+            '{scheduled_min_hist} | '
+            '`{eval_file}` |'.format(
                 variant=row['requested_variant'],
                 eval_speed=fmt(row.get('eval_speed')),
                 seed=row['seed'],
@@ -824,6 +907,16 @@ def write_markdown(path: Path, speed_rows: List[Dict],
                 rate=fmt(float(row['success_rate_pct'])),
                 task_hz=fmt(row.get('task_predict_call_hz')),
                 task_ms=fmt(row.get('task_predict_mean_ms')),
+                raw_steps=fmt(
+                    row.get('action_success_raw_chunk_steps_mean')),
+                selected_steps=fmt(
+                    row.get('action_success_selected_steps_mean')),
+                chunk_speedup=fmt(
+                    row.get('action_success_chunk_compression_speedup')),
+                selected_hist=row.get(
+                    'action_success_selected_step_hist') or '',
+                scheduled_min_hist=row.get(
+                    'action_success_scheduled_min_step_hist') or '',
                 eval_file=row['eval_file'],
             ))
 

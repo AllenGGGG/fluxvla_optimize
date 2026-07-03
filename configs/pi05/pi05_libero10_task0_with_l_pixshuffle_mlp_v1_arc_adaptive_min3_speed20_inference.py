@@ -1,0 +1,41 @@
+# Copyright 2026 Limx Dynamics
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+
+"""Arc adaptive retiming: try 3 executed steps first, then relax upward."""
+
+_base_ = './pi05_libero10_task0_with_l_pixshuffle_mlp_inference.py'
+
+eval = dict(
+    action_postprocess=dict(
+        type='arc_adaptive_delta',
+        action_space='delta',
+        speed=2.0,
+        min_output_steps=3,
+        max_output_steps=10,
+        smooth_type='none',
+        length_weight=1.0,
+        accel_weight=0.35,
+        turn_weight=0.35,
+        gripper_weight=0.5,
+        min_segment_weight=0.05,
+        importance_power=1.0,
+        max_delta_ratio=2.5,
+        max_accel_ratio=2.5,
+        accel_floor_delta_ratio=0.75,
+        anchor_first_steps=1,
+        anchor_first_steps_when_k_ge=4,
+        first_step_guard=True,
+        first_step_error_ratio=0.75,
+        path_fidelity_guard=True,
+        path_error_mean_ratio=0.05,
+        path_error_max_ratio=0.15,
+        metric_idx=[0, 1, 2],
+        guard_mode='per_dim',
+        gripper_sample='end',
+        allow_zero_motion_passthrough=True,
+        fallback_until_feasible=True,
+        cont_idx=[0, 1, 2, 3, 4, 5],
+        gripper_idx=[6],
+    ),
+)

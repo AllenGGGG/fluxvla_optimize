@@ -247,7 +247,9 @@ class ProcessParquetInputs():
                     inputs[key] = data[key]
         images = list()
         img_masks = list()
-        timestamps = data.get('frame_timestamps', [data['timestamp']])
+        timestamps = data.get(
+            'visual_frame_timestamps',
+            data.get('frame_timestamps', [data['timestamp']]))
         for video_key in self.video_keys:
             episode_chunk = data['episode_index'] // data['info'][
                 'chunks_size']  # noqa: E501
@@ -285,6 +287,8 @@ class ProcessParquetInputs():
             inputs['embodiment_ids'] = np.array(self.embodiment_id)
         if 'frame_masks' in data:
             inputs['frame_masks'] = data['frame_masks']
+        if 'visual_delay_steps' in data:
+            inputs['visual_delay_steps'] = data['visual_delay_steps']
         if 'sample_weight' in data:
             inputs['sample_weight'] = np.asarray(
                 data['sample_weight'], dtype=np.float32)

@@ -37,7 +37,11 @@ class ParquetDataset(Dataset):
                  window_start_idx: int = 1,
                  frame_window_size: int = 1,
                  expose_index: bool = False,
-                 task_indices: List[int] = None) -> None:
+                 task_indices: List[int] = None,
+                 visual_delay_max_steps: int = 0,
+                 visual_delay_min_steps: int = 0,
+                 visual_delay_distribution: str = 'uniform',
+                 visual_delay_probability: float = 1.0) -> None:
         """Initialize the Parquet dataset.
 
         Args:
@@ -68,6 +72,14 @@ class ParquetDataset(Dataset):
                 to each raw sample before transforms. This is useful for
                 offline sample-weight transforms such as SARM RA-BC.
                 Defaults to False.
+            visual_delay_max_steps (int): Maximum number of previous dataset
+                steps used for image timestamps while leaving state/action
+                targets aligned to the current sample. Set to 0 to disable.
+            visual_delay_min_steps (int): Minimum sampled visual delay.
+            visual_delay_distribution (str): Distribution for visual delay,
+                one of ``uniform`` or ``constant``.
+            visual_delay_probability (float): Probability of applying a
+                nonzero visual delay to a sample.
         """
         super().__init__()
 
@@ -158,6 +170,26 @@ class ParquetDataset(Dataset):
         self.window_start_idx = window_start_idx
         self.frame_window_size = frame_window_size
         self.expose_index = expose_index
+        self.visual_delay_max_steps = int(visual_delay_max_steps)
+        self.visual_delay_min_steps = int(visual_delay_min_steps)
+        self.visual_delay_distribution = visual_delay_distribution
+        self.visual_delay_probability = float(visual_delay_probability)
+        if self.visual_delay_max_steps < 0:
+            raise ValueError('visual_delay_max_steps must be >= 0')
+        if self.visual_delay_min_steps < 0:
+            raise ValueError('visual_delay_min_steps must be >= 0')
+        if self.visual_delay_min_steps > self.visual_delay_max_steps:
+            raise ValueError(
+                'visual_delay_min_steps cannot exceed '
+                'visual_delay_max_steps')
+        if not 0.0 <= self.visual_delay_probability <= 1.0:
+            raise ValueError(
+                'visual_delay_probability must be in [0, 1], got '
+                f'{self.visual_delay_probability}')
+        if self.visual_delay_distribution not in ('uniform', 'constant'):
+            raise ValueError(
+                'visual_delay_distribution must be "uniform" or "constant", '
+                f'got {self.visual_delay_distribution!r}')
         for transform in transforms:
             self.transforms.append(build_transform_from_cfg(transform))
 
@@ -180,6 +212,52 @@ class ParquetDataset(Dataset):
         dataset_idx = np.searchsorted(
             self.dataset_cumulative_sizes, index, side='right') - 1
         return dataset_idx
+
+    def _sample_visual_delay(self) -> int:
+        if self.visual_delay_max_steps <= 0:
+            return 0
+        if np.random.random() > self.visual_delay_probability:
+            return 0
+        if self.visual_delay_distribution == 'constant':
+            return self.visual_delay_max_steps
+        return int(
+            np.random.randint(self.visual_delay_min_steps,
+                              self.visual_delay_max_steps + 1))
+
+    def _same_episode_valid_index(self, base_index: int, candidate_index: int,
+                                  dataset_idx: int) -> bool:
+        return (
+            0 <= candidate_index < len(self.dataset)
+            and self.dataset[candidate_index]['episode_index']
+            == self.dataset[base_index]['episode_index']
+            and self._get_dataset_index(candidate_index) == dataset_idx
+            and self.tasks[dataset_idx][self.dataset[candidate_index]
+                                        ['task_index']]['task'] != 'empty'
+            and self.tasks[dataset_idx][self.dataset[candidate_index]
+                                        ['task_index']]['task'] != 'static')
+
+    def _visual_timestamps_for_delay(self, index: int, delay: int,
+                                     dataset_idx: int,
+                                     frame_count: int):
+        delay = max(0, int(delay))
+        first_visual_index = index - delay
+        if not self._same_episode_valid_index(index, first_visual_index,
+                                              dataset_idx):
+            delay = 0
+
+        timestamps = []
+        for frame_offset in range(frame_count):
+            source_index = index + frame_offset - delay
+            if not self._same_episode_valid_index(index, source_index,
+                                                  dataset_idx):
+                fallback_index = index + frame_offset
+                if self._same_episode_valid_index(index, fallback_index,
+                                                  dataset_idx):
+                    source_index = fallback_index
+                else:
+                    source_index = index
+            timestamps.append(self.dataset[source_index]['timestamp'])
+        return timestamps, delay
 
     def __getitem__(self, index, dataset_statistics):
         data = self.dataset[index]
@@ -262,6 +340,17 @@ class ParquetDataset(Dataset):
                     frame_masks.append(0)
             data['frame_timestamps'] = frame_timestamps
             data['frame_masks'] = np.array(frame_masks, dtype=np.float32)
+
+        visual_delay = self._sample_visual_delay()
+        if visual_delay > 0:
+            frame_count = len(data.get('frame_timestamps',
+                                       [data['timestamp']]))
+            visual_timestamps, visual_delay = self._visual_timestamps_for_delay(
+                index, visual_delay, dataset_idx, frame_count)
+            data['visual_frame_timestamps'] = visual_timestamps
+            data['visual_delay_steps'] = np.array(visual_delay, dtype=np.int64)
+        elif self.visual_delay_max_steps > 0:
+            data['visual_delay_steps'] = np.array(0, dtype=np.int64)
 
         data['info'] = self.info[dataset_idx]
         data['stats'] = dataset_statistics[self.statistic_name]

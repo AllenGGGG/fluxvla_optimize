@@ -362,6 +362,47 @@ def merge_split_k_bias_res(out_ptr,
 
 
 @triton.jit
+def merge_split_k_res_gate(out_ptr,
+                           res_ptr,
+                           gate_ptr,
+                           final_out_ptr,
+                           seq_len: tl.constexpr,
+                           hidden: tl.constexpr,
+                           SPLIT_K: tl.constexpr,
+                           BLOCK: tl.constexpr = 512):
+    """Merge split-K partial sums with residual + gate fusion.
+
+    Computes: final = res + (sum_k partial[k]) * gate
+
+    Matches the semantics of matmul_small_res_gate (res + matmul * gate),
+    but the matmul result comes from SPLIT_K partial accumulators that need
+    to be summed first. partial layout: [SPLIT_K, seq_len, hidden] fp32.
+    """
+    pid = tl.program_id(0)
+    psize = tl.num_programs(0)
+    for i in range(pid * BLOCK, seq_len * hidden, psize * BLOCK):
+        mask = (i + tl.arange(0, BLOCK)) < (seq_len * hidden)
+        # Sum the SPLIT_K partial matmul results
+        mm = tl.zeros((BLOCK, ), dtype=tl.float32)
+        for k in range(SPLIT_K):
+            offset = k * seq_len * hidden
+            mm += tl.load(
+                out_ptr + offset + i + tl.arange(0, BLOCK),
+                mask=mask, other=0.0).to(tl.float32)
+        # Load gate (elementwise, [seq_len, hidden] layout) and residual
+        gate = tl.load(
+            gate_ptr + i + tl.arange(0, BLOCK), mask=mask, other=0.0).to(tl.float32)
+        res = tl.load(
+            res_ptr + i + tl.arange(0, BLOCK), mask=mask, other=0.0).to(tl.float32)
+        acc = res + mm * gate
+        tl.store(
+            final_out_ptr + i + tl.arange(0, BLOCK),
+            acc.to(tl.bfloat16),
+            mask=mask)
+
+
+
+@triton.jit
 def combine_1536_1152_twopart(out_ptr, inp_ptr, seq_len: tl.constexpr,
                               hidden: tl.constexpr):
     pid = tl.program_id(0)

@@ -11,11 +11,9 @@ def test_imports():
     print("=" * 70)
 
     try:
-        from fluxvla.ops.triton.realtime_fusion_ops import (
-            adarms_norm_gate_fused,
-            matmul_res_gate_fused,
-            time_mlp_speed_fused,
-        )
+        # 只有 matmul_res_gate_fused 保留（已验证正确）。另两个坏 kernel
+        # 已移除，详见 REALTIME_OPTIMIZATION_REPORT.md。
+        from fluxvla.ops.triton.realtime_fusion_ops import matmul_res_gate_fused
         print("✅ realtime_fusion_ops 导入成功")
     except Exception as e:
         print(f"❌ realtime_fusion_ops 导入失败: {e}")
@@ -64,8 +62,13 @@ def test_config():
             print(f"❌ 错误的模型类型: {cfg.inference_model.type}")
             return False
 
-        if not cfg.inference_model.use_ultra_fusion:
-            print("⚠️  Ultra fusion 未启用（应该默认为 True）")
+        # Ultra fusion 默认关闭（实测在 CUDA Graph 下无加速，详见
+        # REALTIME_OPTIMIZATION_REPORT.md）。这里只验证字段存在且为布尔。
+        if not isinstance(cfg.inference_model.use_ultra_fusion, bool):
+            print(f"❌ use_ultra_fusion 应为布尔: {cfg.inference_model.use_ultra_fusion}")
+            return False
+        print(f"   (ultra fusion 默认 {cfg.inference_model.use_ultra_fusion}，"
+              f"实测无加速，仅供 A/B 对比)")
 
         return True
 
