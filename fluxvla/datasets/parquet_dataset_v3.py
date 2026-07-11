@@ -187,6 +187,14 @@ class ParquetDatasetV3(ParquetDataset):
         self.tasks = all_tasks
         self.episodes = all_episodes
         self.episodes_by_dataset = episodes_by_dataset
+        self.episode_records_by_index = []
+        for records in episodes_by_dataset:
+            indexed_records = {}
+            for fallback_index, record in enumerate(records):
+                episode_index = int(
+                    record.get('episode_index', fallback_index))
+                indexed_records[episode_index] = record
+            self.episode_records_by_index.append(indexed_records)
 
         datasets = []
         dataset_sizes = []
@@ -215,13 +223,17 @@ class ParquetDatasetV3(ParquetDataset):
             if isinstance(only_value, str):
                 return only_value
             if isinstance(only_value, (int, np.integer)):
-                return self.tasks[dataset_idx].get(int(only_value), '')
+                task = self.tasks[dataset_idx].get(int(only_value), '')
+                if task:
+                    return task
         if isinstance(raw_task, np.ndarray) and raw_task.ndim == 0:
             raw_task = raw_task.item()
         if isinstance(raw_task, torch.Tensor) and raw_task.numel() == 1:
             raw_task = raw_task.item()
         if isinstance(raw_task, (int, np.integer)):
-            return self.tasks[dataset_idx].get(int(raw_task), '')
+            task = self.tasks[dataset_idx].get(int(raw_task), '')
+            if task:
+                return task
 
         raw_task_index = data.get('task_index')
         if isinstance(raw_task_index, np.ndarray) and raw_task_index.ndim == 0:
@@ -230,7 +242,31 @@ class ParquetDatasetV3(ParquetDataset):
                       torch.Tensor) and raw_task_index.numel() == 1:
             raw_task_index = raw_task_index.item()
         if isinstance(raw_task_index, (int, np.integer)):
-            return self.tasks[dataset_idx].get(int(raw_task_index), '')
+            task = self.tasks[dataset_idx].get(int(raw_task_index), '')
+            if task:
+                return task
+
+        # Some LeRobot v3 exporters store the sentence only in the episode
+        # metadata while tasks.parquet contains just the numeric task index.
+        episode_index = data.get('episode_index')
+        if isinstance(episode_index, np.ndarray) and episode_index.size == 1:
+            episode_index = episode_index.item()
+        if isinstance(episode_index,
+                      torch.Tensor) and episode_index.numel() == 1:
+            episode_index = episode_index.item()
+        if isinstance(episode_index, (int, np.integer)):
+            episode = self.episode_records_by_index[dataset_idx].get(
+                int(episode_index))
+            if episode is not None:
+                episode_tasks = episode.get('tasks')
+                if isinstance(episode_tasks, str):
+                    return episode_tasks
+                if isinstance(episode_tasks, np.ndarray):
+                    episode_tasks = episode_tasks.tolist()
+                if isinstance(episode_tasks, (list, tuple)):
+                    for task in episode_tasks:
+                        if isinstance(task, str) and task:
+                            return task
 
         return ''
 

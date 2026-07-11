@@ -15,6 +15,7 @@
 from .dataset_wrapper import *  # noqa: F401, F403
 from .online_vsta_dataset import *  # noqa: F401, F403
 from .online_safe_speedup_dataset import *  # noqa: F401, F403
+from .packed_parquet_dataset_v3 import *  # noqa: F401, F403
 from .parquet_dataset import *  # noqa: F401, F403
 from .parquet_dataset_v3 import *  # noqa: F401, F403
 from .rlds_dataset import *  # noqa: F401, F403

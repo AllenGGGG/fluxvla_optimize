@@ -336,6 +336,10 @@ class NormalizeStatesAndActions:
             that contains the state information.
         action_key (str | None): The key in the data dictionary
             that contains the action information. If None, actions are skipped.
+        state_norm_mask (List[bool], optional): Per-dimension mask for state
+            normalization. Masked-out dimensions are passed through unchanged.
+        action_norm_mask (List[bool], optional): Per-dimension mask for action
+            normalization. Masked-out dimensions are passed through unchanged.
     """
 
     def __init__(self,
@@ -345,6 +349,7 @@ class NormalizeStatesAndActions:
                  state_dim: int = None,
                  norm_type: str = 'mean_std',
                  pad_value: float = 0.0,
+                 state_norm_mask: List[bool] = None,
                  action_norm_mask: List[bool] = None,
                  *args,
                  **kwargs):
@@ -354,6 +359,12 @@ class NormalizeStatesAndActions:
         self.pad_value = pad_value
         self.action_dim = action_dim
         self.state_dim = state_dim
+        if state_norm_mask is not None:
+            assert len(state_norm_mask) == state_dim, \
+                f'State norm mask must be of length {state_dim}'
+            self.state_norm_mask = state_norm_mask
+        else:
+            self.state_norm_mask = None
         if action_norm_mask is not None:
             assert len(action_norm_mask) == action_dim, \
                 f'Action norm mask must be of length {action_dim}'
@@ -366,6 +377,12 @@ class NormalizeStatesAndActions:
         actions = None
         if self.action_key is not None and 'actions' in data:
             actions = np.asarray(data['actions'], dtype=np.float32)
+        state_norm_mask = self._mask_for_input_dim(self.state_norm_mask,
+                                                   states.shape[-1])
+        action_norm_mask = None
+        if actions is not None:
+            action_norm_mask = self._mask_for_input_dim(
+                self.action_norm_mask, actions.shape[-1])
 
         if self.norm_type == 'none':
             data['states'] = states
@@ -379,22 +396,24 @@ class NormalizeStatesAndActions:
                 action_stats = data['stats'][self.action_key]
 
             if self.norm_type == 'quantile':
-                states = self._normalize_quantile(states, state_stats)
+                states = self._normalize_quantile(states, state_stats,
+                                                  state_norm_mask)
                 if actions is not None:
                     actions = self._normalize_quantile(actions, action_stats,
-                                                       self.action_norm_mask)
+                                                       action_norm_mask)
                     data['actions'] = actions
             elif self.norm_type == 'min_max':
-                states = self._normalize_min_max(states, state_stats)
+                states = self._normalize_min_max(states, state_stats,
+                                                 state_norm_mask)
                 if actions is not None:
                     actions = self._normalize_min_max(actions, action_stats,
-                                                      self.action_norm_mask)
+                                                      action_norm_mask)
                     data['actions'] = actions
             else:  # norm_type == 'mean_std'
-                states = self._normalize(states, state_stats)
+                states = self._normalize(states, state_stats, state_norm_mask)
                 if actions is not None:
                     actions = self._normalize(actions, action_stats,
-                                              self.action_norm_mask)
+                                              action_norm_mask)
                     data['actions'] = actions
             data['states'] = states
         if self.state_dim is not None:
@@ -414,6 +433,15 @@ class NormalizeStatesAndActions:
         padded = np.full(padded_shape, self.pad_value, dtype=values.dtype)
         padded[..., :current_dim] = values
         return padded
+
+    def _mask_for_input_dim(self, norm_mask: Optional[List[bool]],
+                            input_dim: int) -> Optional[List[bool]]:
+        """Match a target-dimension mask to the raw input dimension."""
+        if norm_mask is None:
+            return None
+        if len(norm_mask) >= input_dim:
+            return norm_mask[:input_dim]
+        return norm_mask + [False] * (input_dim - len(norm_mask))
 
     def _normalize(self, x, stats: Dict, norm_mask: List[bool] = None):
         if norm_mask is None:

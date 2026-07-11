@@ -21,6 +21,8 @@ handling for different roles (e.g., human vs. LLM).
 from abc import ABC, abstractmethod
 from typing import Dict, Optional
 
+import numpy as np
+
 from fluxvla.engines import TRANSFORMS
 from fluxvla.engines.utils import build_tokenizer_from_cfg
 
