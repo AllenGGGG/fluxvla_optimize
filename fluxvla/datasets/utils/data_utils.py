@@ -27,11 +27,41 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import dlimp as dl
 import numpy as np
-import tensorflow as tf
-import tensorflow_datasets as tfds
 from tqdm import tqdm
+
+
+class _MissingDep:
+    """Placeholder for optional deps (dlimp/tensorflow) that are not installed.
+
+    Attribute access and calls return the placeholder itself so module-level
+    signatures and defaults that reference e.g. ``tf.data.AUTOTUNE`` still
+    import cleanly. Only actually invoking the RLDS helpers (not used on the
+    parquet training path) would surface the missing dependency.
+    """
+
+    def __getattr__(self, name):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+
+# dlimp/tensorflow are only needed by the RLDS statistics/transform helpers in
+# this module; save_dataset_statistics (used by train.py) is pure json/numpy.
+# Import best-effort so training-only envs work.
+try:
+    import dlimp as dl
+except Exception:  # noqa: BLE001
+    dl = _MissingDep()
+try:
+    import tensorflow as tf
+except Exception:  # noqa: BLE001
+    tf = _MissingDep()
+try:
+    import tensorflow_datasets as tfds
+except Exception:  # noqa: BLE001
+    tfds = _MissingDep()
 
 from fluxvla.engines.utils.overwatch import initialize_overwatch
 

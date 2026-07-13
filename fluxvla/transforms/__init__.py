@@ -19,5 +19,13 @@ from .prompters import *  # noqa: F401, F403
 from .rlds_transform import RLDSBatchTransform  # noqa: F401, F403
 from .transform_actions import *  # noqa: F401, F403
 from .transform_images import *  # noqa: F401, F403
-from .transform_inputs import *  # noqa: F401, F403
+try:
+    # RLDS-oriented input transforms; pull in tensorflow at import time and are
+    # not used by the parquet training pipeline. Best-effort import.
+    from .transform_inputs import *  # noqa: F401, F403
+except Exception as _exc:  # noqa: BLE001
+    import warnings
+    warnings.warn(
+        f'Optional transforms transform_inputs not available: {_exc}',
+        stacklevel=2)
 from .transform_prompts import *  # noqa: F401, F403

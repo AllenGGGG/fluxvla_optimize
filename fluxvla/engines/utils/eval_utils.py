@@ -18,12 +18,23 @@ import time
 
 import imageio
 import numpy as np
-import tensorflow as tf
 import torch
 from PIL import Image
 
-from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+# tensorflow and libero are only needed by the LIBERO eval / video utilities in
+# this module, not by the transforms (quat2axisangle, crop_and_resize) used on
+# the training path. Import them best-effort so training-only envs work.
+try:
+    import tensorflow as tf
+except Exception:  # noqa: BLE001
+    tf = None
+
+try:
+    from libero.libero import get_libero_path
+    from libero.libero.envs import OffScreenRenderEnv
+except Exception:  # noqa: BLE001
+    get_libero_path = None
+    OffScreenRenderEnv = None
 
 OPENVLA_V01_SYSTEM_PROMPT = (
     'A chat between a curious user and an artificial intelligence assistant. '
