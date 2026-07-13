@@ -50,8 +50,7 @@ out/
 *.egg-info/
 
 # Ignore work directories
-/work_dirs/*/checkpoints
-/work_dirs/*/rollouts
+/work_dirs
 # Ignore checkpoints folder contents but keep the folder
 checkpoints/*
 !checkpoints/.gitkeep
