@@ -330,12 +330,22 @@ class FSDPTrainRunner(BaseTrainRunner):
         checkpoint_layer_classes = set()
         vlm_has_hf_checkpointing = False
         if self.enable_gradient_checkpointing:
+            from fluxvla.models.backbones.llms.condition_gemma import (
+                GemmaAttention, GemmaMLP, GemmaRMSNorm)
+
             if hasattr(self, 'llm_transformer_layer_cls') \
-                    and self.llm_transformer_layer_cls is not None:
+                    and self.llm_transformer_layer_cls is not None \
+                    and self.llm_transformer_layer_cls is not GemmaAttention:
+                # Skipped specifically for GemmaAttention: like
+                # GemmaDecoderLayer below, its own forward() is never called
+                # by pi0_flowmatching's custom cross-layer attention (which
+                # reaches directly into q_proj/k_proj/v_proj/o_proj), so
+                # checkpointing it would be inert. Other backbones whose
+                # `transformer_layer_cls` resolves to a module that *is*
+                # invoked as a whole (e.g. LlamaDecoderLayer) still get
+                # checkpointed here as before.
                 checkpoint_layer_classes.add(self.llm_transformer_layer_cls)
 
-            from fluxvla.models.backbones.llms.condition_gemma import (
-                GemmaMLP, GemmaRMSNorm)
             # llm_backbone/llm_expert's custom cross-layer attention
             # (pi0_flowmatching._forward_transformer_layers) never calls a
             # GemmaDecoderLayer's own forward() -- it reaches directly into

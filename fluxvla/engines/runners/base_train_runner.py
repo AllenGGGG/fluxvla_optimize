@@ -856,6 +856,11 @@ class BaseTrainRunner(ABC):
             images = images.detach().float().cpu().numpy()
         n_samples = min(5, images.shape[0])
         n_cameras = images.shape[1] // 3
+        if n_cameras == 0:
+            # Fewer than 3 channels total (e.g. single-channel/depth-only
+            # observations) -- this visualization assumes stacked 3-channel
+            # RGB camera views, so there's nothing sensible to log.
+            return
 
         sample_images = {}
         for i in range(n_samples):
