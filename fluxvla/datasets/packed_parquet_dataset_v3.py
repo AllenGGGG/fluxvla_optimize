@@ -190,6 +190,12 @@ class PackedParquetDatasetV3(ParquetDatasetV3):
             finally:
                 if self.video_backend == 'pyav':
                     reader.container.close()
+                else:
+                    # Non-pyav backends (e.g. the native `video_reader`
+                    # backend) don't expose a public close()/container
+                    # handle; drop the reference promptly so the decoder
+                    # context is released instead of waiting on GC.
+                    del reader
             return frames, loaded_ts
 
         def _match(frames, loaded_ts):

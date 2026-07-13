@@ -307,8 +307,10 @@ class ParquetDataset(Dataset):
             elif index + window_idx >= len(
                     self.dataset) or self.tasks[dataset_idx][self.dataset[
                         index + window_idx]['task_index']]['task'] == 'empty':
+                pad_action = (
+                    actions[-1] if actions else data[self.action_key])
                 for _ in range(self.action_window_size - len(actions)):
-                    actions.append(actions[-1])
+                    actions.append(pad_action)
                     action_masks.append(0)
                 break
             elif self.tasks[dataset_idx][self.dataset[index + window_idx]

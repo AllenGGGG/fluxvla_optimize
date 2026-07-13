@@ -671,6 +671,10 @@ class DDPTrainRunner(BaseTrainRunner):
                 f'Resuming training from checkpoint: {self.resume_from}')
         checkpoint_info = torch.load(self.resume_from)
 
+        # Restore model state (DDP-specific handling)
+        if 'model' in checkpoint_info:
+            self._load_model_state(checkpoint_info['model'])
+
         # Restore training state (reuse base class logic)
         if 'global_step' in checkpoint_info:
             self.metric.global_step = checkpoint_info['global_step']
@@ -804,8 +808,20 @@ class DDPTrainRunner(BaseTrainRunner):
 
     def _custom_training_step(self, batch, output, loss):
         """Custom training step for DDP-specific logging and metrics."""
+        import torch.distributed as dist
+
+        # Average across ranks before logging -- `loss` here is each
+        # rank's own local micro-batch loss, and without this the wandb
+        # curve only reflects rank zero's local batch.
+        if dist.is_available() and dist.is_initialized():
+            reduced_loss = loss.detach().clone()
+            dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
+            reduced_loss /= dist.get_world_size()
+        else:
+            reduced_loss = loss.detach()
+
         # Add loss to recent losses for smoothing
-        self.recent_losses.append(loss.item())
+        self.recent_losses.append(reduced_loss.item())
 
         # Compute smoothed loss
         smoothened_loss = sum(self.recent_losses) / len(self.recent_losses)

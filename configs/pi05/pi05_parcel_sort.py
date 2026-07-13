@@ -198,6 +198,7 @@ runner = dict(
     weight_decay=0.01,
     max_grad_norm=1.0,
     sharding_strategy='full-shard',
+    save_iter_interval=5000,
     collator=dict(
         type='DictCollator',
         keys=[

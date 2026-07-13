@@ -152,17 +152,21 @@ class FSDPTrainRunner(BaseTrainRunner):
             'FSDPStrategy.save_checkpoint assumes VLA is \
                 already wrapped in FSDP!'
 
-        if hasattr(self.vla._fsdp_wrapped_module, 'llm_backbone'):
-            if hasattr(self.vla._fsdp_wrapped_module.llm_backbone, 'config'):
-                self.vla._fsdp_wrapped_module.llm_backbone.config.to_json_file(  # noqa: E501
-                    os.path.join(run_dir, 'llm_backbone_config.json'))
-        if hasattr(self.vla._fsdp_wrapped_module, 'vlm_backbone'):
-            if hasattr(self.vla._fsdp_wrapped_module.vlm_backbone, 'config'):
-                self.vla._fsdp_wrapped_module.vlm_backbone.config.to_json_file(  # noqa: E501
-                    os.path.join(run_dir, 'vlm_backbone_config.json'))
+        if overwatch.is_rank_zero():
+            if hasattr(self.vla._fsdp_wrapped_module, 'llm_backbone'):
+                if hasattr(self.vla._fsdp_wrapped_module.llm_backbone,
+                           'config'):
+                    self.vla._fsdp_wrapped_module.llm_backbone.config.to_json_file(  # noqa: E501
+                        os.path.join(run_dir, 'llm_backbone_config.json'))
+            if hasattr(self.vla._fsdp_wrapped_module, 'vlm_backbone'):
+                if hasattr(self.vla._fsdp_wrapped_module.vlm_backbone,
+                           'config'):
+                    self.vla._fsdp_wrapped_module.vlm_backbone.config.to_json_file(  # noqa: E501
+                        os.path.join(run_dir, 'vlm_backbone_config.json'))
 
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(os.path.join(run_dir, 'tokenizer'))
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(
+                    os.path.join(run_dir, 'tokenizer'))
         # Summon Full State Dictionary =>> Reconstitute from Shards
         with FSDP.state_dict_type(self.vla, self.fsdp_state_dict_type,
                                   self.fsdp_save_policy):

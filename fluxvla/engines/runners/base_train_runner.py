@@ -395,6 +395,16 @@ class BaseTrainRunner(ABC):
             try:
                 self.lr_scheduler.load_state_dict(
                     checkpoint_info['scheduler_state_dict'])
+                # load_state_dict() restores the scheduler's internal step
+                # counters but does not push the corresponding lr back into
+                # optimizer.param_groups (that normally only happens on the
+                # next .step() call). Re-sync explicitly so the first
+                # optimizer.step() after resume uses the correct mid-
+                # schedule lr instead of whatever was left over from setup.
+                for param_group, last_lr in zip(
+                        self.optimizer.param_groups,
+                        self.lr_scheduler.get_last_lr()):
+                    param_group['lr'] = last_lr
                 if overwatch.is_rank_zero():
                     overwatch.info('Scheduler state restored from checkpoint')
             except Exception as e:
@@ -547,11 +557,17 @@ class BaseTrainRunner(ABC):
                 ]
 
             # Create Optimizer & LR Scheduler
+            # NOTE: get_cosine_schedule_with_warmup's LambdaLR base class
+            # already sets each param_group['lr'] from lr_lambda(0) during
+            # construction, so no manual reset is needed here. Forcing
+            # lr=0.0 unconditionally previously meant the first optimizer
+            # step after resume() (which restores the scheduler's step
+            # count but does not push a recomputed lr into the optimizer
+            # until the next .step() call) ran at lr=0.0 instead of the
+            # correct mid-schedule value.
             self.optimizer = AdamW(groups, lr=self.learning_rate)
             self.lr_scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer, num_warmup_steps, num_training_steps)
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = 0.0
 
         elif self.lr_scheduler_type == 'constant':
             # Create Parameter Groups --> bias terms, normalization
@@ -892,7 +908,18 @@ class BaseTrainRunner(ABC):
             output: CausalLMOutputWithPast = self.vla(**batch)
             loss = output['loss']
 
-        self.metric.commit(loss=loss)
+        # Average the loss across ranks for logging only -- the local
+        # (unreduced) `loss` tensor below still drives the backward pass,
+        # since DDP/FSDP already average gradients during backward.
+        # Without this, rank zero's logged loss reflects only its own
+        # local micro-batch instead of the true global-batch average.
+        if dist.is_available() and dist.is_initialized():
+            logged_loss = loss.detach().clone()
+            dist.all_reduce(logged_loss, op=dist.ReduceOp.SUM)
+            logged_loss /= dist.get_world_size()
+        else:
+            logged_loss = loss.detach()
+        self.metric.commit(loss=logged_loss)
         loss.backward()
 
         # Commit per-dataset metrics
@@ -930,11 +957,36 @@ class BaseTrainRunner(ABC):
         """Reinitialize optimizer on state mismatch."""
         if overwatch.is_rank_zero():
             overwatch.warning('Optimizer state mismatch. Reinitializing.')
-        trainable_params = [
-            p for p in self.vla.parameters() if p.requires_grad
-        ]
         current_lr = self.optimizer.param_groups[0]['lr']
-        self.optimizer = torch.optim.AdamW(trainable_params, lr=current_lr)
+        weight_decay = getattr(self, 'weight_decay', None)
+
+        # Rebuild the same decay/no-decay parameter grouping used in
+        # `_setup_optimizer_and_scheduler` -- otherwise AdamW's default
+        # weight_decay silently applies to every parameter (including
+        # biases/norm weights that were deliberately excluded), changing
+        # the optimization objective for the rest of training.
+        if weight_decay is not None:
+            decay, no_decay = [], []
+            for name, param in self.vla.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if param.ndim <= 1 or name.endswith('.bias'):
+                    no_decay.append(param)
+                else:
+                    decay.append(param)
+            groups = [{
+                'params': decay,
+                'weight_decay': weight_decay
+            }, {
+                'params': no_decay,
+                'weight_decay': 0.0
+            }]
+        else:
+            groups = [
+                p for p in self.vla.parameters() if p.requires_grad
+            ]
+
+        self.optimizer = torch.optim.AdamW(groups, lr=current_lr)
         self.optimizer_state_loaded = False
         if self.lr_scheduler and hasattr(self.lr_scheduler, 'optimizer'):
             self.lr_scheduler.optimizer = self.optimizer
