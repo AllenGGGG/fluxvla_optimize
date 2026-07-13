@@ -188,10 +188,8 @@ class PackedParquetDatasetV3(ParquetDatasetV3):
                     if current_ts >= last_ts:
                         break
             finally:
-                try:
+                if self.video_backend == 'pyav':
                     reader.container.close()
-                except AttributeError:
-                    pass
             return frames, loaded_ts
 
         def _match(frames, loaded_ts):
