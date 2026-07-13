@@ -33,6 +33,10 @@ class Tracker(Protocol):
               metrics: Dict[str, Union[int, float]]) -> None:
         ...
 
+    def write_images(self, global_step: int,
+                     images: Dict[str, np.ndarray]) -> None:
+        ...
+
     def finalize(self) -> None:
         ...
 
@@ -62,6 +66,11 @@ class JSONLinesTracker:
                 mode='a',
                 sort_keys=True) as js_tracker:
             js_tracker.write(metrics)
+
+    def write_images(self, global_step: int,
+                     images: Dict[str, np.ndarray]) -> None:
+        # Images aren't JSON-serializable; this tracker only logs scalars.
+        return
 
     def finalize(self) -> None:
         return
@@ -121,6 +130,13 @@ class WeightsBiasesTracker:
               metrics: Dict[str, Union[int, float]]) -> None:
         wandb.log(metrics, step=global_step)
 
+    @overwatch.rank_zero_only
+    def write_images(self, global_step: int,
+                     images: Dict[str, np.ndarray]) -> None:
+        wandb.log(
+            {key: wandb.Image(image) for key, image in images.items()},
+            step=global_step)
+
     @staticmethod
     def finalize() -> None:
         if overwatch.is_rank_zero():
@@ -170,6 +186,13 @@ class TensorBoardTracker:
               metrics: Dict[str, Union[int, float]]) -> None:
         for key, value in metrics.items():
             self.writer.add_scalar(key, value, global_step)
+
+    @overwatch.rank_zero_only
+    def write_images(self, global_step: int,
+                     images: Dict[str, np.ndarray]) -> None:
+        for key, image in images.items():
+            self.writer.add_image(
+                key, image, global_step, dataformats='HWC')
 
     @overwatch.rank_zero_only
     def finalize(self) -> None:
@@ -261,6 +284,11 @@ class VLAMetric:
                                                              float]]) -> None:
         for tracker in self.trackers:
             tracker.write(global_step, metrics)
+
+    def log_images(self, global_step: int,
+                   images: Dict[str, np.ndarray]) -> None:
+        for tracker in self.trackers:
+            tracker.write_images(global_step, images)
 
     def get_status(self, loss: Optional[torch.Tensor] = None) -> str:
         lr = self.state['lr'][-1] if len(self.state['lr']) > 0 else 0

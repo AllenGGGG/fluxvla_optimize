@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
@@ -156,6 +157,9 @@ class BaseTrainRunner(ABC):
         self.steps_per_epoch = None  # Determined at runtime
         # Accumulate losses for checkpoint interval averaging
         self._loss_accumulator = []
+        # Log a sample-input visualization to wandb exactly once, on the
+        # first training step.
+        self._logged_input_sample = False
 
         # Optimizers & Scheduler (initialized in `run_setup`)
         self.optimizer, self.lr_scheduler = None, None
@@ -831,8 +835,44 @@ class BaseTrainRunner(ABC):
         self._vla_accepts_kwarg_cache = cache
         return accepts
 
+    def _log_input_sample_images(self, batch) -> None:
+        """Log a visualization of the first 5 samples' camera views to
+        wandb, once, on the first training step.
+
+        Each sample's ``images`` tensor is ``(num_cameras * 3, H, W)``
+        (channels 0:3=head/base, 3:6=left wrist, 6:9=right wrist,
+        normalized to [-1, 1]). For each of the first 5 samples (in order,
+        no skipping) the three camera views are concatenated side-by-side
+        into one row image; the 5 row images are logged as separate panels
+        (not stacked into a single combined image).
+        """
+        if (self._logged_input_sample or not overwatch.is_rank_zero()
+                or 'images' not in batch):
+            return
+        self._logged_input_sample = True
+
+        images = batch['images']
+        if isinstance(images, torch.Tensor):
+            images = images.detach().float().cpu().numpy()
+        n_samples = min(5, images.shape[0])
+        n_cameras = images.shape[1] // 3
+
+        sample_images = {}
+        for i in range(n_samples):
+            cams = [
+                images[i, c * 3:(c + 1) * 3] for c in range(n_cameras)
+            ]  # each (3, H, W) in [-1, 1]
+            row = np.concatenate(cams, axis=2)  # (3, H, W * n_cameras)
+            # [-1, 1] -> [0, 255] uint8, CHW -> HWC for image logging.
+            row = np.clip((row + 1.0) * 127.5, 0, 255).astype(np.uint8)
+            row = row.transpose(1, 2, 0)
+            sample_images[f'input_sample/{i}'] = row
+
+        self.metric.log_images(self.metric.global_step, sample_images)
+
     def _training_step(self, batch) -> torch.Tensor:
         """Execute single training step: forward, backward, optimize."""
+        self._log_input_sample_images(batch)
         if self.enable_mixed_precision_training:
             batch = self._convert_batch_to_dtype(batch,
                                                  self.mixed_precision_dtype)
