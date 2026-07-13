@@ -22,18 +22,10 @@ from .pi05_flowmatching_speed_modulated import \
     PI05FlowMatchingSpeedModulated  # noqa: F401, F403
 from .pi05_flowmatching_speed_modulated_inference import \
     PI05FlowMatchingSpeedModulatedInference  # noqa: F401, F403
-from .pi05_flowmatching_speed_modulated_decoupled_inference import \
-    PI05FlowMatchingSpeedModulatedDecoupledInference  # noqa: F401, F403
-from .pi05_flowmatching_time_schedule_inference import (  # noqa: F401, F403
-    PI05FlowMatchingSpeedModulatedTimeScheduleInference,
-    PI05FlowMatchingTimeScheduleInference,
-)
 from .pi05_flowmatching_ultra_v2_inference import (  # noqa: F401, F403
     PI05FlowMatchingPlainUltraV2Inference,
     PI05FlowMatchingUltraV2Inference,
 )
-from .pi05_flowmatching_decoupled_inference import \
-    PI05FlowMatchingDecoupledInference  # noqa: F401, F403
 from .sarm_reward_model import SARMRewardModel  # noqa: F401, F403
 from .smolvla_flowmatching import SmolVLAFlowMatching  # noqa: F401, F403
 from .x_vla import X_VLA  # noqa: F401, F403
