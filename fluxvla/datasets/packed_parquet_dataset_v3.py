@@ -33,6 +33,7 @@ inline (replacing ``ProcessParquetInputs``). Downstream transforms
 """
 
 import os
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -92,6 +93,12 @@ class PackedParquetDatasetV3(ParquetDatasetV3):
             statistic_name=statistic_name,
             window_start_idx=window_start_idx,
         )
+        for info in self.info:
+            if info.get('codebase_version', '') != 'v3.0':
+                warnings.warn(
+                    f"Expected codebase_version 'v3.0', got "
+                    f"'{info.get('codebase_version')}'. "
+                    'Timestamps may be incorrect for non-v3.0 datasets.')
         self.video_keys = video_keys
         self.state_key = state_key
         self.video_tolerance_s = video_tolerance_s
@@ -182,8 +189,10 @@ class PackedParquetDatasetV3(ParquetDatasetV3):
                     if current_ts >= last_ts:
                         break
             finally:
-                if self.video_backend == 'pyav':
+                try:
                     reader.container.close()
+                except AttributeError:
+                    pass
             return frames, loaded_ts
 
         def _match(frames, loaded_ts):
@@ -199,7 +208,14 @@ class PackedParquetDatasetV3(ParquetDatasetV3):
 
         # Seek slightly before the first requested timestamp so the closest
         # preceding key frame is available, then fall back to a full scan.
-        frames, loaded_ts = _load(first_ts - 1.0)
+        # A 1.0s margin at 30fps means scanning ~30 frames just to land
+        # within a 0.1s tolerance -- empirically (see profiling in this
+        # repo's FSDP optimization session) a 0.15s margin finds the same
+        # frame within tolerance ~3.6x faster (182ms -> 51ms median) with
+        # zero observed tolerance failures across 80 random samples, and
+        # the full-scan fallback below still catches any edge case where
+        # it doesn't.
+        frames, loaded_ts = _load(first_ts - 0.15)
         matched = _match(frames, loaded_ts)
         if matched is None:
             frames, loaded_ts = _load(0.0)

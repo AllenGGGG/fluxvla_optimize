@@ -20,9 +20,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.gemma.modeling_gemma import (GemmaAttention,
-                                                      GemmaDecoderLayer,
-                                                      GemmaMLP, GemmaRMSNorm)
+from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
 
 from fluxvla.engines import VLM_BACKBONES
 from .hf_vlm import VLMBackbone
@@ -139,6 +137,6 @@ class PaliGemma(VLMBackbone):
         """
         transformer_block_policy = partial(
             transformer_auto_wrap_policy,
-            transformer_layer_cls={GemmaAttention, GemmaMLP, GemmaRMSNorm},
+            transformer_layer_cls={self.transformer_layer_cls},
         )
         return transformer_block_policy

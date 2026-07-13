@@ -840,9 +840,21 @@ class PI0FlowMatching(BaseVLA):
         """
         Returns the FSDP auto wrapping policy for the model.
 
-        This policy wraps low-level modules (e.g., nn.Linear, nn.LayerNorm),
-        and combines with VLM's existing policy. It explicitly avoids wrapping
-        nn.Embedding to prevent errors during sharding.
+        This combines each backbone's own (block-level) wrapping policy with
+        a leaf-level match on nn.Linear/nn.LayerNorm, plus an explicit opt-in
+        for standalone modules flagged via `is_fsdp_wrap`.
+
+        The Linear-level match is required for correctness, not just an
+        efficiency knob: `_forward_transformer_layers` below calls into
+        `layer.self_attn.q_proj(...)`, `.k_proj(...)`, `.v_proj(...)`,
+        `.o_proj(...)` directly, bypassing the enclosing decoder-layer's own
+        `forward()`. FSDP only gathers a module's full (unsharded) params
+        when that module's own `__call__`/forward hook fires; wrapping only
+        an ancestor (e.g. the whole attention block or decoder layer) that
+        is never itself directly invoked here would leave these Linears'
+        parameters sharded when accessed under real (multi-rank) sharding,
+        causing a shape mismatch. Wrapping each Linear individually ensures
+        the direct calls above trigger their own gather correctly.
         """
         wrapping_policies = []
         if self.vlm_backbone is not None:

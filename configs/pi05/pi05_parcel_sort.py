@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # PI0.5 parcel sorting real-robot fine-tuning.
+_JOINT_DIM = 28
+_PAD_DIM = 4
 # LeRobot v3 data with three RGB cameras and 30 Hz joint-space control.
 # State/action use 32 values: 28 robot joints followed by 4 zero pads.
 # For state[t], the 50-step target starts at action[t + 1].
@@ -130,8 +132,8 @@ model = dict(
 inference_model = model.copy()
 
 train_dataloader = dict(
-    per_device_batch_size=8,
-    per_device_num_workers=4,
+    per_device_batch_size=32,
+    per_device_num_workers=8,
     dataset=dict(
         type='DistributedRepeatingDataset',
         statistic_keys=['observation.state', 'action'],
@@ -166,10 +168,10 @@ train_dataloader = dict(
                         state_key='proprio',
                         action_key='action',
                         norm_type='min_max',
-                        state_norm_mask=[True] * 28 + [False] * 4,
-                        action_norm_mask=[True] * 28 + [False] * 4),
+                        state_norm_mask=[True] * _JOINT_DIM + [False] * _PAD_DIM,
+                        action_norm_mask=[True] * _JOINT_DIM + [False] * _PAD_DIM),
                     dict(type='PreparePromptWithState'),
-                    dict[str, str | dict[str, str]](
+                    dict(
                         type='ProcessPrompts',
                         max_len=200,
                         tokenizer=dict(
@@ -189,7 +191,7 @@ runner = dict(
     learning_rate=5e-5,
     weight_decay=0.01,
     max_grad_norm=1.0,
-    sharding_strategy='no-shard',
+    sharding_strategy='full-shard',
     collator=dict(
         type='DictCollator',
         keys=[
@@ -211,7 +213,7 @@ runner = dict(
         grad_accumulation_steps=1,
         window_size=1),
     lr_scheduler_type='linear-warmup+cosine-decay',
-    enable_gradient_checkpointing=False,
+    enable_gradient_checkpointing=True,
     enable_mixed_precision_training=True,
     mixed_precision_dtype='bf16',
     change_key_name=False)

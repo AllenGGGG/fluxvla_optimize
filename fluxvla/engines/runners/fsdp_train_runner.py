@@ -273,6 +273,12 @@ class FSDPTrainRunner(BaseTrainRunner):
 
         is_no_shard = (
             self.fsdp_sharding_strategy == ShardingStrategy.NO_SHARD)
+        # With a single rank, FULL_SHARD/HYBRID_SHARD shard across a
+        # world of one -- i.e. they shard nothing. Treat that case like
+        # NO_SHARD for dtype/memory purposes so single-GPU runs store bf16
+        # master weights instead of paying full fp32 memory for zero actual
+        # sharding benefit.
+        is_effectively_unsharded = is_no_shard or overwatch.world_size() == 1
 
         if is_no_shard:
             vla_fsdp_wrapping_policy = None
@@ -281,7 +287,7 @@ class FSDPTrainRunner(BaseTrainRunner):
 
         # Assemble the Default FSDP Mixed Precision Policy
         if self.enable_mixed_precision_training and self.mixed_precision_dtype == torch.bfloat16:  # noqa: E501
-            if is_no_shard:
+            if is_effectively_unsharded:
                 fsdp_precision_policy = MixedPrecision(
                     param_dtype=torch.bfloat16,
                     reduce_dtype=torch.bfloat16,
@@ -304,13 +310,19 @@ class FSDPTrainRunner(BaseTrainRunner):
 
         self.vla.freeze_backbones()
 
-        if is_no_shard:
+        if is_effectively_unsharded:
             target_dtype = torch.bfloat16
         else:
             target_dtype = torch.float32
         for name, param in self.vla.named_parameters():
             if param.dtype != target_dtype:
                 param.data = param.data.to(target_dtype)
+        # The dtype cast above drops each original tensor's reference, but
+        # its CUDA block stays in PyTorch's caching allocator rather than
+        # being returned to the driver -- reclaim it now so the freed
+        # (larger, pre-cast) blocks are available to satisfy allocations
+        # during the first forward/backward instead of sitting unusable.
+        torch.cuda.empty_cache()
         overwatch.info(
             f'Unified all model parameters to {target_dtype}', ctx_level=1)
 
@@ -321,6 +333,19 @@ class FSDPTrainRunner(BaseTrainRunner):
             if hasattr(self, 'llm_transformer_layer_cls') \
                     and self.llm_transformer_layer_cls is not None:
                 checkpoint_layer_classes.add(self.llm_transformer_layer_cls)
+
+            from fluxvla.models.backbones.llms.condition_gemma import (
+                GemmaMLP, GemmaRMSNorm)
+            # llm_backbone/llm_expert's custom cross-layer attention
+            # (pi0_flowmatching._forward_transformer_layers) never calls a
+            # GemmaDecoderLayer's own forward() -- it reaches directly into
+            # `layer.mlp(...)`, `layer.input_layernorm(...)`, and
+            # `layer.post_attention_layernorm(...)`. A checkpoint wrapper
+            # only takes effect for the exact module whose own forward gets
+            # invoked, so checkpoint at GemmaMLP/GemmaRMSNorm granularity
+            # here (not GemmaDecoderLayer, which would be inert).
+            checkpoint_layer_classes.add(GemmaMLP)
+            checkpoint_layer_classes.add(GemmaRMSNorm)
 
             try:
                 from timm.models.vision_transformer import Block as VisionBlock
@@ -337,11 +362,14 @@ class FSDPTrainRunner(BaseTrainRunner):
                     checkpoint_layer_classes.add(
                         self.vla.vlm_backbone.transformer_layer_cls)
 
-            if hasattr(self.vla,
-                       'llm_expert') and self.vla.llm_expert is not None:
-                if hasattr(self.vla.llm_expert, 'transformer_layer_cls'):
-                    checkpoint_layer_classes.add(
-                        self.vla.llm_expert.transformer_layer_cls)
+            # Note: llm_expert (ConditionGemmaModel) is already covered by
+            # the GemmaMLP/GemmaRMSNorm added above -- both llm_backbone and
+            # llm_expert are ConditionGemmaModel instances, so the same
+            # classes match their decoder layers too. Its own
+            # `transformer_layer_cls` resolves to GemmaAttention, which
+            # (like GemmaDecoderLayer) is never itself directly invoked by
+            # `_forward_transformer_layers` and would be an inert checkpoint
+            # boundary.
 
         self.vla = FSDP(
             self.vla,
@@ -351,7 +379,13 @@ class FSDPTrainRunner(BaseTrainRunner):
             device_id=torch.cuda.current_device(),
             limit_all_gathers=True,
             use_orig_params=True,
+            forward_prefetch=True,
         )
+        # FSDP's internal flatten/copy during wrapping leaves a large
+        # reserved-but-unallocated gap in the caching allocator (observed:
+        # ~7GB actually allocated vs ~14GB reserved) that persists into
+        # training unless reclaimed here.
+        torch.cuda.empty_cache()
 
         # Apply Gradient Checkpointing AFTER FSDP wrapping
         if self.enable_gradient_checkpointing:
