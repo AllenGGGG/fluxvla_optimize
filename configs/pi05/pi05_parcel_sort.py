@@ -16,6 +16,10 @@
 # State/action use 32 values: 28 robot joints followed by 4 zero pads.
 # For state[t], the 50-step target starts at action[t + 1].
 
+_JOINT_DIM = 28
+_MODEL_ACTION_DIM = 32
+_ACTION_HORIZON = 50
+
 model = dict(
     type='PI05FlowMatching',
     llm_backbone=dict(
@@ -69,12 +73,14 @@ model = dict(
         out_dim=2048,
     ),
     proj_width=1024,
-    n_action_steps=50,
-    action_in_proj=dict(type='LinearProjector', in_dim=32, out_dim=1024),
-    action_out_proj=dict(type='LinearProjector', in_dim=1024, out_dim=32),
+    n_action_steps=_ACTION_HORIZON,
+    action_in_proj=dict(
+        type='LinearProjector', in_dim=_MODEL_ACTION_DIM, out_dim=1024),
+    action_out_proj=dict(
+        type='LinearProjector', in_dim=1024, out_dim=_MODEL_ACTION_DIM),
     time_mlp_in=dict(type='LinearProjector', in_dim=1024, out_dim=1024),
     time_mlp_out=dict(type='LinearProjector', in_dim=1024, out_dim=1024),
-    max_action_dim=32,
+    max_action_dim=_MODEL_ACTION_DIM,
     llm_expert=dict(
         type='ConditionGemmaModel',
         attention_bias=False,
@@ -124,7 +130,7 @@ model = dict(
         'vlm_backbone.vlm.model.vision_tower',
         'vlm_backbone.vlm.model.multi_modal_projector',
     ],
-    ori_action_dim=28,
+    ori_action_dim=_JOINT_DIM,
 )
 
 inference_model = model.copy()
@@ -161,15 +167,17 @@ train_dataloader = dict(
                 transforms=[
                     dict(
                         type='NormalizeStatesAndActions',
-                        action_dim=32,
-                        state_dim=32,
+                        action_dim=_MODEL_ACTION_DIM,
+                        state_dim=_MODEL_ACTION_DIM,
                         state_key='proprio',
                         action_key='action',
                         norm_type='min_max',
-                        state_norm_mask=[True] * 28 + [False] * 4,
-                        action_norm_mask=[True] * 28 + [False] * 4),
+                        state_norm_mask=[True] * _JOINT_DIM + [False] *
+                        (_MODEL_ACTION_DIM - _JOINT_DIM),
+                        action_norm_mask=[True] * _JOINT_DIM + [False] *
+                        (_MODEL_ACTION_DIM - _JOINT_DIM)),
                     dict(type='PreparePromptWithState'),
-                    dict[str, str | dict[str, str]](
+                    dict(
                         type='ProcessPrompts',
                         max_len=200,
                         tokenizer=dict(
@@ -180,7 +188,7 @@ train_dataloader = dict(
                     dict(type='ResizeImages', height=224, width=224),
                     dict(type='SimpleNormalizeImages'),
                 ],
-                action_window_size=50)
+                action_window_size=_ACTION_HORIZON)
         ]))
 
 runner = dict(

@@ -332,8 +332,10 @@ class ParquetDatasetV3(ParquetDataset):
                     actions.append(self.dataset[future_idx][self.action_key])
                 action_masks.append(1)
             elif not future_in_range or future_task == 'empty':
+                pad_action = (
+                    actions[-1] if actions else data[self.action_key])
                 for _ in range(self.action_window_size - len(actions)):
-                    actions.append(actions[-1])
+                    actions.append(pad_action)
                     action_masks.append(0)
                 break
             elif future_task == 'static':
