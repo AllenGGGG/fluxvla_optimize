@@ -332,10 +332,11 @@ class NormalizeStatesAndActions:
         norm_type (str): Type of normalization to use.
             Options: 'mean_std', 'quantile', 'min_max', or 'none'.
             Defaults to 'mean_std'.
-        state_key (str | None): The key in the data dictionary
-            that contains the state information.
-        action_key (str | None): The key in the data dictionary
-            that contains the action information. If None, actions are skipped.
+        state_key (str | None): Key used to look up state statistics in
+            ``data['stats']``. State values are read from ``data['states']``.
+        action_key (str | None): Key used to look up action statistics in
+            ``data['stats']``. Action values are read from ``data['actions']``;
+            if None, actions are skipped.
         state_norm_mask (List[bool], optional): Per-dimension mask for state
             normalization. Masked-out dimensions are passed through unchanged.
         action_norm_mask (List[bool], optional): Per-dimension mask for action
@@ -451,7 +452,7 @@ class NormalizeStatesAndActions:
 
     def _normalize_quantile(self,
                             x,
-                            stats: torch.tensor,
+                            stats: Dict,
                             norm_mask: List[bool] = None):
         assert stats['q01'] is not None
         assert stats['q99'] is not None

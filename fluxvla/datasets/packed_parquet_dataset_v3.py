@@ -33,7 +33,6 @@ inline (replacing ``ProcessParquetInputs``). Downstream transforms
 """
 
 import os
-import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -93,12 +92,12 @@ class PackedParquetDatasetV3(ParquetDatasetV3):
             statistic_name=statistic_name,
             window_start_idx=window_start_idx,
         )
-        for info in self.info:
-            if info.get('codebase_version', '') != 'v3.0':
-                warnings.warn(
-                    f"Expected codebase_version 'v3.0', got "
-                    f"'{info.get('codebase_version')}'. "
-                    'Timestamps may be incorrect for non-v3.0 datasets.')
+        for root, info in zip(self.data_root_path, self.info):
+            version = info.get('codebase_version')
+            if version != 'v3.0':
+                raise ValueError(
+                    f'PackedParquetDatasetV3 requires LeRobot v3.0 data, '
+                    f'but {root} declares codebase_version={version!r}')
         self.video_keys = video_keys
         self.state_key = state_key
         self.video_tolerance_s = video_tolerance_s
