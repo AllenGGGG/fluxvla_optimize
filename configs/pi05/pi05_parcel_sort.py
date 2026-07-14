@@ -171,7 +171,7 @@ train_dataloader = dict(
                         state_dim=_MODEL_ACTION_DIM,
                         state_key='proprio',
                         action_key='action',
-                        norm_type='min_max',
+                        norm_type='quantile',
                         state_norm_mask=[True] * _JOINT_DIM + [False] *
                         (_MODEL_ACTION_DIM - _JOINT_DIM),
                         action_norm_mask=[True] * _JOINT_DIM + [False] *
