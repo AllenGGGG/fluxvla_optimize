@@ -13,6 +13,7 @@ import torch
 import wandb
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.nn.parallel import DistributedDataParallel as DDP
+from transformers.pytorch_utils import Conv1D
 
 from fluxvla.engines.utils import build_vla_from_cfg
 from fluxvla.engines.utils.overwatch import initialize_overwatch
@@ -20,6 +21,48 @@ from ..utils.root import RUNNERS
 from .base_train_runner import BaseTrainRunner
 
 overwatch = initialize_overwatch(__name__)
+
+_ALL_LINEAR_TARGET = 'all-linear'
+
+
+def _collect_output_embedding_ids(model: torch.nn.Module) -> set:
+    output_embedding_ids = set()
+    for module in model.modules():
+        get_output_embeddings = getattr(module, 'get_output_embeddings', None)
+        if not callable(get_output_embeddings):
+            continue
+
+        try:
+            output_embeddings = get_output_embeddings()
+        except (AttributeError, NotImplementedError):
+            continue
+
+        if output_embeddings is not None:
+            output_embedding_ids.add(id(output_embeddings))
+    return output_embedding_ids
+
+
+def _resolve_lora_target_modules(model: torch.nn.Module, target_modules):
+    if not (isinstance(target_modules, str)
+            and target_modules.lower() == _ALL_LINEAR_TARGET):
+        return target_modules
+
+    output_embedding_ids = _collect_output_embedding_ids(model)
+    linear_classes = (torch.nn.Linear, Conv1D)
+    target_module_names = [
+        name for name, module in model.named_modules()
+        if isinstance(module, linear_classes)
+        and id(module) not in output_embedding_ids
+    ]
+
+    if not target_module_names:
+        raise ValueError(
+            "No linear modules found for LoRA target_modules='all-linear'.")
+
+    if overwatch.is_rank_zero():
+        overwatch.info("Resolved LoRA target_modules='all-linear' to "
+                       f'{len(target_module_names)} linear modules.')
+    return target_module_names
 
 
 @RUNNERS.register_module()
@@ -37,7 +80,7 @@ class DDPTrainRunner(BaseTrainRunner):
         cfg (Dict): Configuration dictionary containing
             model, dataset, and training settings.
         args: Command-line arguments for the runner.
-        learning_rate (float): Learning rate for the optimizer.
+        optimizer (Dict): Optimizer configuration.
         collator (Dict): Collator configuration for batching.
         sampler (Dict): Sampler configuration for data loading.
         grad_accumulation_steps (int): Number of steps for gradient
@@ -56,55 +99,58 @@ class DDPTrainRunner(BaseTrainRunner):
     def __init__(self,
                  cfg: Dict,
                  args,
-                 learning_rate: float,
-                 weight_decay: Optional[float] = None,
                  max_grad_norm: float = 1.0,
                  collator: Dict = None,
                  sampler: str = 'distributed',
                  metric: Dict = None,
+                 optimizer: Optional[Dict] = None,
                  max_epochs: int = 10,
                  max_steps: Optional[int] = None,
                  save_epoch_interval: int = 1,
                  save_iter_interval: int = 10000,
                  max_keep_ckpts: int = 2,
-                 lr_scheduler_type: str = 'constant',
-                 lr_schedule: Optional[Dict[float, float]] = None,
-                 warmup_ratio: int = 0,
+                 lr_scheduler: Optional[Dict] = None,
                  enable_gradient_checkpointing: bool = True,
                  enable_mixed_precision_training: bool = True,
                  reduce_in_full_precision: bool = True,
                  mixed_precision_dtype: str = 'bf16',
+                 grad_accumulation_steps: int = 1,
+                 evaluator: Optional[Dict] = None,
                  tokenizer: Optional[Dict] = None,
                  resume_from: Optional[str] = None,
+                 static_graph: bool = True,
                  **kwargs) -> None:
 
+        if kwargs:
+            fields = ', '.join(sorted(kwargs))
+            raise TypeError(f'Unexpected runner config field(s): {fields}')
         device_id = overwatch.local_rank()
         super().__init__(
             cfg=cfg,
             device_id=device_id,
-            learning_rate=learning_rate,
             collator=collator,
             sampler=sampler,
             metric=metric,
+            optimizer=optimizer,
             max_epochs=max_epochs,
             max_steps=max_steps,
             save_epoch_interval=save_epoch_interval,
             save_iter_interval=save_iter_interval,
             max_keep_ckpts=max_keep_ckpts,
-            lr_scheduler_type=lr_scheduler_type,
-            lr_schedule=lr_schedule,
-            warmup_ratio=warmup_ratio,
+            lr_scheduler=lr_scheduler,
             enable_gradient_checkpointing=enable_gradient_checkpointing,
             enable_mixed_precision_training=enable_mixed_precision_training,
             reduce_in_full_precision=reduce_in_full_precision,
             mixed_precision_dtype=mixed_precision_dtype,
+            grad_accumulation_steps=grad_accumulation_steps,
+            evaluator=evaluator,
             tokenizer=tokenizer,
             resume_from=resume_from)
 
         self.cfg = cfg
         self.args = args
-        self.weight_decay = weight_decay
         self.max_grad_norm = max_grad_norm
+        self.static_graph = static_graph
         self.distributed_state = overwatch.distributed_state
         self.recent_losses = deque(maxlen=self.grad_accumulation_steps)
 
@@ -142,23 +188,21 @@ class DDPTrainRunner(BaseTrainRunner):
                                  self.cfg.model.lora_rank)
             # Get modules_to_save for full fine-tuning of specific modules
             modules_to_save = getattr(self.cfg.model, 'modules_to_save', None)
+            target_modules = _resolve_lora_target_modules(
+                self.vla, self.cfg.model.lora_target_modules)
             lora_config = LoraConfig(
                 r=self.cfg.model.lora_rank,
                 lora_alpha=lora_alpha,
                 lora_dropout=self.cfg.model.lora_dropout,
-                target_modules=self.cfg.model.lora_target_modules,
+                target_modules=target_modules,
                 modules_to_save=modules_to_save,
                 init_lora_weights='gaussian',
             )
             self.vla = get_peft_model(self.vla, lora_config)
             self.vla.print_trainable_parameters()
 
-        # Setup optimizer and scheduler using base class method
-        # Support optional weight_decay parameter grouping (if provided)
-        self._setup_optimizer_and_scheduler(
-            n_train_examples,
-            weight_decay=self.weight_decay,
-            lr_schedule=self.lr_schedule)
+        # Setup optimizer and scheduler using base class method.
+        self._setup_optimizer_and_scheduler(n_train_examples)
 
         # Move model to device and wrap with DDP
         torch.cuda.empty_cache()
@@ -226,7 +270,7 @@ class DDPTrainRunner(BaseTrainRunner):
             device_ids=[device_id],
             find_unused_parameters=True,
             gradient_as_bucket_view=True,
-            static_graph=True)
+            static_graph=self.static_graph)
 
         if overwatch.is_rank_zero():
             overwatch.info(
@@ -239,11 +283,14 @@ class DDPTrainRunner(BaseTrainRunner):
                 f'|-> Distributed World Size = {overwatch.world_size()}\n'
                 f'|-> Gradient Accumulation Steps = {self.grad_accumulation_steps}\n\n'  # noqa: E501
                 f'|-> Gradient Checkpointing = {self.enable_gradient_checkpointing}\n'  # noqa: E501
+                f'|-> DDP Static Graph = {self.static_graph}\n'
                 f'|-> Mixed Precision Training = {self.enable_mixed_precision_training}\n'  # noqa: E501
-                f'     |-> Dtype = {self.mixed_precision_dtype}\n')
+                f'|-> Mixed Precision Dtype = {self.mixed_precision_dtype}\n')
 
     def clip_grad_norm(self):
         """Clip gradient norm for DDP model."""
+        if self.max_grad_norm is None:
+            return
         torch.nn.utils.clip_grad_norm_(
             self.vla.parameters(), max_norm=self.max_grad_norm)
 
@@ -273,6 +320,10 @@ class DDPTrainRunner(BaseTrainRunner):
                 self.vla.module.vlm_backbone.config.to_json_file(
                     os.path.join(save_dir, 'vlm_backbone_config.json'))
 
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(
+                    os.path.join(save_dir, 'tokenizer'))
+
             # Handle LoRA merging and checkpoint creation
             if hasattr(self.cfg.model, 'use_lora') and self.cfg.model.use_lora:
                 # First, save the current LoRA adapter to save_dir
@@ -293,10 +344,13 @@ class DDPTrainRunner(BaseTrainRunner):
             os.makedirs(checkpoint_dir, exist_ok=True)
 
             # Create checkpoint filename (unified format)
-            checkpoint_name = f'step-{global_step:06d}-epoch-{epoch:03d}'
+            step_name = str(global_step).zfill(6)
+            epoch_name = str(epoch).zfill(3)
+            checkpoint_name = f'step-{step_name}-epoch-{epoch_name}'
 
             if train_loss is not None:
-                checkpoint_name += f'-loss={train_loss:.4f}'
+                loss_name = format(train_loss, '.4f')
+                checkpoint_name += f'-loss={loss_name}'
             checkpoint_name += '.pt'
 
             checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
@@ -521,15 +575,14 @@ class DDPTrainRunner(BaseTrainRunner):
 
             if param_name not in current_name_to_idx:
                 if overwatch.is_rank_zero():
-                    overwatch.debug(
-                        f'Parameter {param_name} not found in current model')
+                    overwatch.debug(f'Parameter {param_name} is missing from '
+                                    'current model')
                 continue
 
             if ckpt_state_idx not in checkpoint_state:
                 if overwatch.is_rank_zero():
-                    overwatch.debug(
-                        f'State index {ckpt_state_idx} not found in checkpoint'
-                    )
+                    overwatch.debug(f'State index {ckpt_state_idx} is missing '
+                                    'from checkpoint')
                 continue
 
             current_idx = current_name_to_idx[param_name]
@@ -671,7 +724,6 @@ class DDPTrainRunner(BaseTrainRunner):
                 f'Resuming training from checkpoint: {self.resume_from}')
         checkpoint_info = torch.load(self.resume_from)
 
-        # Restore model state (DDP-specific handling)
         if 'model' in checkpoint_info:
             self._load_model_state(checkpoint_info['model'])
 
@@ -753,7 +805,7 @@ class DDPTrainRunner(BaseTrainRunner):
             overwatch.info(f'Loading checkpoint from: {checkpoint_path}')
 
         checkpoint = torch.load(
-            checkpoint_path, map_location=f'cuda:{self.device_id}')
+            checkpoint_path, map_location='cuda:' + str(self.device_id))
 
         # Load model state dict (DDP-specific)
         if 'model' in checkpoint:
@@ -839,7 +891,7 @@ class DDPTrainRunner(BaseTrainRunner):
 
         return smoothened_loss
 
-    def run(self, vla_dataset):
+    def run(self, vla_dataset, eval_dataset=None):
         """Run training with DDP-specific enhancements while using BaseTrainRunner logic."""  # noqa: E501
         # Save dataset statistics if available
         if overwatch.is_rank_zero():
@@ -849,4 +901,4 @@ class DDPTrainRunner(BaseTrainRunner):
                                         self.args.work_dir)
 
         # Use parent's training logic
-        return super().run(vla_dataset)
+        return super().run(vla_dataset, eval_dataset=eval_dataset)

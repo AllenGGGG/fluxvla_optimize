@@ -196,8 +196,7 @@ class ParquetPrompter:
                  action_tokenizer: Optional[dict] = None,
                  use_conversation: bool = True,
                  add_new_line: bool = False,
-                 speed_key: Optional[str] = None,
-                 speed_prompt_template: str = '{task_description} at {speed:g}x speed',
+                 lowercase_task_description: bool = False,
                  *args,
                  **kwargs):
         self.prompt = ''
@@ -211,17 +210,14 @@ class ParquetPrompter:
             self.action_tokenizer = None
         self.use_conversation = use_conversation
         self.add_new_line = add_new_line
-        self.speed_key = speed_key
-        self.speed_prompt_template = speed_prompt_template
+        self.lowercase_task_description = lowercase_task_description
 
     def __call__(self, inputs):
         assert 'task_description' in inputs, \
             "Data must contain 'task_description' key."
         task_description = inputs['task_description']
-        if self.speed_key is not None and self.speed_key in inputs:
-            speed = float(inputs[self.speed_key])
-            task_description = self.speed_prompt_template.format(
-                task_description=task_description, speed=speed)
+        if self.lowercase_task_description:
+            task_description = str(task_description).lower()
         if not self.use_conversation:
             prompt = task_description
         else:
@@ -318,7 +314,12 @@ class PreparePromptWithState():
         cleaned_text = task_description.strip().replace('_', ' ').replace(
             '\n', ' ')
         state_str = ' '.join(map(str, discretized_states))
-        full_prompt = f'Task: {cleaned_text}, State: {state_str};\nAction: '
+        action_prefix = ';\nAction: '
+        full_prompt = (
+            f'Task: {cleaned_text}, State: {state_str}{action_prefix}')
 
         inputs['prompt'] = full_prompt
+        # Normalize state to [-1, 1] range if needed
+        # (assuming it's already normalized by normalizer processor step!!)
+        # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         return inputs

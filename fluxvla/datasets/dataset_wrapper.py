@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from collections import defaultdict
 from typing import Dict, List, Optional, Union
 
@@ -55,6 +56,8 @@ class DistributedRepeatingDataset(IterableDataset):
         dim (int, optional): Target dimension for padding/copying data.
             If provided, data will be padded/copied to be an integer
             multiple of this dimension. Defaults to None.
+        statistics_overrides (dict, optional): Nested statistic values to
+            override after collecting dataset statistics.
     """
 
     def __init__(self,
@@ -66,7 +69,17 @@ class DistributedRepeatingDataset(IterableDataset):
                  seed: int = 42,
                  statistic_name: str = 'private',
                  dim: Optional[int] = None,
-                 dataset_statistics: Optional[Dict] = None) -> None:
+                 dataset_statistics: Optional[Dict] = None,
+                 statistics_overrides: Optional[Dict] = None,
+                 dataset_statistics_path: Optional[str] = None) -> None:
+        if (dataset_statistics is not None
+                and dataset_statistics_path is not None):
+            raise ValueError(
+                'dataset_statistics and dataset_statistics_path are mutually '
+                'exclusive')
+        if dataset_statistics_path is not None:
+            with open(dataset_statistics_path, 'r', encoding='utf-8') as f:
+                dataset_statistics = json.load(f)
         self.shuffle = shuffle
         self.reshuffle_each_epoch = reshuffle_each_epoch
         self.seed = seed
@@ -125,10 +138,18 @@ class DistributedRepeatingDataset(IterableDataset):
             self.is_grouped = False
             self.is_list = True
 
-            self.dataset_statistics = self.get_dataset_statistics(
-                stats, statistic_keys, name_mappings)
+            if dataset_statistics is None:
+                self.dataset_statistics = self.get_dataset_statistics(
+                    stats, statistic_keys, name_mappings)
+            else:
+                self.dataset_statistics = dataset_statistics
 
         else:
+            if dataset_statistics is not None:
+                raise ValueError(
+                    'dataset_statistics_path is only supported for '
+                    'single/list dataset configs; grouped datasets should use '
+                    'grouped stats.')
             # Case 3: Grouped datasets (dict of list of dict)
             self.grouped_datasets = {}
             self.grouped_dataset_lens = {}
@@ -179,10 +200,28 @@ class DistributedRepeatingDataset(IterableDataset):
             self.is_grouped = True
             self.is_list = False
 
+        if statistics_overrides is not None:
+            if self.is_grouped:
+                for stats in self.grouped_dataset_statistics.values():
+                    self._apply_statistics_overrides(stats,
+                                                     statistics_overrides)
+            else:
+                self._apply_statistics_overrides(self.dataset_statistics,
+                                                 statistics_overrides)
+
         # Get the rank and world size from the overwatch
         self.rank = overwatch.rank()
         self.world_size = overwatch.world_size()
         self._epoch = 0
+
+    def _apply_statistics_overrides(self, statistics: Dict,
+                                    overrides: Dict) -> None:
+        for key, value in overrides.items():
+            if (isinstance(value, dict) and key in statistics
+                    and isinstance(statistics[key], dict)):
+                self._apply_statistics_overrides(statistics[key], value)
+            else:
+                statistics[key] = value
 
     def _get_item_from_global_idx(self, global_idx):
         """Get item from global index, handling single, list,
@@ -256,7 +295,7 @@ class DistributedRepeatingDataset(IterableDataset):
         for stat in stats:
             for key in static_keys:
                 if key not in stat['stats']:
-                    raise KeyError(f"Key '{key}' not found in dataset.")
+                    raise KeyError(f"Missing dataset statistic key: '{key}'.")
 
                 stat_data = stat['stats'][key]
 
@@ -301,8 +340,10 @@ class DistributedRepeatingDataset(IterableDataset):
             # Apply dimension padding to individual
             # dataset statistics if dim is specified
             if self.dim is not None:
-                for stat_type in ['min', 'max', 'mean', 'std', 'q01',
-                                  'q99']:  # noqa: E501
+                for stat_type in [
+                        'min', 'max', 'mean', 'std', 'count', 'q01', 'q99',
+                        'q25', 'q50', 'q75'
+                ]:
                     if stat_type in key_stats and len(
                             key_stats[stat_type]) > 0:
                         padded_stats = []
@@ -313,78 +354,27 @@ class DistributedRepeatingDataset(IterableDataset):
                         key_stats[stat_type] = padded_stats
 
             # Global min and max
-            global_min = np.array(key_stats['min']).min(axis=0).tolist()
-            global_max = np.array(key_stats['max']).max(axis=0).tolist()
+            global_min = np.asarray(
+                key_stats['min'], dtype=np.float64).min(axis=0).tolist()
+            global_max = np.asarray(
+                key_stats['max'], dtype=np.float64).max(axis=0).tolist()
 
-            # Compute weighted mean and combined std
-            if 'count' in key_stats and len(key_stats['count']) > 0:
-                # If count information is available,
-                # use it for weighted calculations
-                means = np.array(key_stats['mean'])
-                counts = np.array(key_stats['count']).repeat(means.shape[1], 1)
-                stds = np.array(key_stats['std'])
+            means = np.asarray(key_stats['mean'], dtype=np.float64)
+            stds = np.asarray(key_stats['std'], dtype=np.float64)
+            counts = self._counts_to_weights(key_stats, means, key)
 
-                # Weighted mean
-                total_count = counts.sum()
-                if total_count > 0:
-                    weighted_mean = np.average(
-                        means, weights=counts, axis=0).tolist()
+            weighted_mean, combined_std = self._combine_mean_and_std(
+                means, stds, counts)
+            weighted_mean = weighted_mean.tolist()
+            combined_std = combined_std.tolist()
 
-                    # Merge standard deviations using the formula:
-                    # Var_combined = Σ(n_i * (σ_i^2 + (μ_i -
-                    # μ_combined)^2)) / Σn_i
-                    variances = stds**2
-                    mean_diffs_sq = (means - weighted_mean)**2
-
-                    combined_variance = np.sum(
-                        counts *
-                        (variances + mean_diffs_sq), axis=0) / total_count
-                    combined_std = np.sqrt(combined_variance).tolist()
-                else:
-                    weighted_mean = np.array(
-                        key_stats['mean']).mean(axis=0).tolist()
-                    combined_std = np.array(
-                        key_stats['std']).mean(axis=0).tolist()
-            else:
-                # if no count information, use simple averages
-                weighted_mean = np.array(
-                    key_stats['mean']).mean(axis=0).tolist()
-
-                # mean of stds as an approximation
-                stds = np.array(key_stats['std'])
-                combined_std = np.sqrt(np.mean(stds**2, axis=0)).tolist()
-
-            # Handle quantiles
-            # Ideally, we would want to merge quantiles more accurately,
-            # but without raw data, we can only approximate.
-
-            # Approach:
-            # 1: Use weighted average if counts are available
-            # 2: Use median of quantiles as a fallback
-            # 3: If neither is available, set to None
-
-            q01_value = None
-            q99_value = None
-
-            if 'q01' in key_stats and len(key_stats['q01']) > 0:
-                q01_array = np.array(key_stats['q01'])
-                if 'count' in key_stats and len(key_stats['count']) > 0:
-                    # Weighted average
-                    q01_value = np.average(
-                        q01_array, weights=counts, axis=0).tolist()
-                else:
-                    # Use median as a compromise
-                    q01_value = np.median(q01_array, axis=0).tolist()
-
-            if 'q99' in key_stats and len(key_stats['q99']) > 0:
-                q99_array = np.array(key_stats['q99'])
-                if 'count' in key_stats and len(key_stats['count']) > 0:
-                    # Weighted average
-                    q99_value = np.average(
-                        q99_array, weights=counts, axis=0).tolist()
-                else:
-                    # Use median as a compromise
-                    q99_value = np.median(q99_array, axis=0).tolist()
+            # Quantiles can only be approximated without raw samples. Use
+            # count-weighted averaging when every dataset provides a compatible
+            # count; otherwise median is the least surprising fallback.
+            q01_value = self._combine_optional_statistic(
+                key_stats, 'q01', counts, len(means))
+            q99_value = self._combine_optional_statistic(
+                key_stats, 'q99', counts, len(means))
 
             # Set combined statistics for all mapped keys
             for mapped_key in mapped_keys:
@@ -399,24 +389,103 @@ class DistributedRepeatingDataset(IterableDataset):
 
                 # Add other quantiles if available
                 for q in ['q25', 'q50', 'q75']:
-                    if q in key_stats and len(key_stats[q]) > 0:
-                        q_array = np.array(key_stats[q])
-                        if 'count' in key_stats and len(
-                                key_stats['count']) > 0:
-                            q_value = np.average(
-                                q_array, weights=counts, axis=0).tolist()
-                        else:
-                            q_value = np.median(q_array, axis=0).tolist()
+                    q_value = self._combine_optional_statistic(
+                        key_stats, q, counts, len(means))
+                    if q_value is not None:
                         metadata[mapped_key][q] = q_value
 
         return {self.statistic_name: metadata}
+
+    def _combine_mean_and_std(self, means, stds, weights=None):
+        """Merge per-dataset mean/std into global population statistics."""
+        if weights is None:
+            mean = means.mean(axis=0)
+            variance = np.mean(stds**2 + (means - mean)**2, axis=0)
+        else:
+            mean = self._weighted_average(means, weights)
+            variance = self._weighted_average(stds**2 + (means - mean)**2,
+                                              weights)
+
+        return mean, np.sqrt(np.maximum(variance, 0.0))
+
+    def _combine_optional_statistic(self, key_stats, stat_type, weights,
+                                    expected_num_stats):
+        if stat_type not in key_stats or len(key_stats[stat_type]) == 0:
+            return None
+
+        values = np.asarray(key_stats[stat_type], dtype=np.float64)
+        if weights is not None and len(
+                key_stats[stat_type]) == expected_num_stats:
+            try:
+                return self._weighted_average(values, weights).tolist()
+            except ValueError:
+                pass
+
+        return np.median(values, axis=0).tolist()
+
+    def _counts_to_weights(self, key_stats, values, stat_key):
+        counts = key_stats.get('count')
+        if counts is None or len(counts) != len(values):
+            return None
+
+        counts = np.asarray(counts, dtype=np.float64)
+        if counts.shape[0] != values.shape[0]:
+            return None
+        if np.any(counts < 0):
+            raise ValueError(
+                f"Negative dataset count in statistic '{stat_key}'")
+
+        if values.ndim == 1:
+            if counts.ndim > 1 and np.prod(counts.shape[1:]) != 1:
+                raise ValueError(
+                    f'Count shape {counts.shape} is incompatible with '
+                    f"statistic '{stat_key}' shape {values.shape}")
+            weights = counts.reshape(counts.shape[0])
+        else:
+            value_shape = values.shape[1:]
+            if counts.ndim == 1:
+                weights = counts.reshape((-1, ) + (1, ) * len(value_shape))
+            elif counts.shape[1:] == value_shape:
+                weights = counts
+            elif np.prod(counts.shape[1:]) == 1:
+                weights = counts.reshape((-1, ) + (1, ) * len(value_shape))
+            else:
+                raise ValueError(
+                    f'Count shape {counts.shape} is incompatible with '
+                    f"statistic '{stat_key}' shape {values.shape}")
+
+        try:
+            broadcast_weights = self._broadcast_weights_for_values(
+                weights, values)
+        except ValueError as exc:
+            raise ValueError(
+                f'Count shape {counts.shape} is incompatible with '
+                f"statistic '{stat_key}' shape {values.shape}") from exc
+
+        if np.any(broadcast_weights.sum(axis=0) <= 0):
+            return None
+
+        return weights
+
+    def _weighted_average(self, values, weights):
+        values = np.asarray(values, dtype=np.float64)
+        weights = self._broadcast_weights_for_values(weights, values)
+        total_weight = weights.sum(axis=0)
+        if np.any(total_weight <= 0):
+            raise ValueError('Weights must have positive sum.')
+        return np.sum(values * weights, axis=0) / total_weight
+
+    def _broadcast_weights_for_values(self, weights, values):
+        weights = np.asarray(weights, dtype=np.float64)
+        values = np.asarray(values, dtype=np.float64)
+        return np.broadcast_to(weights, values.shape)
 
     def _pad_statistics_to_dim(self, stats_dict):
         """Pad statistics to be an integer multiple of self.dim.
 
         Args:
             stats_dict: Dictionary containing statistics
-                (mean, std, min, max, q01, q99)
+                (mean, std, min, max, count, q01, q99, q25, q50, q75)
 
         Returns:
             Dictionary with padded statistics
@@ -426,25 +495,27 @@ class DistributedRepeatingDataset(IterableDataset):
 
         padded_stats = {}
         for key, value in stats_dict.items():
-            if isinstance(value, (list, np.ndarray)) and len(value) > 0:
-                # Convert to numpy array for easier manipulation
-                if isinstance(value, list):
-                    value = np.array(value)
+            if isinstance(value, (list, np.ndarray)):
+                array_value = np.asarray(value)
+                if array_value.ndim == 0 or array_value.size == 0:
+                    padded_stats[key] = array_value.item(
+                    ) if array_value.ndim == 0 else value
+                    continue
 
                 # Get the first dimension (sequence length)
-                orig_len = value.shape[0]
+                orig_len = array_value.shape[0]
                 # Calculate target length as integer multiple of dim
                 target_len = ((orig_len + self.dim - 1) // self.dim) * self.dim
 
                 if target_len == orig_len:
                     # No padding needed
-                    padded_stats[key] = value.tolist() if isinstance(
-                        value, np.ndarray) else value
+                    padded_stats[key] = array_value.tolist()
                 else:
                     # Pad by copying the original data
                     repeat_times = (target_len + orig_len - 1) // orig_len
-                    padded_value = np.tile(value, (repeat_times, ) + (1, ) *
-                                           (value.ndim - 1))[:target_len]
+                    padded_value = np.tile(array_value,
+                                           (repeat_times, ) + (1, ) *
+                                           (array_value.ndim - 1))[:target_len]
                     padded_stats[key] = padded_value.tolist()
             else:
                 # Non-array data or scalar, keep as is
@@ -463,8 +534,8 @@ class DistributedRepeatingDataset(IterableDataset):
         pass
 
     def __iter__(self):
-        # Incorporate DataLoader worker info so that data is split
-        # across both distributed processes AND per-process workers.
+        # Incorporate DataLoader worker info so data is split across both
+        # distributed processes and per-process DataLoader workers.
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             worker_id = worker_info.id
@@ -473,24 +544,26 @@ class DistributedRepeatingDataset(IterableDataset):
             worker_id = 0
             num_workers = 1
 
-        # Effective world: distributed processes × per-process workers
         total_world = self.world_size * num_workers
         total_rank = self.rank * num_workers + worker_id
 
         while True:
+            epoch = self._epoch
+            if self.reshuffle_each_epoch:
+                self._epoch += 1
+
+            # Create indices for the entire virtual concatenated dataset
             indices = np.arange(self.total_len)
             if self.shuffle:
-                epoch_offset = self._epoch if self.reshuffle_each_epoch else 0
+                epoch_offset = epoch if self.reshuffle_each_epoch else 0
                 rng = np.random.default_rng(self.seed + epoch_offset)
                 rng.shuffle(indices)
 
+            # Distribute indices across distributed ranks and workers.
             shard = indices[total_rank::total_world].tolist()
 
             for idx in shard:
                 yield self._get_item_from_global_idx(idx)
-
-            if self.reshuffle_each_epoch:
-                self._epoch += 1
 
     def __len__(self):
         """Return the total length of all datasets."""

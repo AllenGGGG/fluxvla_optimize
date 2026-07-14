@@ -285,7 +285,12 @@ class BaseInferenceRunner:
             if self.enable_mixed_precision:
                 self.vla.to(device='cuda', dtype=self.mixed_precision_dtype)
             else:
-                self.vla.cuda()
+                if self.vla.__class__.__name__ in (
+                        'PI05FlowMatchingInference',
+                        'PI05FlowMatchingRTCInference'):
+                    pass
+                else:
+                    self.vla.cuda()
             overwatch.info(
                 f'Model loaded (dtype={self.mixed_precision_dtype}). '
                 f'Seed set to {self.seed}')
@@ -351,12 +356,13 @@ class BaseInferenceRunner:
                         enabled=(self.enable_mixed_precision
                                  and not self._use_remote)):
                     raw_action = self._predict_action(inputs)
-
                 actions = self._postprocess_actions(raw_action)
                 self._execute_actions(actions, rate)
 
                 self._prev_ctx = self._action_ctx
-                t += self.action_chunk
+                t += (
+                    getattr(self, 'execute_horizon', None)
+                    or self.action_chunk)
                 overwatch.info(f'Published Step {t}')
 
     def _preprocess(self, instruction: str) -> dict:

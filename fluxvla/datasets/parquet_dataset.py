@@ -13,8 +13,9 @@
 # limitations under the License.
 import json
 import os
+import shlex
 from collections import deque
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -26,6 +27,9 @@ from fluxvla.engines import DATASETS, build_transform_from_cfg
 
 @DATASETS.register_module()
 class ParquetDataset(Dataset):
+    VERSION_FILE = 'meta/fluxvla_dataset_version.json'
+    HF_REPO_ID = 'limxdynamics/FluxVLAData'
+    HF_REVISION = 'main'
 
     def __init__(self,
                  data_root_path: Union[str, List[str]],
@@ -36,12 +40,11 @@ class ParquetDataset(Dataset):
                  statistic_name: str = 'private',
                  window_start_idx: int = 1,
                  frame_window_size: int = 1,
+                 frame_sample_stride: int = 1,
+                 train_episode_fraction: float = 1.0,
+                 repeat_to_full_length: bool = False,
                  expose_index: bool = False,
-                 task_indices: List[int] = None,
-                 visual_delay_max_steps: int = 0,
-                 visual_delay_min_steps: int = 0,
-                 visual_delay_distribution: str = 'uniform',
-                 visual_delay_probability: float = 1.0) -> None:
+                 expected_dataset_version: Optional[str] = None) -> None:
         """Initialize the Parquet dataset.
 
         Args:
@@ -68,24 +71,31 @@ class ParquetDataset(Dataset):
                 Defaults to 'private'.
             window_start_idx (int): Start index for the action window.
                 Defaults to 1.
+            frame_window_size (int): Number of video frames to expose via
+                ``frame_timestamps``. Defaults to 1 (single current frame).
+            frame_sample_stride (int): Stride (in dataset rows) between the
+                sampled video frames. Defaults to 1 (consecutive frames).
+                Increase this when the sampled frames should span a longer
+                temporal window:
+                ``(frame_window_size - 1) * frame_sample_stride`` rows.
+            train_episode_fraction (float): Fraction of episodes to sample
+                from each data root, preserving original episode order.
+                Defaults to 1.0.
+            repeat_to_full_length (bool): If True, repeat the selected
+                episode subset so `__len__` remains the full dataset length.
+                This keeps epoch length based on full statistics while
+                sampling only the selected train episode fraction.
             expose_index (bool): Whether to add the concatenated dataset index
                 to each raw sample before transforms. This is useful for
                 offline sample-weight transforms such as SARM RA-BC.
                 Defaults to False.
-            visual_delay_max_steps (int): Maximum number of previous dataset
-                steps used for image timestamps while leaving state/action
-                targets aligned to the current sample. Set to 0 to disable.
-            visual_delay_min_steps (int): Minimum sampled visual delay.
-            visual_delay_distribution (str): Distribution for visual delay,
-                one of ``uniform`` or ``constant``.
-            visual_delay_probability (float): Probability of applying a
-                nonzero visual delay to a sample.
+            expected_dataset_version (str, optional): Expected FluxVLA dataset
+                content version. If omitted, no version check is performed so
+                existing local datasets remain usable.
         """
         super().__init__()
-
-        self.task_indices = (
-            set(task_indices) if task_indices is not None else None)
-
+        if not 0 < train_episode_fraction <= 1:
+            raise ValueError('train_episode_fraction must be in (0, 1].')
         self.action_window_size = action_window_size
         if isinstance(data_root_path, str):
             data_root_path = [data_root_path]
@@ -99,14 +109,17 @@ class ParquetDataset(Dataset):
         all_tasks = []
         all_episodes = []
         info_list = []
-        task_indices = self.task_indices
 
-        for root in meta_root:
+        for dataset_root, root in zip(data_root_path, meta_root):
             info_path = os.path.join(root, 'info.json')
             assert os.path.exists(info_path), \
                 f'Metadata file not found at {info_path}'
             with open(os.path.join(root, 'info.json'), 'rb') as f:
                 info_list.append(json.load(f))
+            if expected_dataset_version is not None:
+                self._verify_dataset_version(
+                    dataset_root=dataset_root,
+                    expected_dataset_version=expected_dataset_version)
 
             stats_path = os.path.join(root, 'episodes_stats.jsonl')
             assert os.path.exists(stats_path), \
@@ -115,14 +128,7 @@ class ParquetDataset(Dataset):
                     os.path.join(root, 'episodes_stats.jsonl'),
                     'r',
                     encoding='utf-8') as f:
-                stats = [json.loads(line) for line in f]
-                if task_indices is not None:
-                    stats = [
-                        stat for stat in stats
-                        if int(stat['stats']['task_index']['min'][0])
-                        in task_indices
-                    ]
-                all_stats.extend(stats)
+                all_stats.extend([json.loads(line) for line in f])
 
             tasks_path = os.path.join(root, 'tasks.jsonl')
             assert os.path.exists(tasks_path), \
@@ -145,57 +151,113 @@ class ParquetDataset(Dataset):
         dataset_sizes = []  # Record the size of each dataset
         for root in data_root:
             hf_dataset = load_dataset('parquet', data_dir=root, split='train')
-            if task_indices is not None:
-                hf_dataset = hf_dataset.filter(
-                    lambda sample: sample['task_index'] in task_indices)
-                if len(hf_dataset) == 0:
-                    raise ValueError(
-                        f'No parquet samples found for task_indices='
-                        f'{sorted(task_indices)} in {root}')
             dataset_sizes.append(len(hf_dataset))
             datasets.append(hf_dataset)
-        if task_indices is not None and not all_stats:
-            raise ValueError(
-                f'No episode statistics found for task_indices='
-                f'{sorted(task_indices)}')
         hf_dataset = concatenate_datasets(datasets)
-
         # Compute cumulative sizes for fast index lookup
         self.dataset_cumulative_sizes = np.cumsum([0] + dataset_sizes)
         self.dataset = hf_dataset
+        self.full_length = len(self.dataset)
+        self.sample_indices = self._build_sample_indices(
+            train_episode_fraction)
+        self.effective_length = (
+            self.full_length
+            if repeat_to_full_length else len(self.sample_indices))
         self.transforms = list()
         self.action_key = action_key
         self.use_delta = use_delta
         self.statistic_name = statistic_name
         self.window_start_idx = window_start_idx
         self.frame_window_size = frame_window_size
+        self.frame_sample_stride = frame_sample_stride
         self.expose_index = expose_index
-        self.visual_delay_max_steps = int(visual_delay_max_steps)
-        self.visual_delay_min_steps = int(visual_delay_min_steps)
-        self.visual_delay_distribution = visual_delay_distribution
-        self.visual_delay_probability = float(visual_delay_probability)
-        if self.visual_delay_max_steps < 0:
-            raise ValueError('visual_delay_max_steps must be >= 0')
-        if self.visual_delay_min_steps < 0:
-            raise ValueError('visual_delay_min_steps must be >= 0')
-        if self.visual_delay_min_steps > self.visual_delay_max_steps:
-            raise ValueError(
-                'visual_delay_min_steps cannot exceed '
-                'visual_delay_max_steps')
-        if not 0.0 <= self.visual_delay_probability <= 1.0:
-            raise ValueError(
-                'visual_delay_probability must be in [0, 1], got '
-                f'{self.visual_delay_probability}')
-        if self.visual_delay_distribution not in ('uniform', 'constant'):
-            raise ValueError(
-                'visual_delay_distribution must be "uniform" or "constant", '
-                f'got {self.visual_delay_distribution!r}')
         for transform in transforms:
             self.transforms.append(build_transform_from_cfg(transform))
 
+    @staticmethod
+    def _read_dataset_version(path: str) -> Optional[str]:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw_version = f.read().strip()
+        if not raw_version:
+            return None
+
+        try:
+            version_data = json.loads(raw_version)
+        except json.JSONDecodeError:
+            return raw_version
+
+        if isinstance(version_data, dict):
+            version = version_data.get('fluxvla_dataset_version',
+                                       version_data.get('version'))
+            return str(version) if version is not None else None
+        if isinstance(version_data, str):
+            return version_data
+        return str(version_data)
+
+    @classmethod
+    def _dataset_refresh_command(cls, dataset_root: str) -> str:
+        normalized_root = dataset_root.rstrip(os.sep)
+        local_dir = os.path.dirname(normalized_root) or '.'
+        remote_dir = os.path.basename(normalized_root)
+        return (f'rm -rf {shlex.quote(dataset_root)}\n'
+                f'huggingface-cli download {shlex.quote(cls.HF_REPO_ID)} \\\n'
+                '  --repo-type dataset \\\n'
+                f'  --revision {shlex.quote(cls.HF_REVISION)} \\\n'
+                f'  --include {shlex.quote(remote_dir + "/*")} \\\n'
+                f'  --local-dir {shlex.quote(local_dir)}')
+
+    def _verify_dataset_version(self, dataset_root: str,
+                                expected_dataset_version: str) -> None:
+        version_path = os.path.join(dataset_root, self.VERSION_FILE)
+        refresh_command = self._dataset_refresh_command(dataset_root)
+
+        if not os.path.exists(version_path):
+            raise RuntimeError(
+                f'Dataset version file not found at {version_path}. '
+                f'Expected FluxVLA dataset version '
+                f'{expected_dataset_version}.\n\n'
+                f'Please refresh the dataset with:\n\n{refresh_command}')
+
+        dataset_version = self._read_dataset_version(version_path)
+        if dataset_version != expected_dataset_version:
+            raise RuntimeError(
+                f'Dataset version mismatch for {dataset_root}. '
+                f'Expected FluxVLA dataset version '
+                f'{expected_dataset_version}, but found '
+                f'{dataset_version or "missing"} in {version_path}.\n\n'
+                f'Please refresh the dataset with:\n\n{refresh_command}')
+
+    def _build_sample_indices(self, episode_fraction: float) -> np.ndarray:
+        if episode_fraction == 1.0:
+            return np.arange(self.full_length, dtype=np.int64)
+
+        episode_indices = list(self.dataset['episode_index'])
+        sample_indices = []
+        for start, end in zip(self.dataset_cumulative_sizes[:-1],
+                              self.dataset_cumulative_sizes[1:]):
+            start, end = int(start), int(end)
+            local_episode_indices = episode_indices[start:end]
+            ordered_episodes = list(dict.fromkeys(local_episode_indices))
+            keep_count = int(len(ordered_episodes) * episode_fraction)
+            keep_count = max(1, min(keep_count, len(ordered_episodes)))
+            keep_episodes = set(ordered_episodes[:keep_count])
+            sample_indices.extend(
+                start + offset
+                for offset, episode in enumerate(local_episode_indices)
+                if episode in keep_episodes)
+
+        if not sample_indices:
+            raise ValueError('No samples left after applying episode split.')
+        return np.asarray(sample_indices, dtype=np.int64)
+
+    def _resolve_index(self, index: int) -> int:
+        sample_index = index % len(self.sample_indices)
+        return int(self.sample_indices[sample_index])
+
     def _rand_another(self):
         """Randomly select another index from the dataset."""
-        return np.random.randint(0, len(self.dataset))
+        return int(self.sample_indices[np.random.randint(
+            0, len(self.sample_indices))])
 
     def _get_dataset_index(self, index: int) -> int:
         """Get which dataset in data_root list the index belongs to.
@@ -213,67 +275,38 @@ class ParquetDataset(Dataset):
             self.dataset_cumulative_sizes, index, side='right') - 1
         return dataset_idx
 
-    def _sample_visual_delay(self) -> int:
-        if self.visual_delay_max_steps <= 0:
-            return 0
-        if np.random.random() > self.visual_delay_probability:
-            return 0
-        if self.visual_delay_distribution == 'constant':
-            return self.visual_delay_max_steps
-        return int(
-            np.random.randint(self.visual_delay_min_steps,
-                              self.visual_delay_max_steps + 1))
+    def _get_task_name(self, dataset_idx: int, index: int) -> str:
+        task_idx = self.dataset[index]['task_index']
+        if task_idx < 0 or task_idx >= len(self.tasks[dataset_idx]):
+            return 'empty'
+        return self.tasks[dataset_idx][task_idx].get('task', 'empty')
 
-    def _same_episode_valid_index(self, base_index: int, candidate_index: int,
-                                  dataset_idx: int) -> bool:
-        return (
-            0 <= candidate_index < len(self.dataset)
-            and self.dataset[candidate_index]['episode_index']
-            == self.dataset[base_index]['episode_index']
-            and self._get_dataset_index(candidate_index) == dataset_idx
-            and self.tasks[dataset_idx][self.dataset[candidate_index]
-                                        ['task_index']]['task'] != 'empty'
-            and self.tasks[dataset_idx][self.dataset[candidate_index]
-                                        ['task_index']]['task'] != 'static')
+    def _invalid_start_index(self, index: int, dataset_idx: int,
+                             data: Dict[str, Any]) -> bool:
+        if self._get_task_name(dataset_idx, index) in ('empty', 'static'):
+            return True
 
-    def _visual_timestamps_for_delay(self, index: int, delay: int,
-                                     dataset_idx: int,
-                                     frame_count: int):
-        delay = max(0, int(delay))
-        first_visual_index = index - delay
-        if not self._same_episode_valid_index(index, first_visual_index,
-                                              dataset_idx):
-            delay = 0
+        first_action_index = index + self.window_start_idx
+        if first_action_index == index:
+            return False
+        if not self._same_episode_and_dataset(first_action_index, dataset_idx,
+                                              data):
+            return True
+        return self._get_task_name(dataset_idx,
+                                   first_action_index) in ('empty', 'static')
 
-        timestamps = []
-        for frame_offset in range(frame_count):
-            source_index = index + frame_offset - delay
-            if not self._same_episode_valid_index(index, source_index,
-                                                  dataset_idx):
-                fallback_index = index + frame_offset
-                if self._same_episode_valid_index(index, fallback_index,
-                                                  dataset_idx):
-                    source_index = fallback_index
-                else:
-                    source_index = index
-            timestamps.append(self.dataset[source_index]['timestamp'])
-        return timestamps, delay
+    def _same_episode_and_dataset(self, index: int, dataset_idx: int,
+                                  data: Dict[str, Any]) -> bool:
+        return (index < len(self.dataset) and data['episode_index']
+                == self.dataset[index]['episode_index']
+                and self._get_dataset_index(index) == dataset_idx)
 
     def __getitem__(self, index, dataset_statistics):
+        index = self._resolve_index(index)
         data = self.dataset[index]
         # Determine which dataset the data belongs to
         dataset_idx = self._get_dataset_index(index)
-        while (index == len(self.dataset) - 1
-               or self.dataset[index]['episode_index'] !=
-               self.dataset[index + 1]['episode_index']
-               or self._get_dataset_index(index + 1) != dataset_idx or
-               self.tasks[dataset_idx][self.dataset[index +
-                                                    1]['task_index']]['task']
-               == 'empty' or
-               self.tasks[dataset_idx][self.dataset[index +
-                                                    1]['task_index']]['task']
-               == 'static'):
-
+        while self._invalid_start_index(index, dataset_idx, data):
             index = self._rand_another()
             data = self.dataset[index]
             # Recalculate dataset_idx
@@ -282,39 +315,29 @@ class ParquetDataset(Dataset):
         action_masks = list()
         window_idx = self.window_start_idx
         while len(actions) < self.action_window_size:
-            if (index + window_idx < len(self.dataset)
-                    and data['episode_index']
-                    == self.dataset[index + window_idx]['episode_index']
-                    and  # noqa: E501
-                    self._get_dataset_index(index + window_idx) == dataset_idx
-                    and  # noqa: E501
-                    self.tasks[dataset_idx][self.dataset[index + window_idx]
-                                            ['task_index']]['task'] != 'empty'
-                    and  # noqa: E501
-                    self.tasks[dataset_idx][self.dataset[index + window_idx]
-                                            ['task_index']]['task'] !=
-                    'static'):  # noqa: E501
+            action_index = index + window_idx
+            valid_window_index = self._same_episode_and_dataset(
+                action_index, dataset_idx, data)
+            action_task = (
+                self._get_task_name(dataset_idx, action_index)
+                if valid_window_index else None)
+            if valid_window_index and action_task not in ('empty', 'static'):
                 if self.use_delta:
-                    actions.append(
-                        np.array(self.dataset[index +
-                                              window_idx][self.action_key]) -
-                        np.array(self.dataset[index + window_idx -
-                                              1][self.action_key]).tolist())
+                    actions.append((
+                        np.array(self.dataset[action_index][self.action_key]) -
+                        np.array(self.dataset[action_index -
+                                              1][self.action_key])).tolist())
                 else:
-                    actions.append(self.dataset[index +
-                                                window_idx][self.action_key])
+                    actions.append(self.dataset[action_index][self.action_key])
                 action_masks.append(1)
-            elif index + window_idx >= len(
-                    self.dataset) or self.tasks[dataset_idx][self.dataset[
-                        index + window_idx]['task_index']]['task'] == 'empty':
+            elif action_task == 'empty':
                 pad_action = (
                     actions[-1] if actions else data[self.action_key])
                 for _ in range(self.action_window_size - len(actions)):
                     actions.append(pad_action)
                     action_masks.append(0)
                 break
-            elif self.tasks[dataset_idx][self.dataset[index + window_idx]
-                                         ['task_index']]['task'] == 'static':
+            elif action_task == 'static':
                 window_idx += 1
                 continue
             else:
@@ -329,7 +352,7 @@ class ParquetDataset(Dataset):
             frame_timestamps = [data['timestamp']]
             frame_masks = [1]
             for fi in range(1, self.frame_window_size):
-                future_idx = index + fi
+                future_idx = index + fi * self.frame_sample_stride
                 if (future_idx < len(self.dataset)
                         and self.dataset[future_idx]['episode_index']
                         == data['episode_index'] and
@@ -343,25 +366,13 @@ class ParquetDataset(Dataset):
             data['frame_timestamps'] = frame_timestamps
             data['frame_masks'] = np.array(frame_masks, dtype=np.float32)
 
-        visual_delay = self._sample_visual_delay()
-        if visual_delay > 0:
-            frame_count = len(data.get('frame_timestamps',
-                                       [data['timestamp']]))
-            visual_timestamps, visual_delay = self._visual_timestamps_for_delay(
-                index, visual_delay, dataset_idx, frame_count)
-            data['visual_frame_timestamps'] = visual_timestamps
-            data['visual_delay_steps'] = np.array(visual_delay, dtype=np.int64)
-        elif self.visual_delay_max_steps > 0:
-            data['visual_delay_steps'] = np.array(0, dtype=np.int64)
-
         data['info'] = self.info[dataset_idx]
         data['stats'] = dataset_statistics[self.statistic_name]
         data['actions'] = np.array(actions, dtype=np.float32)
         data['action_masks'] = np.array(action_masks, dtype=np.float32)
         if self.expose_index:
             data['index'] = np.array(index, dtype=np.int64)
-        data['task_description'] = self.tasks[dataset_idx][data['task_index']][
-            'task']  # noqa: E501
+        data['task_description'] = self._get_task_name(dataset_idx, index)
         data['data_root'] = self.data_root_path[dataset_idx]
         for transform in self.transforms:
             data = transform(data)
@@ -369,7 +380,7 @@ class ParquetDataset(Dataset):
         return data
 
     def __len__(self):
-        return len(self.dataset)
+        return self.effective_length
 
         # Additional initialization can be added here if needed.
 
@@ -378,8 +389,7 @@ class ParquetDataset(Dataset):
 class LiberoParquetEvalDataset:
     """Evaluation dataset pipeline for Libero using Parquet-style transforms.
 
-    This mirrors the behavior of `LiberoEvalDataset` in `rlds_dataset.py`,
-    but composes processing via a list of transforms similar to
+    This composes Libero eval processing via a list of transforms similar to
     `ParquetDataset`.
 
     Args:

@@ -94,7 +94,198 @@ Key differences from the training `model`:
 
 See `configs/pi05/pi05_paligemma_libero_10_full_finetune.py`:
 
+```python
+inference_model = dict(
+    type='PI05FlowMatchingInference',
+    pretrained_name_or_path=  # noqa: E251
+    './checkpoints/pi05_libero/model.safetensors',  # noqa: E501
+    num_views=2,
+    llm_backbone=dict(
+        type='ConditionGemmaInferenceModel',
+            ...
+    ),
+   vision_backbone=dict(
+        type='SigLIPViTBackboneInference',
+            ...
+    ),
+    projector=dict(
+        type='LinearProjectorInference',
+        in_dim=1152,
+        out_dim=2048,
+    ),
+    action_in_proj=dict(
+        type='LinearProjectorInference', in_dim=32, out_dim=1024),
+    action_out_proj=dict(
+        type='LinearProjectorInference', in_dim=1024, out_dim=32),
+    time_mlp_in=dict(
+        type='LinearProjectorInference', in_dim=1024, out_dim=1024),
+    time_mlp_out=dict(
+        type='LinearProjectorInference', in_dim=1024, out_dim=1024),
+    llm_expert=dict(
+        type='ConditionGemmaInferenceModel',
+            ...
+    ),
+    name_mapping={
+        'llm_backbone': 'paligemma_with_expert.paligemma.model.language_model',
+        'vision_backbone.vision':
+        'paligemma_with_expert.paligemma.model.vision_tower',
+        'projector.projector':
+        'paligemma_with_expert.paligemma.model.multi_modal_projector.linear',
+        'llm_expert': 'paligemma_with_expert.gemma_expert.model',
+        'time_mlp_in.projector': 'time_mlp_in',
+        'time_mlp_out.projector': 'time_mlp_out',
+        'action_in_proj.projector': 'action_in_proj',
+        'action_out_proj.projector': 'action_out_proj',
+        'llm_backbone.embed_tokens': 'paligemma_with_expert.paligemma.lm_head'
+    })
+```
+
 PI0.5 uses a unified inference model class `PI05FlowMatchingInference` that replaces the entire pipeline with Triton-fused operations and a single CUDA Graph. The inference model is automatically selected during evaluation.
+
+### PI0.5-RTC Example
+
+PI0.5-RTC extends the accelerated pipeline with real-time control (RTC) support via `PI05FlowMatchingRTCInference`. It reuses the same whole-fused-kernel CUDA Graph backend while adding action-chunk prefix conditioning, allowing the model to refine predictions based on previously executed actions.
+
+See `configs/pi05/pi05_paligemma_aloha_rtc_kernel_inference.py`:
+
+```python
+inference_model = dict(
+    type='PI05FlowMatchingRTCInference',
+    pretrained_name_or_path=  # noqa: E251
+    './checkpoints/pi05_base/model.safetensors',  # noqa: E501
+    num_views=2,
+    llm_backbone=dict(
+        type='ConditionGemmaInferenceModel',
+            ...
+    ),
+   vision_backbone=dict(
+        type='SigLIPViTBackboneInference',
+            ...
+    ),
+    projector=dict(
+        type='LinearProjectorInference',
+        in_dim=1152,
+        out_dim=2048,
+    ),
+    action_in_proj=dict(
+        type='LinearProjectorInference', in_dim=32, out_dim=1024),
+    action_out_proj=dict(
+        type='LinearProjectorInference', in_dim=1024, out_dim=32),
+    time_mlp_in=dict(
+        type='LinearProjectorInference', in_dim=1024, out_dim=1024),
+    time_mlp_out=dict(
+        type='LinearProjectorInference', in_dim=1024, out_dim=1024),
+    llm_expert=dict(
+        type='ConditionGemmaInferenceModel',
+            ...
+    ),
+    name_mapping={
+        'llm_backbone': 'paligemma_with_expert.paligemma.model.language_model',
+        'vision_backbone.vision':
+        'paligemma_with_expert.paligemma.model.vision_tower',
+        'projector.projector':
+        'paligemma_with_expert.paligemma.model.multi_modal_projector.linear',
+        'llm_expert': 'paligemma_with_expert.gemma_expert.model',
+        'time_mlp_in.projector': 'time_mlp_in',
+        'time_mlp_out.projector': 'time_mlp_out',
+        'action_in_proj.projector': 'action_in_proj',
+        'action_out_proj.projector': 'action_out_proj',
+        'llm_backbone.embed_tokens': 'paligemma_with_expert.paligemma.lm_head'
+    },
+    params_to_change_dtype=[
+        'llm_expert.llm.model.layers',
+        'vlm_backbone.vlm.model.language_model.layers',
+        'vlm_backbone.vlm.model.vision_tower',
+        'vlm_backbone.vlm.model.multi_modal_projector',
+    ])
+
+inference = dict(
+    type='AlohaRTCInferenceRunner',
+    async_execution=True,
+    execute_horizon=0,
+    rtc_config=dict(
+        enabled=True,
+        method='prefix',
+        prefix_len=5,  # based on deployment inference frequency
+    ),
+    ...)
+```
+
+### GR00T-RTC Example
+
+GR00T-RTC uses the existing GR00T acceleration path (`EagleInferenceBackbone` + `FlowMatchingInferenceHead`) and adds RTC at the runner/head boundary. The RTC runner resamples the remaining part of the previously predicted action chunk, passes it as `prev_actions` with `prefix_len`, and the accelerated head fills CUDA Graph prefix buffers before replay.
+
+See `configs/gr00t/gr00t_eagle_3b_ur3_rtc_kernel_inference.py`:
+
+```python
+
+inference_model = dict(
+    type='LlavaVLA',
+    vlm_backbone=dict(type='EagleInferenceBackbone', ...),
+    vla_head=dict(type='FlowMatchingInferenceHead', ...))
+
+inference = dict(
+    type='URRTCInferenceRunner',
+    async_execution=True,
+    execute_horizon=10,
+    rtc_config=dict(
+        enabled=True,
+        method='prefix',
+        prefix_len=5,
+    ),
+    ...)
+```
+
+#### What changed for GR00T-RTC acceleration
+
+| Area                | Change                                                                                                                                                                                 |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Accelerated model   | Use the existing GR00T inference model path: `EagleInferenceBackbone` + `FlowMatchingInferenceHead`.                                                                                   |
+| RTC runner          | Use `AlohaRTCInferenceRunner` or `Tron2RTCInferenceRunner` so previous action chunks are passed back as RTC prefixes.                                                                  |
+| RTC method          | Use `rtc_config.method='prefix'`; this is the supported RTC method in the accelerated GR00T head.                                                                                      |
+| Config entry points | Add `configs/gr00t/gr00t_eagle_3b_aloha_rtc_inference.py`, `configs/gr00t/gr00t_eagle_3b_tron2_3cam_rtc_inference.py`, and `configs/gr00t/gr00t_eagle_3b_ur3_rtc_kernel_inference.py`. |
+
+#### Usage
+
+The RTC prefix method is robot-agnostic and can be applied to all supported robot embodiments. UR3:
+
+```bash
+python scripts/inference_real_robot.py \
+    --config configs/gr00t/gr00t_eagle_3b_ur3_rtc_kernel_inference.py \
+    --ckpt-path /path/to/checkpoint.safetensors
+```
+
+Key inference parameters:
+
+| Parameter                    | Purpose                                                                                                                                 |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `async_execution=True`       | Enables overlapping execution and inference for ALOHA/Tron2, allowing the next prediction to condition on the remaining previous chunk. |
+| `execute_horizon=10`         | Executes only the first 10 actions from each chunk; tune this to match deployment latency and control frequency.                        |
+| `rtc_config.prefix_len=5`    | Locks the first 5 denoising steps to the resampled previous action prefix.                                                              |
+| `rtc_config.method='prefix'` | Selects prefix inpainting RTC, which is CUDA Graph compatible in `FlowMatchingInferenceHead`.                                           |
+
+UR3 uses synchronous `servoj` / gripper command publication, so the
+`URRTCInferenceRunner` records when the current horizon starts executing and
+uses `execute_horizon` to request the next chunk before consuming the full
+32-step prediction. This keeps the same RTC prefix contract as ALOHA/Tron2
+while preserving the existing UR ROS command topics.
+
+#### Random-weight parity check
+
+The accelerated GR00T-RTC head was checked against the original GR00T-RTC head with randomly initialized weights. The test copies one random `FlowMatchingHead` state dict into `FlowMatchingInferenceHead`, uses the same random inputs and sampling seed, and compares the generated actions.
+
+| Case             | Compared paths                                                                      |     Cosine |   Max diff |
+| ---------------- | ----------------------------------------------------------------------------------- | ---------: | ---------: |
+| Plain GR00T      | `FlowMatchingHead` vs `FlowMatchingInferenceHead`                                   | 0.99999237 | 0.02273726 |
+| GR00T-RTC prefix | `FlowMatchingHead(method='prefix')` vs `FlowMatchingInferenceHead(method='prefix')` | 0.99999380 | 0.02104545 |
+
+These differences are expected from bf16 fused kernels, CUDA Graph replay, and slightly different operation ordering; the cosine similarity confirms the accelerated RTC path is numerically aligned with the original GR00T-RTC path.
+
+Notes:
+
+- Accelerated GR00T RTC currently supports `rtc_config.method='prefix'`.
+- `prefix_len` should be chosen from deployment latency and control frequency, and clamped by the runner to the remaining previous chunk length.
+- Keep `cfg.inference_model` on the accelerated classes; using `cfg.model` or `FlowMatchingHead` will run RTC but will not use the GR00T CUDA Graph/Triton acceleration path.
 
 ## Benchmarks
 
@@ -188,3 +379,15 @@ result is not conflated with LIBERO environment dynamics.
 | ----- | ------------- | ---------------- | ------- |
 | GR00T | 14.7          | 42.6             | 2.90x   |
 | PI0.5 | 4.52          | 31.6             | 6.99x   |
+
+### On RTX 4090 Device (Inference Frequency)
+
+| Model     | Baseline (Hz) | Accelerated (Hz) | Speedup |
+| --------- | ------------- | ---------------- | ------- |
+| PI0.5-rtc | 3.4           | 19.6             | 6.66x   |
+
+### On AGX Orin 64GB Device (Inference Frequency)
+
+| Model | Baseline (Hz) | Accelerated (Hz) | Speedup |
+| ----- | ------------- | ---------------- | ------- |
+| GR00T | 3.2           | 5.26             | 1.63x   |
