@@ -127,6 +127,7 @@ class ParquetDatasetV3(ParquetDataset):
                  statistic_name: str = 'private',
                  window_start_idx: int = 1,
                  frame_window_size: int = 1,
+                 frame_sample_stride: int = 1,
                  expose_index: bool = False) -> None:
         """Initialize a parquet dataset backed by LeRobot v3 metadata.
 
@@ -145,6 +146,9 @@ class ParquetDatasetV3(ParquetDataset):
                 window.
             frame_window_size (int): Number of timestamps to expose for
                 frame-sequence consumers.
+            frame_sample_stride (int): Stride (in dataset rows) between sampled
+                video frames. Defaults to 1. Increase this when the sampled
+                frames should span a longer temporal window.
             expose_index (bool): Whether to expose the concatenated row index
                 to transforms for offline sample weighting.
         """
@@ -204,12 +208,16 @@ class ParquetDatasetV3(ParquetDataset):
             datasets.append(hf_dataset)
         self.dataset_cumulative_sizes = np.cumsum([0] + dataset_sizes)
         self.dataset = concatenate_datasets(datasets)
+        self.full_length = len(self.dataset)
+        self.sample_indices = np.arange(self.full_length, dtype=np.int64)
+        self.effective_length = self.full_length
         self.transforms = list()
         self.action_key = action_key
         self.use_delta = use_delta
         self.statistic_name = statistic_name
         self.window_start_idx = window_start_idx
         self.frame_window_size = frame_window_size
+        self.frame_sample_stride = frame_sample_stride
         self.expose_index = expose_index
         for transform in transforms:
             self.transforms.append(build_transform_from_cfg(transform))
@@ -353,7 +361,7 @@ class ParquetDatasetV3(ParquetDataset):
             frame_timestamps = [data['timestamp']]
             frame_masks = [1]
             for fi in range(1, self.frame_window_size):
-                future_idx = index + fi
+                future_idx = index + fi * self.frame_sample_stride
                 if (future_idx < len(self.dataset)
                         and self.dataset[future_idx]['episode_index']
                         == data['episode_index'] and

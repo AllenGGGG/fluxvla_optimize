@@ -33,10 +33,6 @@ class Tracker(Protocol):
               metrics: Dict[str, Union[int, float]]) -> None:
         ...
 
-    def write_images(self, global_step: int,
-                     images: Dict[str, np.ndarray]) -> None:
-        ...
-
     def finalize(self) -> None:
         ...
 
@@ -66,11 +62,6 @@ class JSONLinesTracker:
                 mode='a',
                 sort_keys=True) as js_tracker:
             js_tracker.write(metrics)
-
-    def write_images(self, global_step: int,
-                     images: Dict[str, np.ndarray]) -> None:
-        # Images aren't JSON-serializable; this tracker only logs scalars.
-        return
 
     def finalize(self) -> None:
         return
@@ -130,13 +121,6 @@ class WeightsBiasesTracker:
               metrics: Dict[str, Union[int, float]]) -> None:
         wandb.log(metrics, step=global_step)
 
-    @overwatch.rank_zero_only
-    def write_images(self, global_step: int,
-                     images: Dict[str, np.ndarray]) -> None:
-        wandb.log(
-            {key: wandb.Image(image) for key, image in images.items()},
-            step=global_step)
-
     @staticmethod
     def finalize() -> None:
         if overwatch.is_rank_zero():
@@ -188,13 +172,6 @@ class TensorBoardTracker:
             self.writer.add_scalar(key, value, global_step)
 
     @overwatch.rank_zero_only
-    def write_images(self, global_step: int,
-                     images: Dict[str, np.ndarray]) -> None:
-        for key, image in images.items():
-            self.writer.add_image(
-                key, image, global_step, dataformats='HWC')
-
-    @overwatch.rank_zero_only
     def finalize(self) -> None:
         if self.writer:
             self.writer.close()
@@ -244,8 +221,13 @@ class VLAMetric:
         update_step_time: bool = True,
     ) -> None:
         self.update_step_time = update_step_time
+        self.grad_accumulation_steps = max(int(grad_accumulation_steps), 1)
+        self.window_size = max(int(window_size), 1)
+        self.scalar_window_size = (
+            self.window_size * self.grad_accumulation_steps)
         self.run_id, self.run_dir, self.hparams = run_id, run_dir, hparams
-        os.makedirs(self.run_dir, exist_ok=True)
+        if self.run_dir:
+            os.makedirs(self.run_dir, exist_ok=True)
         # Initialize Trackers
         self.trackers = []
         for tracker_type in active_trackers:
@@ -269,26 +251,35 @@ class VLAMetric:
         self.epoch = 0 if resume_epoch is None else resume_epoch
         self.start_time, self.step_start_time = time.time(), time.time()
         self.state = {
-            'loss_raw': deque(maxlen=grad_accumulation_steps),
-            'loss': deque(maxlen=window_size),
-            'l1_loss': deque(maxlen=window_size),
-            'action_accuracy': deque(maxlen=window_size),
-            'step_time': deque(maxlen=window_size),
+            'loss_raw': deque(maxlen=self.grad_accumulation_steps),
+            'loss': deque(maxlen=self.scalar_window_size),
+            'l1_loss': deque(maxlen=self.scalar_window_size),
+            'action_accuracy': deque(maxlen=self.scalar_window_size),
+            'step_time': deque(maxlen=self.window_size),
             'lr': [],
         }
+        self.extra_scalar_metric_keys = []
 
         # Created metrics buffers for individual tracked datasets
-        self.dataset_trackers = defaultdict(lambda: VLAMetric([], '', '', {}))
+        self.dataset_trackers = defaultdict(self._build_dataset_tracker)
+
+    def _build_dataset_tracker(self) -> 'VLAMetric':
+        return VLAMetric([],
+                         '',
+                         self.run_dir, {},
+                         grad_accumulation_steps=self.grad_accumulation_steps,
+                         window_size=self.window_size,
+                         update_step_time=False)
 
     def log(self, global_step: int, metrics: Dict[str, Union[int,
                                                              float]]) -> None:
         for tracker in self.trackers:
             tracker.write(global_step, metrics)
 
-    def log_images(self, global_step: int,
-                   images: Dict[str, np.ndarray]) -> None:
-        for tracker in self.trackers:
-            tracker.write_images(global_step, images)
+    @staticmethod
+    def _format_scalar_metric_name(prefix: str, key: str) -> str:
+        metric_label = ' '.join(key.split('_')).title()
+        return f'{prefix}/{metric_label}'
 
     def get_status(self, loss: Optional[torch.Tensor] = None) -> str:
         lr = self.state['lr'][-1] if len(self.state['lr']) > 0 else 0
@@ -322,7 +313,8 @@ class VLAMetric:
         if lr is not None:
             self.state['lr'].append(lr)
 
-        if self.update_step_time:
+        if self.update_step_time and (global_step is not None
+                                      or lr is not None):
             self.state['step_time'].append(time.time() - self.step_start_time)
             self.step_start_time = time.time()
 
@@ -333,7 +325,13 @@ class VLAMetric:
                 self.state['loss_raw'].append(loss_val)
                 self.state['loss'].append(loss_val)
             else:
-                self.state[key].append(value.detach())
+                metric_val = value.detach()
+                if metric_val.numel() != 1:
+                    continue
+                if key not in self.state:
+                    self.state[key] = deque(maxlen=self.scalar_window_size)
+                    self.extra_scalar_metric_keys.append(key)
+                self.state[key].append(metric_val)
 
     def commit_for_dataset(self, dataset_name: str, **kwargs) -> None:
         self.dataset_trackers[dataset_name].commit(**kwargs)
@@ -375,6 +373,13 @@ class VLAMetric:
         prefix = 'VLA Train'
         # Format lr to ensure at least 6 decimal places
         lr_formatted = f'{lr:.7f}'
+        extra_scalar_metrics = {}
+        for key in self.extra_scalar_metric_keys:
+            values = list(self.state[key])
+            if values:
+                metric_name = self._format_scalar_metric_name(prefix, key)
+                extra_scalar_metrics[metric_name] = torch.stack(
+                    values).mean().item()
         self.log(
             self.global_step,
             metrics={
@@ -387,6 +392,7 @@ class VLAMetric:
                 f'{prefix}/Learning Rate': lr_formatted,
                 f'{prefix}/Step Time': step_time,
                 **dataset_metrics,
+                **extra_scalar_metrics,
             },
         )
         return status
