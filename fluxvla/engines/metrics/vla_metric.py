@@ -9,7 +9,7 @@ import os
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol, Tuple, Union
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 import jsonlines
 import numpy as np
@@ -31,6 +31,10 @@ class Tracker(Protocol):
 
     def write(self, global_step: int,
               metrics: Dict[str, Union[int, float]]) -> None:
+        ...
+
+    def write_images(self, global_step: int,
+                     images: Dict[str, List[np.ndarray]]) -> None:
         ...
 
     def finalize(self) -> None:
@@ -62,6 +66,11 @@ class JSONLinesTracker:
                 mode='a',
                 sort_keys=True) as js_tracker:
             js_tracker.write(metrics)
+
+    def write_images(self, global_step: int,
+                     images: Dict[str, List[np.ndarray]]) -> None:
+        # Images aren't JSON-serializable; this tracker only logs scalars.
+        return
 
     def finalize(self) -> None:
         return
@@ -121,6 +130,19 @@ class WeightsBiasesTracker:
               metrics: Dict[str, Union[int, float]]) -> None:
         wandb.log(metrics, step=global_step)
 
+    @overwatch.rank_zero_only
+    def write_images(self, global_step: int,
+                     images: Dict[str, List[np.ndarray]]) -> None:
+        # Log each key as a list of wandb.Image so the W&B UI renders a
+        # single scrollable/clickable gallery panel per key, instead of one
+        # static panel per image.
+        wandb.log(
+            {
+                key: [wandb.Image(image) for image in image_list]
+                for key, image_list in images.items()
+            },
+            step=global_step)
+
     @staticmethod
     def finalize() -> None:
         if overwatch.is_rank_zero():
@@ -170,6 +192,16 @@ class TensorBoardTracker:
               metrics: Dict[str, Union[int, float]]) -> None:
         for key, value in metrics.items():
             self.writer.add_scalar(key, value, global_step)
+
+    @overwatch.rank_zero_only
+    def write_images(self, global_step: int,
+                     images: Dict[str, List[np.ndarray]]) -> None:
+        # TensorBoard has no native "gallery" widget; log each image in the
+        # list under its own indexed tag instead.
+        for key, image_list in images.items():
+            for idx, image in enumerate(image_list):
+                self.writer.add_image(
+                    f'{key}/{idx}', image, global_step, dataformats='HWC')
 
     @overwatch.rank_zero_only
     def finalize(self) -> None:
@@ -275,6 +307,11 @@ class VLAMetric:
                                                              float]]) -> None:
         for tracker in self.trackers:
             tracker.write(global_step, metrics)
+
+    def log_images(self, global_step: int,
+                   images: Dict[str, List[np.ndarray]]) -> None:
+        for tracker in self.trackers:
+            tracker.write_images(global_step, images)
 
     @staticmethod
     def _format_scalar_metric_name(prefix: str, key: str) -> str:

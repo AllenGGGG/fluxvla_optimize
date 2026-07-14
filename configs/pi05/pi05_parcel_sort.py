@@ -171,11 +171,12 @@ train_dataloader = dict(
                         state_dim=_MODEL_ACTION_DIM,
                         state_key='proprio',
                         action_key='action',
-                        norm_type='min_max',
+                        norm_type='quantile',
                         state_norm_mask=[True] * _JOINT_DIM + [False] *
                         (_MODEL_ACTION_DIM - _JOINT_DIM),
                         action_norm_mask=[True] * _JOINT_DIM + [False] *
                         (_MODEL_ACTION_DIM - _JOINT_DIM)),
+                    dict(type='AddStateGaussianNoise', noise_std=0.01),
                     dict(type='PreparePromptWithState'),
                     dict(
                         type='ProcessPrompts',
@@ -186,6 +187,11 @@ train_dataloader = dict(
                             'checkpoints/pi05_base',  # noqa: E501
                         )),
                     dict(type='ResizeImages', height=224, width=224),
+                    dict(
+                        type='RandomMaskImages',
+                        num_masks_range=(0, 3),
+                        mask_size_range=(0.05, 0.2),
+                        prob=0.5),
                     dict(type='SimpleNormalizeImages'),
                 ],
                 action_window_size=_ACTION_HORIZON)

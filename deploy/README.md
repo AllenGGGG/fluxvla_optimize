@@ -85,15 +85,17 @@ PyTorch, OpenCV, MMEngine, safetensors, and the pinned visualization packages:
 
 ```bash
 conda activate fluxvla_infer
-./install_env.sh
+bash scripts/install_env.sh real-only --with-ros2
 ```
 
-This delegates the ML dependencies to `scripts/install_env.sh real-only`,
-adds the pinned visualization packages above, and installs ROS2 Jazzy
-(`ros-jazzy-ros-base`) via apt if `rclpy` isn't already importable. Set
-`ROS2_INSTALL=never` to only check, or `ROS2_INSTALL=always` to force a
+`--with-ros2` installs the same ML dependencies as `scripts/install_env.sh
+real-only`, then adds the pinned visualization packages above and installs
+ROS2 Jazzy (`ros-jazzy-ros-base`) via apt if `rclpy` isn't already importable.
+Set `ROS2_INSTALL=never` to only check, or `ROS2_INSTALL=always` to force a
 reinstall; installing ROS2 runs `apt-get` as root and adds the ros2.org apt
-source system-wide.
+source system-wide. There used to be a separate `deploy/install_env.sh` for
+this; it's been folded into `scripts/install_env.sh` so there's a single
+installer for both training and deploy.
 
 All deployment parameters are grouped at the top of `launch.sh`. Edit those
 values directly when changing the model, inference mode, or safety thresholds,

@@ -21,6 +21,7 @@ from .robocasa_transforms import (  # noqa: F401, F403
     RobocasaGR1N15Bridge)
 from .transform_actions import *  # noqa: F401, F403
 from .transform_images import *  # noqa: F401, F403
+from .transform_states import *  # noqa: F401, F403
 try:
     # RLDS-oriented input transforms; pull in tensorflow at import time and are
     # not used by the parquet training pipeline. Best-effort import.

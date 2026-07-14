@@ -444,7 +444,7 @@ class JointInferenceNode(Node):
                 timestamp_s = self.get_clock().now().nanoseconds * 1e-9
                 chunk_id = self._backend.action_chunk_id
                 if chunk_id is not None and chunk_id != self._last_rerun_chunk_id:
-                    self._rerun.log_inference_boundary(timestamp_s=timestamp_s)
+                    self._rerun.log_inference_marker(timestamp_s=timestamp_s)
                     self._last_rerun_chunk_id = chunk_id
                 self._publish_joint_action(action, timestamp_s=timestamp_s)
             except Exception as exc:

@@ -23,6 +23,7 @@ SKIP_FLASH_ATTN=0
 SKIP_PROJECT=0
 SKIP_BUILD_TOOLS=0
 SKIP_EGL_SETUP=0
+WITH_ROS2=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -74,6 +75,9 @@ FLUXVLA_ROBOCASA_GR1_DIR="${FLUXVLA_ROBOCASA_GR1_DIR:-${FLUXVLA_ROBOCASA_SRC_ROO
 FLUXVLA_ROBOCASA_ASSETS="${FLUXVLA_ROBOCASA_ASSETS:-always}"
 FLUXVLA_ROBOCASA_ASSET_ENDPOINT="${FLUXVLA_ROBOCASA_ASSET_ENDPOINT:-${HF_ENDPOINT:-https://hf-mirror.com}}"
 FLUXVLA_ROBOCASA_ASSET_CACHE="${FLUXVLA_ROBOCASA_ASSET_CACHE:-/tmp/robocasa-assets}"
+ROS_DISTRO_NAME="jazzy"
+ROS_SETUP="${ROS_SETUP:-/opt/ros/${ROS_DISTRO_NAME}/setup.bash}"
+ROS2_INSTALL="${ROS2_INSTALL:-auto}"
 
 usage() {
   cat <<'EOF'
@@ -108,6 +112,11 @@ Options:
                               when RoboCasa source checkouts are installed.
   --skip-robocasa-assets      Skip RoboCasa asset download. --skip-robocasa
                               also skips asset download.
+  --with-ros2                 Also install deploy/'s pinned visualization
+                              packages and ROS2 Jazzy (real-robot deploy
+                              stack, e.g. pistar06). Independent of the
+                              ROS1 Noetic/rospy check real-only already runs
+                              for other real-robot runners.
   -h, --help                  Show this help.
 
 Environment variables:
@@ -215,6 +224,19 @@ Environment variables:
   FLUXVLA_ROBOCASA_ASSET_CACHE
                       Local archive cache for RoboCasa asset downloads.
                       Default: /tmp/robocasa-assets.
+  ROS2_INSTALL        With --with-ros2, controls the ROS2 Jazzy install step:
+                      auto (default) installs it only if rclpy isn't already
+                      importable, always forces a reinstall attempt, never
+                      only checks and warns. Installing ROS2 Jazzy runs
+                      apt-get as root (via sudo) and adds the ros2.org apt
+                      source system-wide.
+  ROS2_INSTALL_ALLOW_UNVERIFIED
+                      With --with-ros2, set to 1 to install the ros-apt-source
+                      .deb even if its published sha256 checksum can't be
+                      fetched. Default: 0 (refuse unverified installs).
+  ROS_SETUP           With --with-ros2, path to the ROS2 Jazzy setup.bash
+                      used to check whether rclpy is importable. Default:
+                      /opt/ros/jazzy/setup.bash.
 
 Examples:
   conda activate fluxvla
@@ -226,6 +248,8 @@ Examples:
   FLUXVLA_ROBOCASA_SRC_ROOT=/data/src bash scripts/install_env.sh sim-only
   bash scripts/install_env.sh sim-only --skip-robocasa
   GH_PROXY_CANDIDATES="https://ghfast.top https://gh.llkk.cc https://gh-proxy.com" bash scripts/install_env.sh full
+  conda activate fluxvla_infer
+  bash scripts/install_env.sh real-only --with-ros2
 EOF
 }
 
@@ -308,6 +332,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --with-robocasa)
       FLUXVLA_ROBOCASA_INSTALL="always"
+      shift
+      ;;
+    --with-ros2)
+      WITH_ROS2=1
       shift
       ;;
     --skip-robocasa)
@@ -393,6 +421,15 @@ case "${FLUXVLA_ROBOCASA_ASSETS}" in
     ;;
   *)
     echo "FLUXVLA_ROBOCASA_ASSETS must be one of: always, never" >&2
+    exit 1
+    ;;
+esac
+
+case "${ROS2_INSTALL}" in
+  auto|always|never)
+    ;;
+  *)
+    echo "ROS2_INSTALL must be one of: auto, always, never" >&2
     exit 1
     ;;
 esac
@@ -1659,6 +1696,186 @@ if importlib.util.find_spec("rospy") is None:
 PY
 }
 
+# ------------------------------------------------------------------
+# --with-ros2: deploy/'s visualization deps + ROS2 Jazzy (real-robot deploy
+# stack, e.g. pistar06). Independent of check_ros_python_runtime above, which
+# checks ROS1 Noetic/rospy for the other real-robot runners.
+# ------------------------------------------------------------------
+
+install_deploy_visualization() {
+  echo "Installing deploy/ visualization dependencies."
+  pip_install_with_mirrors -r "${PROJECT_ROOT}/deploy/requirements-visualization.txt"
+}
+
+as_root() {
+  if [[ "${EUID}" == "0" ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "Error: need root or sudo to install ROS2 ${ROS_DISTRO_NAME} system packages." >&2
+    return 1
+  fi
+}
+
+rclpy_importable() {
+  if [[ -f "${ROS_SETUP}" ]]; then
+    set +u
+    # shellcheck disable=SC1090
+    source "${ROS_SETUP}"
+    set -u
+  fi
+  "${PYTHON_BIN}" -c "import rclpy" >/dev/null 2>&1
+}
+
+# Verify the downloaded .deb against the sha256sum GitHub publishes alongside
+# release assets (<asset>.sha256, a convention ros-apt-source's release
+# workflow follows). Refuses to install an unverified package unless the
+# caller explicitly opts in via ROS2_INSTALL_ALLOW_UNVERIFIED=1 -- installing
+# it runs apt-get as root, so a tampered/MITM'd download must not be silently
+# trusted.
+verify_deb_checksum() {
+  local deb_url="$1" deb_path="$2"
+  local checksum_url="${deb_url}.sha256"
+  local checksum_path="${deb_path}.sha256"
+
+  if ! curl -fsSL -o "${checksum_path}" "${checksum_url}" 2>/dev/null; then
+    if [[ "${ROS2_INSTALL_ALLOW_UNVERIFIED:-0}" == "1" ]]; then
+      echo "Warning: no ${checksum_url} published; installing ${deb_path} UNVERIFIED" \
+        "(ROS2_INSTALL_ALLOW_UNVERIFIED=1)." >&2
+      return 0
+    fi
+    echo "Error: could not fetch a checksum for ${deb_path} from ${checksum_url};" >&2
+    echo "       refusing to apt-get install an unverified package downloaded over" >&2
+    echo "       the network. Re-run with ROS2_INSTALL_ALLOW_UNVERIFIED=1 to bypass" >&2
+    echo "       (not recommended), or install ROS2 ${ROS_DISTRO_NAME} manually." >&2
+    return 1
+  fi
+
+  local expected actual
+  expected="$(awk '{print $1}' "${checksum_path}")"
+  actual="$(sha256sum "${deb_path}" | awk '{print $1}')"
+  if [[ -z "${expected}" || "${expected}" != "${actual}" ]]; then
+    echo "Error: checksum mismatch for ${deb_path}" >&2
+    echo "       expected: ${expected:-<empty>}" >&2
+    echo "       actual:   ${actual}" >&2
+    echo "       refusing to install a package that does not match its published checksum." >&2
+    return 1
+  fi
+  echo "    checksum verified: ${deb_path} matches ${checksum_url}"
+}
+
+# Download a GitHub release asset through the same GH_PROXY/GH_PROXY_CANDIDATES
+# fallback chain used for the FlashAttention wheel below, so the ROS2 apt
+# source .deb isn't a second, unproxied path to the same "GitHub is
+# unreachable" failure mode.
+download_github_asset_via_proxy() {
+  local url="$1"
+  local out="$2"
+  local proxies=() urls=() proxy candidate
+
+  if [[ -v GH_PROXY ]]; then
+    if [[ -n "${GH_PROXY}" ]]; then
+      proxies+=("${GH_PROXY%/}")
+    fi
+  else
+    for proxy in ${DEFAULT_GH_PROXY_CANDIDATES}; do
+      proxies+=("${proxy%/}")
+    done
+  fi
+  proxies+=("")
+
+  for proxy in "${proxies[@]}"; do
+    if [[ -z "${proxy}" ]]; then
+      urls+=("${url}")
+    else
+      urls+=("${proxy}/${url}")
+    fi
+  done
+
+  for candidate in "${urls[@]}"; do
+    echo "  fetching: ${candidate}" >&2
+    if download_file_to_cache "${candidate}" "${out}"; then
+      return 0
+    fi
+    rm -f "${out}" "${out}.aria2"
+  done
+  return 1
+}
+
+install_ros2_jazzy() {
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "+ install_ros2_jazzy"
+    return
+  fi
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "Error: ROS2 ${ROS_DISTRO_NAME} auto-install only supports Linux (Ubuntu 24.04 Noble)." >&2
+    return 1
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "Error: apt-get not found; install ROS2 ${ROS_DISTRO_NAME} manually:" >&2
+    echo "       https://docs.ros.org/en/${ROS_DISTRO_NAME}/Installation.html" >&2
+    return 1
+  fi
+
+  echo "Installing ROS2 ${ROS_DISTRO_NAME} (ros-${ROS_DISTRO_NAME}-ros-base) via apt."
+  as_root apt-get update
+  as_root apt-get install -y software-properties-common curl
+  as_root add-apt-repository -y universe
+  as_root apt-get update
+
+  local version_codename ros_apt_source_version deb_url deb_path
+  version_codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+  ros_apt_source_version="$(
+    curl -fsSL https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest \
+      | grep -F '"tag_name"' | head -n1 | awk -F'"' '{print $4}'
+  )"
+  if [[ -z "${ros_apt_source_version}" ]]; then
+    echo "Error: could not determine the latest ros-apt-source release version." >&2
+    return 1
+  fi
+
+  deb_url="https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ros_apt_source_version}/ros2-apt-source_${ros_apt_source_version}.${version_codename}_all.deb"
+  deb_path="/tmp/ros2-apt-source.deb"
+  if ! download_github_asset_via_proxy "${deb_url}" "${deb_path}"; then
+    echo "Error: failed to download ${deb_url} (direct and via GH_PROXY_CANDIDATES)." >&2
+    return 1
+  fi
+  verify_deb_checksum "${deb_url}" "${deb_path}"
+  as_root apt-get install -y "${deb_path}"
+  as_root apt-get update
+  as_root apt-get install -y "ros-${ROS_DISTRO_NAME}-ros-base" python3-rosdep
+}
+
+setup_ros2_and_visualization() {
+  install_deploy_visualization
+
+  echo "Setting up ROS2 ${ROS_DISTRO_NAME} for deploy/."
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "+ setup_ros2_and_visualization (ROS2_INSTALL=${ROS2_INSTALL})"
+    return
+  fi
+
+  if [[ "${ROS2_INSTALL}" == "never" ]]; then
+    if rclpy_importable; then
+      echo "    rclpy is importable."
+    else
+      echo "Warning: rclpy is not importable and ROS2_INSTALL=never; skipping install." >&2
+      echo "         Install ROS2 ${ROS_DISTRO_NAME} manually and source ${ROS_SETUP}." >&2
+    fi
+  elif [[ "${ROS2_INSTALL}" == "always" ]] || ! rclpy_importable; then
+    install_ros2_jazzy
+    if rclpy_importable; then
+      echo "    rclpy is importable after install."
+    else
+      echo "Warning: rclpy is still not importable after installing ROS2 ${ROS_DISTRO_NAME}." >&2
+      echo "         Check that ${ROS_SETUP} exists and matches ${PYTHON_BIN}'s Python version." >&2
+    fi
+  else
+    echo "    rclpy is already importable; skipping install (ROS2_INSTALL=auto)."
+  fi
+}
+
 download_via_proxy() {
   local upstream="$1"
   local cache_dir="${FLUXVLA_WHEEL_CACHE:-${HOME}/.cache/fluxvla/wheels}"
@@ -2040,6 +2257,11 @@ main() {
     echo "RoboCasa asset download: never (RoboCasa source checkout skipped)"
   fi
   echo "RoboCasa source root: ${FLUXVLA_ROBOCASA_SRC_ROOT}"
+  if [[ "${WITH_ROS2}" == "1" ]]; then
+    echo "ROS2 setup: enabled (ROS2_INSTALL=${ROS2_INSTALL})"
+  else
+    echo "ROS2 setup: skipped (pass --with-ros2 to enable)"
+  fi
 
   ensure_build_tools
   ensure_pip
@@ -2048,6 +2270,9 @@ main() {
   verify_torch_install "${selected}"
   install_av
   install_requirements
+  if [[ "${WITH_ROS2}" == "1" ]]; then
+    setup_ros2_and_visualization
+  fi
   install_robocasa_sources
   configure_libero_egl_runtime
   install_flash_attn "${selected}"

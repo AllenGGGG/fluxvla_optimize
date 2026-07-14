@@ -694,6 +694,76 @@ class AugImage:
 
 
 @TRANSFORMS.register_module()
+class RandomMaskImages:
+    """Randomly occlude square regions of each camera image, filling each
+    masked region with that image's own per-channel mean.
+
+    Follows the same `data['images']` convention as `ResizeImages`: a single
+    array of shape `(N * 3, H, W)` with each camera's 3 RGB channels
+    concatenated along axis 0. Reshapes to `(N, 3, H, W)`, masks each of the
+    N camera images independently, then concatenates back to `(N * 3, H, W)`.
+
+    For each camera image, with probability `prob`, samples a random number
+    of square masks from `num_masks_range` and, for each mask, a random side
+    length from `mask_size_range` (as a fraction of the image's shorter
+    side) and a random top-left position fully inside the image bounds.
+
+    Args:
+        num_masks_range (Tuple[int, int]): Inclusive (min, max) number of
+            mask squares per image. Default: (0, 3).
+        mask_size_range (Tuple[float, float]): (min, max) mask side length
+            as a fraction of the image's shorter side. Default: (0.05, 0.2).
+        prob (float): Probability of applying masking to each image.
+            Default: 0.5.
+    """
+
+    def __init__(self,
+                 num_masks_range: Tuple[int, int] = (0, 3),
+                 mask_size_range: Tuple[float, float] = (0.05, 0.2),
+                 prob: float = 0.5,
+                 *args,
+                 **kwargs):
+        self.num_masks_range = num_masks_range
+        self.mask_size_range = mask_size_range
+        self.prob = prob
+
+    def _mask_one(self, image: np.ndarray) -> np.ndarray:
+        if np.random.random() > self.prob:
+            return image
+
+        _, h, w = image.shape
+        short_side = min(h, w)
+        num_masks = np.random.randint(self.num_masks_range[0],
+                                      self.num_masks_range[1] + 1)
+        if num_masks <= 0:
+            return image
+
+        masked = image.copy()
+        fill_value = masked.mean(axis=(1, 2), keepdims=True)
+        for _ in range(num_masks):
+            size = int(
+                round(
+                    np.random.uniform(self.mask_size_range[0],
+                                      self.mask_size_range[1]) * short_side))
+            size = max(size, 1)
+            size_h = min(size, h)
+            size_w = min(size, w)
+            top = np.random.randint(0, h - size_h + 1)
+            left = np.random.randint(0, w - size_w + 1)
+            masked[:, top:top + size_h, left:left + size_w] = fill_value
+        return masked
+
+    def __call__(self, data: dict) -> dict:
+        assert 'images' in data, "Input data must contain 'images' key"
+        raw = np.asarray(data['images'])
+        assert raw.ndim == 3, "Input 'images' must be a (N*3, H, W) array"
+        images = raw.reshape(-1, 3, raw.shape[-2], raw.shape[-1])
+        masked_images = [self._mask_one(image) for image in images]
+        data['images'] = np.concatenate(masked_images, axis=0)
+        return data
+
+
+@TRANSFORMS.register_module()
 class NormalizeImages:
     """Normalize images in the dataset using specified
     means and standard deviations. This transform normalizes

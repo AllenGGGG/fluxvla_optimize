@@ -93,6 +93,7 @@ class RerunVisualizer:
         self._info = info or (lambda _message: None)
         self._recording: Any | None = None
         self._joint_ranges: dict[str, list[float]] = {}
+        self._inference_marker_logged = False
         self.enabled = False
         if not enabled:
             return
@@ -130,12 +131,12 @@ class RerunVisualizer:
     def _log_series_styles(self) -> None:
         for group_name in JOINT_GROUPS:
             self._recording.log(
-                f"joints/{group_name}/inference_boundaries",
-                rr.SeriesLines(
-                    colors=[180, 180, 180],
-                    widths=2.0,
-                    names="inference boundary",
-                    aggregation_policy=rr.components.AggregationPolicy.MinMax,
+                f"joints/{group_name}/inference_marker",
+                rr.SeriesPoints(
+                    colors=[255, 215, 0],
+                    markers=rr.components.MarkerShape.Circle,
+                    marker_sizes=8.0,
+                    names="inference start",
                 ),
                 static=True,
             )
@@ -237,20 +238,28 @@ class RerunVisualizer:
 
         self._run(log)
 
-    def log_inference_boundary(self, *, timestamp_s: float) -> None:
-        """Draw one vertical separator in every joint plot for a new chunk."""
+    def log_inference_marker(self, *, timestamp_s: float) -> None:
+        """Mark the moment a new inference chunk starts in every joint plot.
+
+        Logs one point per joint group at a fixed height above the observed
+        range, rather than the two-point-spike-plus-Clear trick used
+        previously to fake a vertical separator on a scalar time series
+        (unreliable — depended on Clear not retroactively hiding the points
+        just logged, and on sub-millisecond time deltas rendering as a
+        visible near-vertical segment).
+        """
+        if not self._inference_marker_logged:
+            self._inference_marker_logged = True
+            self._info("[rerun] logging inference-start markers")
+
         def log(recording: Any) -> None:
             for group_name in JOINT_GROUPS:
                 lower, upper = self._joint_ranges.get(group_name, [-1.0, 1.0])
                 span = max(upper - lower, 0.2)
                 margin = 0.05 * span
-                path = f"joints/{group_name}/inference_boundaries"
+                path = f"joints/{group_name}/inference_marker"
                 self._set_time(recording, timestamp_s)
-                recording.log(path, rr.Scalars(lower - margin))
-                self._set_time(recording, timestamp_s + 1e-4)
                 recording.log(path, rr.Scalars(upper + margin))
-                self._set_time(recording, timestamp_s + 2e-4)
-                recording.log(path, rr.Clear(recursive=False))
 
         self._run(log)
 
