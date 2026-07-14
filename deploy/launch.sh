@@ -10,17 +10,33 @@ CHECKPOINT_ROOT="$SCRIPT_DIR/checkpoints/07_13"
 
 # Paths
 MODEL_ID="$CHECKPOINT_ROOT/checkpoints/step-072330-epoch-10-loss=0.0142.safetensors"
+# Must match RTC_METHOD below:
+#   RTC_METHOD=none     -> pi05_parcel_sort_inference.py               (Triton)
+#   RTC_METHOD=prefix   -> pi05_parcel_sort_inference_prefix_rtc.py    (Triton)
+#   RTC_METHOD=guidance -> pi05_parcel_sort_inference_guidance_rtc.py  (eager, slower)
+# A mismatch (e.g. guidance against the plain/prefix Triton configs) fails
+# fast at startup -- see model.py's _RTC_METHOD_SUPPORTED_TYPES check.
 INFERENCE_CONFIG="$PACKAGE_PARENT/configs/pi05/pi05_parcel_sort_inference.py"
 PYTHON_BIN="$HOME/runtime/miniforge3/envs/fluxvla_infer/bin/python"
+# Empty = use BaseInferenceRunner's default (MODEL_ID's grandparent directory).
+NORM_STATS_PATH=""
 
 # Model and execution
-RTC_MODE="plain"
 ROBOT_HZ=30.0
-NUM_STEPS_OVERRIDE=0
-MAX_NORMALIZED_ACTION_ABS=1.25
+NUM_STEPS_OVERRIDE=0  # 0 = use the inference_config's own denoising step count
 TASK="Pick up the parcel with the left hand, then move it onto the conveyor belt with the right hand."
 DEVICE="cuda"
 DTYPE="bf16"
+NORM_TYPE="min_max"  # "quantile" or "min_max"; must match dataset_statistics.json
+#NORM_TYPE="quantile"  # "quantile" or "min_max"; must match dataset_statistics.json
+
+# fluxvla's own RTC guidance, fed by deploy/exec_engine's ChunkScheduler
+# (the async scheduler; see deploy/README.md for the RTC_METHOD/INFERENCE_CONFIG
+# pairing table).
+RTC_METHOD="none"  # "none", "prefix", or "guidance"
+RTC_EXECUTION_HORIZON=10
+RTC_MAX_GUIDANCE_WEIGHT=10.0
+RTC_SCHEDULE="linear"  # "linear", "exp", "ones", or "zeros"
 
 # CFG / advantage-conditioning (inert until a checkpoint is trained on
 # advantage-tagged data; infrastructure for collecting that signal now).
@@ -35,25 +51,12 @@ ARM_DOF=7
 
 # Safety gates
 AUTO_START=true
-ALLOW_SHARED_CONTROL=false
 REQUIRE_DIRECT_MOVEJ=true
 MANAGE_WBC_INTERPOLATION=true
-MAX_HELD_POSE_ERROR_RAD=0.10
-
-# Chunking
-PLAIN_EXEC_FRACTION=0.5
-OVERLAP_STEPS=15
-ACTION_BLEND_STEPS=10
-NOTIFY_EVERY=12
-DISCARD_LATENCY=true
-MIN_QUEUE_KEEP=1
-STATE_FUSION_ALPHA=0.5
-RTC_HORIZON=10
-RTC_GUIDANCE_WEIGHT=10.0
 
 # Debug
 DEBUG=false
-DEBUG_DIR="/tmp/plain_debug"
+DEBUG_DIR="/tmp/rtc_debug"
 RERUN_ENABLED=true
 
 # ROS environment
@@ -70,14 +73,27 @@ set -u
 
 ROS_PARAMS=(
   --ros-args
+
+  # Paths
   -p "model_id:=$MODEL_ID"
   -p "inference_config:=$INFERENCE_CONFIG"
-  -p "device:=$DEVICE"
-  -p "dtype:=$DTYPE"
-  -p "rtc_mode:=$RTC_MODE"
+  -p "norm_stats_path:=$NORM_STATS_PATH"
+
+  # Model and execution
   -p "robot_exec_hz:=$ROBOT_HZ"
   -p "num_inference_steps_override:=$NUM_STEPS_OVERRIDE"
-  -p "max_normalized_action_abs:=$MAX_NORMALIZED_ACTION_ABS"
+  -p "task:=$TASK"
+  -p "device:=$DEVICE"
+  -p "dtype:=$DTYPE"
+  -p "norm_type:=$NORM_TYPE"
+
+  # fluxvla RTC guidance
+  -p "rtc_method:=$RTC_METHOD"
+  -p "rtc_execution_horizon:=$RTC_EXECUTION_HORIZON"
+  -p "rtc_max_guidance_weight:=$RTC_MAX_GUIDANCE_WEIGHT"
+  -p "rtc_schedule:=$RTC_SCHEDULE"
+
+  # CFG / advantage-conditioning
   -p "advantage_enabled:=$ADVANTAGE_ENABLED"
   -p "cfg_enabled:=$CFG_ENABLED"
   -p "cfg_scale:=$CFG_SCALE"
@@ -86,29 +102,21 @@ ROS_PARAMS=(
   -p "cfg_cond_advantage_tag:=$CFG_COND_ADVANTAGE_TAG"
   -p "cfg_uncond_advantage_tag:=$CFG_UNCOND_ADVANTAGE_TAG"
   -p "arm_dof:=$ARM_DOF"
+
+  # Safety gates
   -p "auto_start:=$AUTO_START"
-  -p "allow_shared_control:=$ALLOW_SHARED_CONTROL"
   -p "require_direct_movej:=$REQUIRE_DIRECT_MOVEJ"
   -p "manage_wbc_interpolation:=$MANAGE_WBC_INTERPOLATION"
-  -p "max_held_pose_error_rad:=$MAX_HELD_POSE_ERROR_RAD"
-  -p "plain_execution_fraction:=$PLAIN_EXEC_FRACTION"
-  -p "overlap_steps:=$OVERLAP_STEPS"
-  -p "action_blend_steps:=$ACTION_BLEND_STEPS"
-  -p "notify_every:=$NOTIFY_EVERY"
-  -p "discard_latency_steps:=$DISCARD_LATENCY"
-  -p "min_queue_keep_steps:=$MIN_QUEUE_KEEP"
-  -p "state_fusion_alpha:=$STATE_FUSION_ALPHA"
-  -p "rtc_infer_execution_horizon:=$RTC_HORIZON"
-  -p "rtc_infer_max_guidance_weight:=$RTC_GUIDANCE_WEIGHT"
+
+  # Debug
   -p "debug:=$DEBUG"
   -p "debug_dir:=$DEBUG_DIR"
   -p "rerun_enabled:=$RERUN_ENABLED"
-  -p "task:=$TASK"
 )
 
 echo "model      : $MODEL_ID"
 echo "config     : $INFERENCE_CONFIG"
-echo "mode       : $RTC_MODE"
+echo "rtc method : $RTC_METHOD"
 echo "control    : auto-start after safety gates pass"
 echo "rerun     : live camera and joint visualization"
 echo "WBC stream : temporarily sets movej_interpolation_type='none'"

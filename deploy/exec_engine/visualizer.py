@@ -12,7 +12,6 @@ import numpy as np
 
 if TYPE_CHECKING:
     import matplotlib.figure
-    from ..config import RTCConfig
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +54,7 @@ def _hard_match_diff(
 class RTCDebugVisualizer:
     """RTC debug plots with a persistent worker thread for async saving.
 
-    Instance methods: record(), used by RTCInferenceEngine.
+    Instance methods: record(), used by ChunkScheduler.
     Static methods:   plot_chunk_comparison(), plot_waypoints(), usable standalone.
     """
 
@@ -63,12 +62,10 @@ class RTCDebugVisualizer:
         self,
         debug_dir: str,
         execution_horizon: int,
-        cfg: RTCConfig | None = None,
     ) -> None:
         self._dir = pathlib.Path(debug_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._horizon = execution_horizon
-        self._cfg = cfg
         self._idx: int = 0
         self._queue: queue.Queue = queue.Queue()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="RTCDebugSave")

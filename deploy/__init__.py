@@ -1,13 +1,13 @@
 from typing import Any
 
-__all__ = ["AsyncJointInferenceNode", "WorkerConfig"]
+__all__ = ["JointInferenceNode", "WorkerConfig"]
 
 
 def __getattr__(name: str) -> Any:
-    if name == "AsyncJointInferenceNode":
-        from .ros_node import AsyncJointInferenceNode
+    if name == "JointInferenceNode":
+        from .ros_node import JointInferenceNode
 
-        return AsyncJointInferenceNode
+        return JointInferenceNode
     if name == "WorkerConfig":
         from .config import WorkerConfig
 

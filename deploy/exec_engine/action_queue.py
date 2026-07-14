@@ -47,25 +47,6 @@ class ActionQueue:
                 return 0
             return max(0, len(self.queue) - self._last_index)
 
-    def empty(self) -> bool:
-        with self._lock:
-            if self.queue is None:
-                return True
-            return self._last_index >= len(self.queue)
-
-    def get_action_index(self) -> int:
-        """Current consumption index (used to measure inference delay)."""
-        with self._lock:
-            return self._last_index
-
-    def get_left_over(self) -> np.ndarray | None:
-        """Unconsumed *original* numpy actions for RTC prefix guidance."""
-        with self._lock:
-            if self.original_queue is None:
-                return None
-            tail = self.original_queue[self._last_index:]
-            return tail.copy() if len(tail) else None
-
     def snapshot(self) -> tuple[int, np.ndarray | None, np.ndarray | None]:
         """Atomically return ``(action_index, full_original, left_over)``."""
         with self._lock:

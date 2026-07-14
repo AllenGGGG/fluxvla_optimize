@@ -1,17 +1,19 @@
-"""FluxVLA PI0.5 loading and CFG/advantage-aware RTC inference.
+"""FluxVLA PI0.5 loading and CFG/advantage/RTC-aware inference.
 
 All preprocessing/postprocessing (image resize+normalize, state
 normalization, prompt building, action denormalization) go through
-``PIStar06InferenceRunner``'s ``dataset``/``denormalize_action`` objects,
-which are built via ``fluxvla.engines``' ``build_dataset_from_cfg``/
-``build_transform_from_cfg`` reading ``configs/pi05/pi05_parcel_sort_inference.py``
-- the exact same ``fluxvla.transforms`` classes used by training. There is no
-hand-rolled normalize/denormalize/prompt-building code in this file.
+``self.dataset``/``self.denormalize_action`` (built by
+``BaseInferenceRunner.__init__`` via ``fluxvla.engines``'
+``build_dataset_from_cfg``/``build_transform_from_cfg`` reading
+``configs/pi05/pi05_parcel_sort_inference.py``) - the exact same
+``fluxvla.transforms`` classes used by training. There is no hand-rolled
+normalize/denormalize/prompt-building code in this file.
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -21,8 +23,39 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
+from fluxvla.engines.runners.base_inference_runner import BaseInferenceRunner
+from fluxvla.engines.utils.root import OPERATORS
+
 from .config import WorkerConfig
-from .pistar06_inference_runner import MODEL_JOINT_DIM, MODEL_TENSOR_DIM
+from .utils import MODEL_JOINT_DIM, MODEL_TENSOR_DIM
+
+
+# ---------------------------------------------------------------------------
+# BaseInferenceRunner unconditionally builds a ROS operator
+# (fluxvla/engines/runners/base_inference_runner.py:154); pistar06's ROS2
+# node (ros_node.JointInferenceNode) owns all ROS I/O itself, so
+# FluxVLAPolicy needs an operator that does nothing.
+# ---------------------------------------------------------------------------
+
+
+@OPERATORS.register_module()
+class NullOperator:
+    """No-op stand-in for BaseInferenceRunner's ROS1 operator abstraction.
+
+    pistar06 is ROS2/rclpy; ``ros_node.JointInferenceNode`` owns all
+    subscriptions/publishers directly rather than through this abstraction.
+    """
+
+
+# inference_model.type names whose predict_action actually consumes
+# prev_actions/prefix_len/rtc_config for each rtc_method. Anything else
+# (e.g. plain PI05FlowMatchingInference) silently drops those kwargs into
+# **kwargs and produces un-guided actions -- see FluxVLAPolicy.__init__'s
+# startup check below.
+_RTC_METHOD_SUPPORTED_TYPES = {
+    "prefix": {"PI05FlowMatchingRTCInference", "PI05FlowMatching", "PI0FlowMatching"},
+    "guidance": {"PI05FlowMatching", "PI0FlowMatching"},
+}
 
 
 @dataclass
@@ -128,10 +161,17 @@ def apply_cfg_blend(
     return out
 
 
-class FluxVLAPolicyWorker:
-    """Loads the pi05_parcel_sort checkpoint via PIStar06InferenceRunner and
-    runs cond/uncond/CFG-blended inference using fluxvla's training-native
-    transform pipeline."""
+class FluxVLAPolicy(BaseInferenceRunner):
+    """Loads the pi05_parcel_sort checkpoint and runs cond/uncond/CFG-blended
+    inference using fluxvla's training-native transform pipeline.
+
+    Subclasses BaseInferenceRunner directly (rather than composing an
+    instance of it) so ``self.dataset``/``self.vla``/``self.denormalize_action``
+    -- built by BaseInferenceRunner.__init__ from pi05_parcel_sort_inference.py
+    -- are used as-is, with no wrapper class or extra attribute indirection
+    in between. Its ROS1-shaped run()/get_ros_observation()/etc. are never
+    called (ros_node.JointInferenceNode owns real ROS I/O).
+    """
 
     def __init__(
         self,
@@ -142,8 +182,6 @@ class FluxVLAPolicyWorker:
         # importable without mmengine/torch installed, matching
         # BaseInferenceRunner's own lazy-import convention.
         from mmengine import Config
-
-        from .pistar06_inference_runner import PIStar06InferenceRunner
 
         startup_started = time.perf_counter()
         stage_started = startup_started
@@ -159,21 +197,9 @@ class FluxVLAPolicyWorker:
             stage_started = now
 
         self.cfg = worker_cfg
-        if not worker_cfg.model_id:
-            raise ValueError("model_id must point to a fine-tuned checkpoint")
-        if (
-            not np.isfinite(worker_cfg.max_normalized_action_abs)
-            or worker_cfg.max_normalized_action_abs <= 0.0
-        ):
-            raise ValueError("max_normalized_action_abs must be finite and positive")
-
+        self.device = worker_cfg.device
         checkpoint_path = Path(worker_cfg.model_id).expanduser().resolve()
         inference_config_path = Path(worker_cfg.inference_config).expanduser().resolve()
-        if not checkpoint_path.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        if not inference_config_path.is_file():
-            raise FileNotFoundError(
-                f"Inference config not found: {inference_config_path}")
         log_success(
             "paths validated: "
             f"checkpoint={checkpoint_path} inference_config={inference_config_path}"
@@ -183,11 +209,17 @@ class FluxVLAPolicyWorker:
         if worker_cfg.num_inference_steps_override > 0:
             inference_cfg.inference_model['num_steps'] = (
                 worker_cfg.num_inference_steps_override)
+        # dataset['transforms'][0] is NormalizeStatesAndActions (see
+        # pi05_parcel_sort_inference.py); it and denormalize_action must use
+        # the same norm_type as whatever dataset_statistics.json contains.
+        inference_cfg.dataset['transforms'][0]['norm_type'] = worker_cfg.norm_type
+        inference_cfg.denormalize_action['norm_type'] = worker_cfg.norm_type
         log_success(
-            f"inference config loaded: type={inference_cfg.inference_model['type']}"
+            f"inference config loaded: type={inference_cfg.inference_model['type']} "
+            f"norm_type={worker_cfg.norm_type}"
         )
 
-        self.runner = PIStar06InferenceRunner(
+        super().__init__(
             cfg=inference_cfg,
             ckpt_path=str(checkpoint_path),
             dataset=copy.deepcopy(inference_cfg.dataset),
@@ -196,16 +228,40 @@ class FluxVLAPolicyWorker:
             mixed_precision_dtype=worker_cfg.dtype,
             enable_mixed_precision=worker_cfg.device == 'cuda',
         )
-        log_success(f"model structure built: type={type(self.runner.vla).__name__}")
+        vla_type = type(self.vla).__name__
+        log_success(f"model structure built: type={vla_type}")
+
+        if worker_cfg.rtc_method != "none":
+            supported = _RTC_METHOD_SUPPORTED_TYPES.get(worker_cfg.rtc_method, set())
+            if vla_type not in supported:
+                raise ValueError(
+                    f"rtc_method={worker_cfg.rtc_method!r} requires an "
+                    f"inference_config whose inference_model.type implements "
+                    f"RTC {worker_cfg.rtc_method!r} (one of {sorted(supported)}), "
+                    f"but got type={vla_type!r}, which silently ignores "
+                    f"prev_actions/prefix_len/rtc_config."
+                )
 
         parameter_count = sum(
-            parameter.numel() for parameter in self.runner.vla.parameters())
+            parameter.numel() for parameter in self.vla.parameters())
         log_success(f"checkpoint loaded strictly: parameters={parameter_count:,}")
 
-        # BaseInferenceRunner.run_setup() moves the model to CUDA and sets
-        # the global seed; it does not depend on ROS being available.
-        self.runner.run_setup()
-        self.n_action_steps = int(getattr(self.runner.vla, 'n_action_steps', 50))
+        # BaseInferenceRunner.__init__ always derives dataset_statistics.json
+        # from ckpt_path's grandparent directory; override with an explicit
+        # path here if the caller gave one (e.g. stats live somewhere else).
+        if worker_cfg.norm_stats_path:
+            norm_stats_path = Path(worker_cfg.norm_stats_path).expanduser().resolve()
+            with open(norm_stats_path, 'r', encoding='utf-8') as f:
+                norm_stats = json.load(f)
+            self.dataset.norm_stats = norm_stats
+            self.denormalize_action.norm_stats = norm_stats
+            log_success(f"norm_stats overridden: path={norm_stats_path}")
+        log_success(f"norm_stats loaded: {self.dataset.norm_stats}")
+
+        # run_setup() moves the model to CUDA and sets the global seed; it
+        # does not depend on ROS being available.
+        self.run_setup()
+        self.n_action_steps = int(getattr(self.vla, 'n_action_steps', 50))
         log_success(
             "model ready: "
             f"dtype={worker_cfg.dtype} eval=true action_horizon={self.n_action_steps}"
@@ -215,40 +271,17 @@ class FluxVLAPolicyWorker:
         # first dataset transform is the same NormalizeStatesAndActions
         # instance, built from the same checkpoint statistics, used for
         # every real preprocessing call below.
-        self._normalize_transform = self.runner.dataset.transforms[0]
-        self._norm_stats = self.runner.dataset.norm_stats['private']
+        self._normalize_transform = self.dataset.transforms[0]
+        self._norm_stats = self.dataset.norm_stats['private']
 
         emit(
             f"[startup] policy worker ready: "
             f"total={time.perf_counter() - startup_started:.2f}s"
         )
 
-    def _check_action_envelope(self, raw_action: torch.Tensor) -> np.ndarray:
-        array = raw_action.detach().float().cpu().numpy()
-        if array.ndim == 3:
-            if array.shape[0] != 1:
-                raise ValueError(f"Expected batch size 1, got action shape {array.shape}")
-            array = array[0]
-        if array.ndim != 2 or array.shape[1] < MODEL_JOINT_DIM:
-            raise ValueError(f"Unexpected action shape: {array.shape}")
-        if not np.isfinite(array).all():
-            raise ValueError("Model returned NaN or Inf")
-        trained_values = array[:, :MODEL_JOINT_DIM]
-        max_abs = float(np.max(np.abs(trained_values)))
-        if max_abs > self.cfg.max_normalized_action_abs:
-            raise ValueError(
-                "Model action is outside the normalized training envelope: "
-                f"max_abs={max_abs:.3f} > {self.cfg.max_normalized_action_abs:.3f}"
-            )
-        return array
-
     def _normalize_prev_actions(self, prev_actions: np.ndarray) -> np.ndarray:
         """Normalize (T, 28) robot-space actions via the training transform."""
         previous = np.asarray(prev_actions, dtype=np.float32)
-        if previous.ndim != 2 or previous.shape[1] != MODEL_JOINT_DIM:
-            raise ValueError(
-                f"prev_actions must have shape (T, {MODEL_JOINT_DIM}), "
-                f"got {previous.shape}")
         padded = np.zeros((previous.shape[0], MODEL_TENSOR_DIM), dtype=np.float32)
         padded[:, :MODEL_JOINT_DIM] = previous
         result = self._normalize_transform({
@@ -258,97 +291,108 @@ class FluxVLAPolicyWorker:
         })
         return result['actions']
 
-    def _forward(self, obs: dict[str, Any], **rtc_kwargs: Any) -> torch.Tensor:
-        inputs = self.runner.dataset(obs)
-        return self.runner.vla.predict_action(**inputs, **rtc_kwargs)
+    def _build_rtc_kwargs(
+        self, guidance_prev: np.ndarray | None
+    ) -> dict[str, Any]:
+        """predict_action's RTC kwargs from the caller-supplied prefix
+        context (empty = no RTC: method 'none', or no prefix context yet).
 
-    def _denormalize(self, raw_action: torch.Tensor) -> np.ndarray:
-        self._check_action_envelope(raw_action)
-        return self.runner.denormalize_action(
+        ``guidance_prev`` is the ground truth for what the new chunk's
+        prefix must match -- the exec engine's real unconsumed queue tail,
+        not a self-tracked guess (see ``predict_chunk``).
+        """
+        cfg = self.cfg
+        if cfg.rtc_method == "none" or guidance_prev is None or not len(
+                guidance_prev):
+            return {}
+        previous = self._normalize_prev_actions(guidance_prev)
+        prefix_len = min(cfg.rtc_execution_horizon, len(previous))
+        if prefix_len <= 0:
+            return {}
+        return {
+            "prev_actions": torch.from_numpy(previous).unsqueeze(0).to(self.device),
+            "prefix_len": prefix_len,
+            "rtc_config": {
+                "method": cfg.rtc_method,
+                "decay_end": min(2 * cfg.rtc_execution_horizon, len(previous)),
+                "schedule": cfg.rtc_schedule,
+                "max_guidance_weight": cfg.rtc_max_guidance_weight,
+                "use_vjp": False,
+            },
+        }
+
+    def _preprocess(self, obs: dict[str, Any]) -> dict[str, Any]:
+        return self.dataset(obs)
+
+    def _forward(
+        self, inputs: dict[str, Any], **rtc_kwargs: Any
+    ) -> torch.Tensor:
+        return self.vla.predict_action(**inputs, **rtc_kwargs)
+
+    def _postprocess(self, raw_action: torch.Tensor) -> np.ndarray:
+        return self.denormalize_action(
             dict(action=raw_action.detach().float().cpu().numpy()))
 
-    def _predict_denormalized(
-        self,
-        obs: dict[str, Any],
-        **rtc_kwargs: Any,
-    ) -> np.ndarray:
-        cfg = self.cfg
-        if not cfg.advantage_enabled:
-            return self._denormalize(self._forward(obs, **rtc_kwargs))
+    def _predict_once(self, obs: dict[str, Any], **rtc_kwargs: Any) -> np.ndarray:
+        inputs = self._preprocess(obs)
+        raw_action = self._forward(inputs, **rtc_kwargs)
+        return self._postprocess(raw_action)
 
-        if not cfg.cfg_enabled:
-            cond_obs = dict(obs)
-            cond_obs['task_description'] = _with_advantage_tag(
-                obs['task_description'], cfg.cfg_cond_advantage_tag)
-            return self._denormalize(self._forward(cond_obs, **rtc_kwargs))
-
-        cond_obs = dict(obs)
-        cond_obs['task_description'] = _with_advantage_tag(
-            obs['task_description'], cfg.cfg_cond_advantage_tag)
-        uncond_obs = dict(obs)
-        uncond_obs['task_description'] = _with_advantage_tag(
-            obs['task_description'], cfg.cfg_uncond_advantage_tag)
-
-        cond = self._denormalize(self._forward(cond_obs, **rtc_kwargs))
-        uncond = self._denormalize(self._forward(uncond_obs, **rtc_kwargs))
-        return apply_cfg_blend(
-            cond,
-            uncond,
-            scale=cfg.cfg_scale,
-            scale_joint=cfg.cfg_scale_joint,
-            scale_gripper=cfg.cfg_scale_gripper,
-            arm_dof=cfg.arm_dof,
-        )
-
-    def predict(self, obs: dict[str, Any]) -> np.ndarray:
-        return self._predict_denormalized(obs)
-
-    def predict_rtc(
+    def predict_chunk(
         self,
         obs: dict[str, Any],
         delay: int,
-        prev_actions: np.ndarray | None,
-        rtc_cfg: Any,
-    ) -> dict[str, np.ndarray]:
-        kwargs: dict[str, Any] = {}
-        if prev_actions is not None and len(prev_actions):
-            previous = self._normalize_prev_actions(prev_actions)
-            prefix_len = min(max(delay, 1), len(previous))
-            kwargs = {
-                "prev_actions": torch.from_numpy(previous).unsqueeze(0).cuda(),
-                "prefix_len": prefix_len,
-                "rtc_config": {
-                    "method": "guidance",
-                    "decay_end": min(
-                        max(delay, 0) + rtc_cfg.execution_horizon, len(previous)),
-                    "schedule": rtc_cfg.prefix_attention_schedule.value,
-                    "max_guidance_weight": rtc_cfg.max_guidance_weight,
-                    "use_vjp": False,
-                },
-            }
-        return {"chunk": self._predict_denormalized(obs, **kwargs)}
+        guidance_prev: np.ndarray | None,
+    ) -> dict[str, Any]:
+        """``ChunkScheduler``'s predict_fn protocol: predict_fn(obs,
+        delay, prev_chunk) -> {"chunk": ndarray}.
+
+        ``guidance_prev`` is the exec engine's real unconsumed queue tail
+        (already delay-aligned by ``aligned_guidance_window``, length up to
+        ``delay + rtc_execution_horizon``). Its first ``delay`` rows are
+        already stale -- they will have been executed by the time this call
+        returns -- so only the remainder anchors the RTC prefix.
+        """
+        cfg = self.cfg
+        anchor = (
+            guidance_prev[delay:]
+            if guidance_prev is not None and len(guidance_prev) > delay
+            else None
+        )
+        rtc_kwargs = self._build_rtc_kwargs(anchor)
+
+        if not cfg.advantage_enabled:
+            result = self._predict_once(obs, **rtc_kwargs)
+        else:
+            cond_obs = dict(obs)
+            cond_obs['task_description'] = _with_advantage_tag(
+                obs['task_description'], cfg.cfg_cond_advantage_tag)
+            if not cfg.cfg_enabled:
+                result = self._predict_once(cond_obs, **rtc_kwargs)
+            else:
+                uncond_obs = dict(obs)
+                uncond_obs['task_description'] = _with_advantage_tag(
+                    obs['task_description'], cfg.cfg_uncond_advantage_tag)
+
+                cond = self._predict_once(cond_obs, **rtc_kwargs)
+                uncond = self._predict_once(uncond_obs, **rtc_kwargs)
+                result = apply_cfg_blend(
+                    cond,
+                    uncond,
+                    scale=cfg.cfg_scale,
+                    scale_joint=cfg.cfg_scale_joint,
+                    scale_gripper=cfg.cfg_scale_gripper,
+                    arm_dof=cfg.arm_dof,
+                )
+
+        return {"chunk": result}
 
 
 def build_predict_fn(
     worker_cfg: WorkerConfig,
     log_info: Callable[[str], None] | None = None,
 ) -> PredictBundle:
-    worker = FluxVLAPolicyWorker(worker_cfg, log_info=log_info)
-    return PredictBundle(fn=worker.predict, n_action_steps=worker.n_action_steps)
-
-
-def build_rtc_predict_fn(
-    worker_cfg: WorkerConfig,
-    rtc_cfg: Any,
-    log_info: Callable[[str], None] | None = None,
-) -> PredictBundle:
-    worker = FluxVLAPolicyWorker(worker_cfg, log_info=log_info)
-
-    def predict_fn(
-        obs: dict[str, Any],
-        delay: int,
-        prev_actions: np.ndarray | None,
-    ) -> dict[str, np.ndarray]:
-        return worker.predict_rtc(obs, delay, prev_actions, rtc_cfg)
-
-    return PredictBundle(fn=predict_fn, n_action_steps=worker.n_action_steps)
+    worker = FluxVLAPolicy(worker_cfg, log_info=log_info)
+    return PredictBundle(
+        fn=worker.predict_chunk, n_action_steps=worker.n_action_steps
+    )

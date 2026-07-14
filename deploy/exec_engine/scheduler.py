@@ -1,4 +1,4 @@
-"""RTCInferenceEngine — background thread that produces action chunks."""
+"""ChunkScheduler — background thread that produces action chunks."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ import math
 import time
 import traceback
 from threading import Event, Lock, Thread
-from typing import Any, Callable
+from typing import Callable
 
 import numpy as np
 
 from .action_queue import ActionQueue
-from .config import RTCConfig
+from .config import ChunkSchedulerConfig
 from .visualizer import RTCDebugVisualizer
 from .latency_tracker import LatencyTracker
 
@@ -42,8 +42,8 @@ def aligned_guidance_window(
     return previous_leftover[:end].copy()
 
 
-class RTCInferenceEngine:
-    """Async RTC inference engine.
+class ChunkScheduler:
+    """Async producer/consumer scheduler for action chunks.
 
     The background thread continuously calls ``predict_fn`` and merges results
     into the ActionQueue.  The main thread calls ``get_action()`` each tick.
@@ -56,32 +56,22 @@ class RTCInferenceEngine:
           ``"chunk"``: np.ndarray (T, A) — raw action array for RTC guidance
         Optional keys:
           ``"_step_info"``: list[tuple[float, float, float]] — (time, weight, err_norm) per denoising step
-        All keys are forwarded to ``to_items_fn`` for building queue items.
 
     Args:
         predict_fn: Callable following the protocol above.
-        cfg: RTCConfig.
-        fps: Control-loop frequency (Hz).
-        to_items_fn: ``(result_dict) -> list`` of length T. Defaults to ``list(chunk)``.
-        reset_fn: Called on ``reset()`` to clear model state.
-        shutdown_event: External Event; set to kill the engine from outside.
+        cfg: ChunkSchedulerConfig.
+        robot_exec_hz: Control-loop frequency (Hz).
     """
 
     def __init__(
         self,
         predict_fn: Callable,
-        cfg: RTCConfig,
+        cfg: ChunkSchedulerConfig,
         robot_exec_hz: float,
-        to_items_fn: Callable[[dict], list] | None = None,
-        reset_fn: Callable | None = None,
-        shutdown_event: Event | None = None,
     ) -> None:
         self._predict_fn = predict_fn
-        self._to_items_fn = to_items_fn
-        self._reset_fn = reset_fn
         self._cfg = cfg
         self._robot_exec_hz = robot_exec_hz
-        self._global_shutdown = shutdown_event
 
         self._action_queue: ActionQueue = ActionQueue()
         self._current_prev_chunk: np.ndarray | None = None
@@ -93,12 +83,12 @@ class RTCInferenceEngine:
         self._error_event = Event()
         self._generation = 0
         self._lifecycle_lock = Lock()
-        self._rtc_thread: Thread | None = None
+        self._scheduler_thread: Thread | None = None
         self.n_action_steps: int = int(getattr(predict_fn, "n_action_steps", 1) or 1)
 
         debug_dir = cfg.debug_dir
         self._chunk_debugger: RTCDebugVisualizer | None = (
-            RTCDebugVisualizer(debug_dir, cfg.execution_horizon, cfg=cfg)
+            RTCDebugVisualizer(debug_dir, cfg.execution_horizon)
             if cfg.debug else None
         )
 
@@ -114,8 +104,8 @@ class RTCInferenceEngine:
     @property
     def ready(self) -> bool:
         return (
-            self._rtc_thread is not None
-            and self._rtc_thread.is_alive()
+            self._scheduler_thread is not None
+            and self._scheduler_thread.is_alive()
             and not self._error_event.is_set()
         )
 
@@ -136,37 +126,35 @@ class RTCInferenceEngine:
         self._shutdown_event.clear()
         self._error_event.clear()
         self._policy_active.set()
-        self._rtc_thread = Thread(
-            target=self._rtc_loop, daemon=True, name="RTCInference"
+        self._scheduler_thread = Thread(
+            target=self._scheduler_loop, daemon=True, name="ChunkScheduler"
         )
-        self._rtc_thread.start()
-        logger.info("RTC inference thread started")
+        self._scheduler_thread.start()
+        logger.info("Chunk scheduler thread started")
 
     def stop(self) -> None:
-        logger.info("Stopping RTC inference thread")
+        logger.info("Stopping chunk scheduler thread")
         self._shutdown_event.set()
         self._policy_active.clear()
-        if self._rtc_thread is not None and self._rtc_thread.is_alive():
-            self._rtc_thread.join(timeout=_JOIN_TIMEOUT_S)
-            if self._rtc_thread.is_alive():
-                logger.warning("RTC thread did not join within %.1f s — it may still be finishing", _JOIN_TIMEOUT_S)
+        if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
+            self._scheduler_thread.join(timeout=_JOIN_TIMEOUT_S)
+            if self._scheduler_thread.is_alive():
+                logger.warning("Scheduler thread did not join within %.1f s — it may still be finishing", _JOIN_TIMEOUT_S)
             else:
-                logger.info("RTC inference thread stopped")
-        self._rtc_thread = None
+                logger.info("Chunk scheduler thread stopped")
+        self._scheduler_thread = None
         if self._chunk_debugger is not None:
             self._chunk_debugger.close()
 
     def pause(self) -> None:
-        logger.info("RTC inference paused")
+        logger.info("Chunk scheduler paused")
         self._policy_active.clear()
 
     def resume(self) -> None:
-        logger.info("RTC inference resumed")
+        logger.info("Chunk scheduler resumed")
         self._policy_active.set()
 
     def reset(self) -> None:
-        if self._reset_fn is not None:
-            self._reset_fn()
         with self._lifecycle_lock:
             self._action_queue.clear()
             with self._obs_lock:
@@ -203,7 +191,7 @@ class RTCInferenceEngine:
     # Background loop
     # ------------------------------------------------------------------
 
-    def _rtc_loop(self) -> None:
+    def _scheduler_loop(self) -> None:
         latency_tracker = LatencyTracker()
         time_per_step = 1.0 / max(self._robot_exec_hz, 1e-6)
         consecutive_errors = 0
@@ -253,8 +241,7 @@ class RTCInferenceEngine:
                         np.asarray(result["_chunk_nortc"], dtype=np.float32)
                         if "_chunk_nortc" in result else None
                     )
-                    items = (self._to_items_fn(result)
-                             if self._to_items_fn is not None else list(chunk_np))
+                    items = list(chunk_np)
 
                     with self._lifecycle_lock:
                         result_is_current = (
@@ -280,14 +267,14 @@ class RTCInferenceEngine:
 
                     consecutive_errors = 0
                     logger.debug(
-                        "RTC chunk: latency=%.3fs delay=%d qsize=%d",
+                        "Chunk scheduled: latency=%.3fs delay=%d qsize=%d",
                         elapsed, new_delay, queue.qsize(),
                     )
 
                 except Exception as exc:
                     consecutive_errors += 1
                     logger.error(
-                        "RTC inference error (%d/%d): %s",
+                        "Chunk scheduler inference error (%d/%d): %s",
                         consecutive_errors, _MAX_CONSECUTIVE_ERRORS, exc,
                     )
                     logger.debug(traceback.format_exc())
@@ -296,8 +283,6 @@ class RTCInferenceEngine:
                     time.sleep(_ERROR_RETRY_DELAY_S)
 
         except Exception as exc:
-            logger.error("Fatal RTC thread error: %s", exc)
+            logger.error("Fatal chunk scheduler thread error: %s", exc)
             logger.error(traceback.format_exc())
             self._error_event.set()
-            if self._global_shutdown is not None:
-                self._global_shutdown.set()

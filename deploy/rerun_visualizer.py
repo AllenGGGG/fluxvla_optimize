@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-import math
 from pathlib import Path
 import sys
 from typing import Any
@@ -15,7 +14,7 @@ except ImportError:  # Keep the control node importable when visualization is di
     rr = None
     rrb = None
 
-from .pistar06_inference_runner import (
+from .utils import (
     ALL_JOINT_NAMES,
     BODY_JOINT_NAMES,
     HEAD_JOINT_NAMES,
@@ -128,7 +127,6 @@ class RerunVisualizer:
                 pass
 
     def _log_series_styles(self) -> None:
-        assert self._recording is not None
         for joint_name in ALL_JOINT_NAMES:
             base = self._joint_path(joint_name)
             self._recording.log(
@@ -164,8 +162,6 @@ class RerunVisualizer:
 
     @staticmethod
     def _set_time(recording: Any, timestamp_s: float) -> None:
-        if not math.isfinite(timestamp_s):
-            raise ValueError(f"invalid ROS timestamp: {timestamp_s}")
         recording.set_time("ros_time", timestamp=timestamp_s)
 
     def log_image(
@@ -212,8 +208,6 @@ class RerunVisualizer:
             for joint_name, value in values.items():
                 if joint_name not in JOINT_GROUP_BY_NAME:
                     continue
-                if not math.isfinite(float(value)):
-                    raise ValueError(f"{joint_name} has non-finite {kind} value")
                 recording.log(
                     f"{self._joint_path(joint_name)}/{kind}",
                     rr.Scalars(float(value)),

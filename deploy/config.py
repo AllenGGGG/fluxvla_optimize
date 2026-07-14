@@ -21,7 +21,17 @@ DEFAULT_TASK = (
     "Pick up the parcel with the left hand, then move it onto the conveyor "
     "belt with the right hand."
 )
-VALID_RTC_MODES = {"plain", "overlap", "rtc_infer"}
+VALID_NORM_TYPES = {"quantile", "min_max"}
+# fluxvla's own RTC (PI0FlowMatching.predict_action's rtc_config['method']):
+# 'none' skips it, 'prefix' hard-pins the shared prefix, 'guidance' soft-
+# blends it (fluxvla/engines/utils/rtc_guidance.py). FluxVLAPolicy
+# (model.py)'s predict_chunk feeds it the exec engine's real
+# unconsumed queue tail as prev_actions (see deploy/exec_engine). Only
+# takes effect when the loaded inference_model's predict_action actually
+# implements RTC: the eager PI0/PI05FlowMatching classes and the Triton
+# PI05FlowMatchingRTCInference (prefix only) do; plain
+# PI05FlowMatchingInference does not.
+VALID_RTC_METHODS = {"none", "prefix", "guidance"}
 
 
 def default_device() -> str:
@@ -41,7 +51,17 @@ class WorkerConfig:
     device: str
     dtype: str
     num_inference_steps_override: int
-    max_normalized_action_abs: float = 1.25
+    # Explicit dataset_statistics.json path. If unset, BaseInferenceRunner's
+    # default (ckpt_path's grandparent directory) is used instead.
+    norm_stats_path: str | None = None
+    # 'quantile' (q01/q99-based) or 'min_max'; must match dataset_statistics.json.
+    norm_type: str = "quantile"
+
+    # fluxvla RTC guidance; see VALID_RTC_METHODS above. Default 'none'.
+    rtc_method: str = "none"
+    rtc_execution_horizon: int = 10
+    rtc_max_guidance_weight: float = 10.0
+    rtc_schedule: str = "linear"  # 'linear', 'exp', 'ones', or 'zeros'
 
     # CFG / advantage-conditioning (see model.py's apply_cfg_blend docstring).
     # Inert against the currently deployed checkpoint (no advantage
