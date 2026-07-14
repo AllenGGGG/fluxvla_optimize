@@ -23,12 +23,15 @@
 # supports rtc_config['method']='prefix' (raises NotImplementedError for
 # 'guidance') -- see pi05_parcel_sort_inference_guidance_rtc.py for that case.
 
+_base_ = ['./pi05_parcel_sort_inference.py']
+
 _JOINT_DIM = 28
 _MODEL_ACTION_DIM = 32
 _ACTION_HORIZON = 50
 _NUM_VIEWS = 3
 
 inference_model = dict(
+    _delete_=True,
     type='PI05FlowMatchingRTCInference',
     num_views=_NUM_VIEWS,
     # Must be >= dataset.transforms' ProcessPrompts.max_len (200 below):
@@ -145,50 +148,4 @@ inference_model = dict(
     ori_action_dim=_JOINT_DIM,
 )
 
-# Same 5-transform pipeline as pi05_parcel_sort.py's training dataset,
-# reused verbatim via PrivateInferenceDataset (fluxvla/datasets/
-# parquet_dataset.py:531) so a training-side transform change (e.g.
-# norm_type) propagates automatically instead of drifting.
-dataset = dict(
-    type='PrivateInferenceDataset',
-    img_keys=[
-        'observation.images.base_0_rgb',
-        'observation.images.left_wrist_0_rgb',
-        'observation.images.right_wrist_0_rgb',
-    ],
-    transforms=[
-        dict(
-            type='NormalizeStatesAndActions',
-            action_dim=_MODEL_ACTION_DIM,
-            state_dim=_MODEL_ACTION_DIM,
-            state_key='proprio',
-            action_key='action',
-            norm_type='quantile',
-            state_norm_mask=[True] * _JOINT_DIM + [False] *
-            (_MODEL_ACTION_DIM - _JOINT_DIM),
-            action_norm_mask=[True] * _JOINT_DIM + [False] *
-            (_MODEL_ACTION_DIM - _JOINT_DIM)),
-        dict(type='PreparePromptWithState'),
-        dict(
-            type='ProcessPrompts',
-            max_len=200,
-            tokenizer=dict(
-                type='PretrainedTokenizer',
-                model_path=  # noqa: E251
-                'checkpoints/pi05_base',  # noqa: E501
-            )),
-        dict(type='ResizeImages', height=224, width=224),
-        dict(type='SimpleNormalizeImages'),
-    ],
-)
-
-# norm_type must match whatever the deployed checkpoint was actually
-# trained with (currently 'quantile', see train_dataloader.dataset.datasets
-# in pi05_parcel_sort.py). Keep in sync by hand if that ever changes.
-denormalize_action = dict(
-    type='DenormalizePrivateAction',
-    norm_type='quantile',
-    action_dim=_MODEL_ACTION_DIM,
-    action_norm_mask=[True] * _JOINT_DIM + [False] *
-    (_MODEL_ACTION_DIM - _JOINT_DIM),
-)
+inference_options = dict(rtc_method='prefix')

@@ -8,6 +8,7 @@ import traceback
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import rclpy
 from PIL import Image
 
 from rclpy.node import Node
@@ -21,8 +22,6 @@ from .config import (
     DEFAULT_INFERENCE_CONFIG,
     DEFAULT_MODEL_ID,
     DEFAULT_TASK,
-    VALID_NORM_TYPES,
-    VALID_RTC_METHODS,
     WorkerConfig,
     default_device,
 )
@@ -44,7 +43,7 @@ WBC_FSM_MOVEJ = 4
 
 
 class JointInferenceNode(Node):
-    """PI0.5 inference node with fail-closed command publication."""
+    """Joint inference node with fail-closed command publication."""
 
     @staticmethod
     def build_joint_commands(
@@ -75,7 +74,7 @@ class JointInferenceNode(Node):
         return JointCommands(wbc=wbc, left_hand=action[16:22], right_hand=action[22:28])
 
     def __init__(self) -> None:
-        super().__init__("pistar06_inference_node")
+        super().__init__("joint_inference_node")
         startup_started = time.perf_counter()
 
         self._declare_parameters()
@@ -93,9 +92,14 @@ class JointInferenceNode(Node):
         self._last_skip_log_time = 0.0
         self._shutdown_started = False
         self._inference_enabled = False
+        self._auto_start_pending = self.auto_start
         self._action_step_count = 0
+        self._last_rerun_chunk_id: int | None = None
         self._wbc_fsm_state: int | None = None
         self._held_joint_positions: dict[str, float] | None = None
+        self._wbc_original_interpolation_type: str | None = None
+        self._wbc_override_applied = False
+        self._wbc_interpolation_ready = self._configure_wbc_interpolation()
         self._backend: InferBackend = self._create_backend()
         self.get_logger().info(
             f"[startup] inference backend created: "
@@ -138,32 +142,22 @@ class JointInferenceNode(Node):
             Int32, self.fsm_state_topic, self._on_wbc_fsm_state, fsm_qos
         )
 
-        self._wbc_override_timer = (
-            self.create_timer(1.0, self._request_wbc_interpolation_override)
-            if self.manage_wbc_interpolation and self.require_direct_movej
-            else None
-        )
         self._backend.start()
-        if hasattr(self._backend, "pause"):
-            self._backend.pause()
         self.get_logger().info(
             f"[startup] inference backend thread started: "
-            f"type={type(self._backend).__name__} paused=true"
+            f"type={type(self._backend).__name__}"
         )
         self.timer = self.create_timer(self.step_interval_s, self._control_step)
-        self._auto_start_timer = (
-            self.create_timer(1.0, self._try_auto_start) if self.auto_start else None
-        )
-
         start_mode = (
-            "waiting for safety gates, then control_loop starts automatically"
+            "auto-start when camera and joint inputs are ready"
             if self.auto_start
             else f"send {self.control_topic}={CTRL_START} to start control_loop"
         )
         self.get_logger().info(
             f"[startup] Inference node ready: "
             f"model_dim={MODEL_JOINT_DIM} wbc_dim={len(WBC_JOINT_NAMES)}; "
-            f"{start_mode}; total={time.perf_counter() - startup_started:.2f}s"
+            f"{start_mode}; "
+            f"total={time.perf_counter() - startup_started:.2f}s"
         )
 
     def _declare_parameters(self) -> None:
@@ -172,35 +166,10 @@ class JointInferenceNode(Node):
         self.declare_parameter("device", default_device())
         self.declare_parameter("dtype", "bf16")
         self.declare_parameter("task", DEFAULT_TASK)
-        self.declare_parameter("num_inference_steps_override", 0)
         self.declare_parameter("norm_stats_path", "")
-        self.declare_parameter("norm_type", "quantile")
-
-        # fluxvla RTC guidance (see model.py's FluxVLAPolicy._build_rtc_kwargs
-        # docstring; default 'none'). Fed by deploy/exec_engine's
-        # ChunkScheduler, which supplies the real unconsumed queue tail
-        # as prefix context on every call.
-        self.declare_parameter("rtc_method", "none")
-        self.declare_parameter("rtc_execution_horizon", 10)
-        self.declare_parameter("rtc_max_guidance_weight", 10.0)
-        self.declare_parameter("rtc_schedule", "linear")
-
-        # CFG / advantage-conditioning (see model.py's apply_cfg_blend
-        # docstring; inert until a checkpoint is trained on advantage-tagged
-        # data - this is infrastructure for collecting that signal now).
-        self.declare_parameter("advantage_enabled", False)
-        self.declare_parameter("cfg_enabled", False)
-        self.declare_parameter("cfg_scale", 2.0)
-        self.declare_parameter("cfg_scale_joint", -1.0)
-        self.declare_parameter("cfg_scale_gripper", -1.0)
-        self.declare_parameter("cfg_cond_advantage_tag", "positive")
-        self.declare_parameter("cfg_uncond_advantage_tag", "")
-        self.declare_parameter("arm_dof", 7)
 
         self.declare_parameter("robot_exec_hz", 30.0)
-        self.declare_parameter("auto_start", True)
-        self.declare_parameter("require_direct_movej", True)
-        self.declare_parameter("manage_wbc_interpolation", True)
+        self.declare_parameter("auto_start", False)
         self.declare_parameter("wbc_controller_node", "/ocs2_wbc_controller")
 
         self.declare_parameter("debug", False)
@@ -238,8 +207,6 @@ class JointInferenceNode(Node):
         self.robot_exec_hz = float(value("robot_exec_hz"))
         self.step_interval_s = 1.0 / max(self.robot_exec_hz, 1e-6)
         self.auto_start = bool(value("auto_start"))
-        self.require_direct_movej = bool(value("require_direct_movej"))
-        self.manage_wbc_interpolation = bool(value("manage_wbc_interpolation"))
         self.wbc_controller_node = str(value("wbc_controller_node"))
 
         self.rerun_enabled = bool(value("rerun_enabled"))
@@ -254,39 +221,12 @@ class JointInferenceNode(Node):
         self.left_hand_topic = str(value("left_hand_topic"))
         self.right_hand_topic = str(value("right_hand_topic"))
 
-        cfg_uncond_advantage_tag = str(value("cfg_uncond_advantage_tag")).strip()
-        norm_type = str(value("norm_type")).strip().lower()
-        if norm_type not in VALID_NORM_TYPES:
-            self.get_logger().warn(
-                f"Unknown norm_type={norm_type!r}; using 'quantile'"
-            )
-            norm_type = "quantile"
-        rtc_method = str(value("rtc_method")).strip().lower()
-        if rtc_method not in VALID_RTC_METHODS:
-            self.get_logger().warn(
-                f"Unknown rtc_method={rtc_method!r}; using 'none'"
-            )
-            rtc_method = "none"
         self.worker_cfg = WorkerConfig(
             model_id=self.model_id,
             inference_config=str(value("inference_config")),
             device=str(value("device")),
             dtype=str(value("dtype")),
-            num_inference_steps_override=int(value("num_inference_steps_override")),
             norm_stats_path=str(value("norm_stats_path")).strip() or None,
-            norm_type=norm_type,
-            rtc_method=rtc_method,
-            rtc_execution_horizon=int(value("rtc_execution_horizon")),
-            rtc_max_guidance_weight=float(value("rtc_max_guidance_weight")),
-            rtc_schedule=str(value("rtc_schedule")).strip().lower(),
-            advantage_enabled=bool(value("advantage_enabled")),
-            cfg_enabled=bool(value("cfg_enabled")),
-            cfg_scale=float(value("cfg_scale")),
-            cfg_scale_joint=float(value("cfg_scale_joint")),
-            cfg_scale_gripper=float(value("cfg_scale_gripper")),
-            cfg_cond_advantage_tag=str(value("cfg_cond_advantage_tag")).strip() or None,
-            cfg_uncond_advantage_tag=cfg_uncond_advantage_tag or None,
-            arm_dof=int(value("arm_dof")),
         )
 
     def _create_backend(self) -> InferBackend:
@@ -299,9 +239,23 @@ class JointInferenceNode(Node):
             self.worker_cfg,
             log_info=self.get_logger().info,
         )
+        predict_fn = bundle.fn
+
+        def logged_predict(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return predict_fn(*args, **kwargs)
+            except Exception:
+                self.get_logger().error(
+                    "Inference predict_chunk failed:\n"
+                    f"{traceback.format_exc()}"
+                )
+                raise
+
+        bundle.fn = logged_predict
         return ChunkScheduler(
             bundle,
             ChunkSchedulerConfig(
+                rtc_enabled=self.worker_cfg.rtc_method != "none",
                 execution_horizon=self.worker_cfg.rtc_execution_horizon,
                 debug=debug,
                 debug_dir=debug_dir or "/tmp/rtc_debug",
@@ -309,55 +263,16 @@ class JointInferenceNode(Node):
             robot_exec_hz=self.robot_exec_hz,
         )
 
-    def _request_wbc_interpolation_override(self) -> None:
-        """Set WBC movej_interpolation_type='none' (required for a raw 30Hz
-        joint-command stream); retries every second (see the timer in
-        __init__) until it succeeds once, then self-cancels."""
-        if not hasattr(self, "_wbc_param_client"):
-            self._wbc_param_client = AsyncParameterClient(
-                self, self.wbc_controller_node
-            )
-        if not self._wbc_param_client.wait_for_services(timeout_sec=0.0):
-            return
-        future = self._wbc_param_client.set_parameters_atomically(
-            [Parameter("movej_interpolation_type", value="none")]
-        )
-
-        def done(result_future: Any) -> None:
-            try:
-                response = result_future.result()
-                if not response.result.successful:
-                    reason = response.result.reason or "controller rejected parameter"
-                    self.get_logger().error(
-                        f"Failed to set WBC interpolation to 'none': {reason}"
-                    )
-                    return
-                self.get_logger().info("[startup] WBC interpolation set to 'none'")
-                if self._wbc_override_timer is not None:
-                    self._wbc_override_timer.cancel()
-            except Exception as exc:
-                self.get_logger().error(
-                    f"Failed to set WBC interpolation to 'none': {exc}"
-                )
-
-        future.add_done_callback(done)
-
-    def _try_auto_start(self) -> None:
-        if self._shutdown_started:
-            if self._auto_start_timer is not None:
-                self._auto_start_timer.cancel()
-            return
-        if self._inference_enabled:
-            if self._auto_start_timer is not None:
-                self._auto_start_timer.cancel()
-            return
-        self._set_inference_enabled(True)
-
     def _on_controller_state(self, msg: Int32) -> None:
         if msg.data == CTRL_START:
             self._set_inference_enabled(True)
         elif msg.data == CTRL_STOP:
+            self._auto_start_pending = False
             self._set_inference_enabled(False)
+
+    def _maybe_auto_start(self) -> None:
+        if self._auto_start_pending and self._wbc_fsm_state == WBC_FSM_MOVEJ:
+            self._set_inference_enabled(True)
 
     def _on_wbc_fsm_state(self, msg: Int32) -> None:
         self._wbc_fsm_state = int(msg.data)
@@ -366,16 +281,26 @@ class JointInferenceNode(Node):
                 f"WBC left MOVEJ (fsm_state={self._wbc_fsm_state}); pausing publication"
             )
             self._set_inference_enabled(False)
+        elif self._wbc_fsm_state == WBC_FSM_MOVEJ:
+            self._maybe_auto_start()
 
     def _set_inference_enabled(self, enabled: bool) -> None:
         if enabled:
             if self._inference_enabled:
                 return
             error = None
-            try:
-                self._build_sample()
-            except Exception as exc:
-                error = f"inputs are not ready: {exc}"
+            if not self._wbc_interpolation_ready:
+                error = "WBC interpolation setup failed"
+            elif self._wbc_fsm_state != WBC_FSM_MOVEJ:
+                error = (
+                    "WBC is not in MOVEJ: "
+                    f"fsm_state={self._wbc_fsm_state}, expected={WBC_FSM_MOVEJ}"
+                )
+            else:
+                try:
+                    self._build_sample()
+                except Exception as exc:
+                    error = f"inputs are not ready: {exc}"
             if error is not None:
                 now = time.monotonic()
                 if now - self._last_skip_log_time > 1.0:
@@ -388,6 +313,7 @@ class JointInferenceNode(Node):
                 self._backend.resume()
             self._action_step_count = 0
             self._inference_enabled = True
+            self._auto_start_pending = False
             self.get_logger().warn("Inference command publication ENABLED")
             return
 
@@ -434,6 +360,7 @@ class JointInferenceNode(Node):
             self.head_image, self._last_head_rgb_time = self._store_image(
                 self.head_camera_topic, "head", msg
             )
+            self._maybe_auto_start()
         except Exception as exc:
             self.get_logger().error(f"Failed to decode head image: {exc}")
 
@@ -442,6 +369,7 @@ class JointInferenceNode(Node):
             self.left_wrist_image, self._last_left_wrist_rgb_time = self._store_image(
                 self.left_camera_topic, "left_wrist", msg
             )
+            self._maybe_auto_start()
         except Exception as exc:
             self.get_logger().error(f"Failed to decode left wrist image: {exc}")
 
@@ -450,6 +378,7 @@ class JointInferenceNode(Node):
             self.right_wrist_image, self._last_right_wrist_rgb_time = self._store_image(
                 self.right_camera_topic, "right_wrist", msg
             )
+            self._maybe_auto_start()
         except Exception as exc:
             self.get_logger().error(f"Failed to decode right wrist image: {exc}")
 
@@ -468,6 +397,7 @@ class JointInferenceNode(Node):
         self._rerun.log_measured_joints(
             updates, timestamp_s=self._message_timestamp_s(msg)
         )
+        self._maybe_auto_start()
 
     def _build_sample(self) -> dict[str, Any]:
         state = np.zeros(MODEL_TENSOR_DIM, dtype=np.float32)
@@ -489,7 +419,10 @@ class JointInferenceNode(Node):
         if not self._inference_enabled:
             return
         if self._backend.failed:
-            self.get_logger().error("Inference backend failed; pausing publication")
+            self.get_logger().error(
+                "Inference backend thread exited; pausing publication. "
+                "See the preceding predict_chunk traceback."
+            )
             self._set_inference_enabled(False)
             return
 
@@ -508,7 +441,12 @@ class JointInferenceNode(Node):
         action = self._backend.get_action()
         if action is not None:
             try:
-                self._publish_joint_action(action)
+                timestamp_s = self.get_clock().now().nanoseconds * 1e-9
+                chunk_id = self._backend.action_chunk_id
+                if chunk_id is not None and chunk_id != self._last_rerun_chunk_id:
+                    self._rerun.log_inference_boundary(timestamp_s=timestamp_s)
+                    self._last_rerun_chunk_id = chunk_id
+                self._publish_joint_action(action, timestamp_s=timestamp_s)
             except Exception as exc:
                 self.get_logger().error(
                     f"Command validation/publication failed; pausing: {exc}\n"
@@ -516,7 +454,9 @@ class JointInferenceNode(Node):
                 )
                 self._set_inference_enabled(False)
 
-    def _publish_joint_action(self, action: np.ndarray) -> None:
+    def _publish_joint_action(
+        self, action: np.ndarray, *, timestamp_s: float
+    ) -> None:
         command_positions = dict(self.joint_positions)
         command_positions.update(self._held_joint_positions)
         commands = self.build_joint_commands(action, command_positions)
@@ -533,7 +473,7 @@ class JointInferenceNode(Node):
         self.right_hand_pub.publish(right_hand_msg)
         self._rerun.log_command(
             commands,
-            timestamp_s=self.get_clock().now().nanoseconds * 1e-9,
+            timestamp_s=timestamp_s,
         )
 
     def destroy_node(self) -> bool:
@@ -541,13 +481,81 @@ class JointInferenceNode(Node):
             self._shutdown_started = True
             self._inference_enabled = False
             self.timer.cancel()
-            if self._wbc_override_timer is not None:
-                self._wbc_override_timer.cancel()
-            if self._auto_start_timer is not None:
-                self._auto_start_timer.cancel()
             try:
                 self._backend.stop()
             except Exception as exc:
                 self.get_logger().warn(f"Failed to stop inference backend: {exc}")
             self._rerun.close()
+            self._restore_wbc_interpolation()
         return super().destroy_node()
+
+    def _configure_wbc_interpolation(self) -> bool:
+        """Set WBC interpolation to none for this process and remember its value."""
+        self._wbc_param_client = AsyncParameterClient(self, self.wbc_controller_node)
+        try:
+            if not self._wbc_param_client.wait_for_services(timeout_sec=2.0):
+                raise TimeoutError("WBC parameter service is unavailable")
+            get_future = self._wbc_param_client.get_parameters(
+                ["movej_interpolation_type"]
+            )
+            rclpy.spin_until_future_complete(self, get_future, timeout_sec=2.0)
+            if not get_future.done():
+                raise TimeoutError("timed out reading WBC interpolation")
+            original = get_future.result().values[0].string_value.strip()
+            if not original:
+                raise RuntimeError("WBC returned an empty interpolation value")
+            self._wbc_original_interpolation_type = original
+            self.get_logger().info(
+                f"[startup] WBC interpolation original value={original!r}"
+            )
+            if original.lower() == "none":
+                return True
+
+            set_future = self._wbc_param_client.set_parameters_atomically(
+                [Parameter("movej_interpolation_type", value="none")]
+            )
+            rclpy.spin_until_future_complete(self, set_future, timeout_sec=2.0)
+            if not set_future.done():
+                raise TimeoutError("timed out setting WBC interpolation to 'none'")
+            result = set_future.result().result
+            if not result.successful:
+                raise RuntimeError(result.reason or "controller rejected parameter")
+            self._wbc_override_applied = True
+            self.get_logger().info(
+                "[startup] WBC interpolation temporarily set to 'none'"
+            )
+            return True
+        except Exception as exc:
+            self.get_logger().error(
+                "WBC interpolation setup failed: "
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            )
+            return False
+
+    def _restore_wbc_interpolation(self) -> None:
+        if not self._wbc_override_applied:
+            return
+        original = self._wbc_original_interpolation_type
+        try:
+            if original is None or not rclpy.ok():
+                raise RuntimeError("ROS shutdown started before restore")
+            if not self._wbc_param_client.wait_for_services(timeout_sec=2.0):
+                raise TimeoutError("WBC parameter service is unavailable")
+            future = self._wbc_param_client.set_parameters_atomically(
+                [Parameter("movej_interpolation_type", value=original)]
+            )
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+            if not future.done():
+                raise TimeoutError("timed out restoring original value")
+            result = future.result().result
+            if not result.successful:
+                raise RuntimeError(result.reason or "controller rejected restore")
+            self._wbc_override_applied = False
+            self.get_logger().info(
+                f"WBC interpolation restored to original value {original!r}"
+            )
+        except Exception as exc:
+            self.get_logger().warn(
+                "Could not restore WBC interpolation: "
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            )

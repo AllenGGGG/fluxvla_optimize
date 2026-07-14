@@ -50,12 +50,10 @@ class WorkerConfig:
     inference_config: str
     device: str
     dtype: str
-    num_inference_steps_override: int
+    num_inference_steps_override: int = 0
     # Explicit dataset_statistics.json path. If unset, BaseInferenceRunner's
     # default (ckpt_path's grandparent directory) is used instead.
     norm_stats_path: str | None = None
-    # 'quantile' (q01/q99-based) or 'min_max'; must match dataset_statistics.json.
-    norm_type: str = "quantile"
 
     # fluxvla RTC guidance; see VALID_RTC_METHODS above. Default 'none'.
     rtc_method: str = "none"

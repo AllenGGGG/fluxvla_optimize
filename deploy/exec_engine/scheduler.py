@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import math
 import time
-import traceback
 from threading import Event, Lock, Thread
 from typing import Callable
 
@@ -20,8 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 _IDLE_SLEEP_S: float = 0.01
-_ERROR_RETRY_DELAY_S: float = 0.5
-_MAX_CONSECUTIVE_ERRORS: int = 10
 _JOIN_TIMEOUT_S: float = 3.0
 
 
@@ -80,10 +77,11 @@ class ChunkScheduler:
         self._obs_lock = Lock()
         self._policy_active = Event()
         self._shutdown_event = Event()
-        self._error_event = Event()
         self._generation = 0
         self._lifecycle_lock = Lock()
         self._scheduler_thread: Thread | None = None
+        self._next_chunk_id = 0
+        self._action_chunk_id: int | None = None
         self.n_action_steps: int = int(getattr(predict_fn, "n_action_steps", 1) or 1)
 
         debug_dir = cfg.debug_dir
@@ -106,16 +104,25 @@ class ChunkScheduler:
         return (
             self._scheduler_thread is not None
             and self._scheduler_thread.is_alive()
-            and not self._error_event.is_set()
+            and not self._shutdown_event.is_set()
         )
 
     @property
     def failed(self) -> bool:
-        return self._error_event.is_set()
+        return (
+            self._scheduler_thread is not None
+            and not self._scheduler_thread.is_alive()
+            and not self._shutdown_event.is_set()
+        )
 
     @property
     def action_queue(self) -> ActionQueue:
         return self._action_queue
+
+    @property
+    def action_chunk_id(self) -> int | None:
+        """ID of the chunk that produced the most recently popped action."""
+        return self._action_chunk_id
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -124,7 +131,6 @@ class ChunkScheduler:
     def start(self) -> None:
         self._action_queue.clear()
         self._shutdown_event.clear()
-        self._error_event.clear()
         self._policy_active.set()
         self._scheduler_thread = Thread(
             target=self._scheduler_loop, daemon=True, name="ChunkScheduler"
@@ -172,7 +178,9 @@ class ChunkScheduler:
         item = self._action_queue.get()
         if item is None:
             return None
-        return np.asarray(item, dtype=np.float32)
+        chunk_id, action = item
+        self._action_chunk_id = int(chunk_id)
+        return np.asarray(action, dtype=np.float32)
 
     def qsize(self) -> int:
         return self._action_queue.qsize()
@@ -194,95 +202,74 @@ class ChunkScheduler:
     def _scheduler_loop(self) -> None:
         latency_tracker = LatencyTracker()
         time_per_step = 1.0 / max(self._robot_exec_hz, 1e-6)
-        consecutive_errors = 0
+        while not self._shutdown_event.is_set():
+            if not self._policy_active.is_set():
+                time.sleep(_IDLE_SLEEP_S)
+                continue
 
-        try:
-            while not self._shutdown_event.is_set():
-                if not self._policy_active.is_set():
-                    time.sleep(_IDLE_SLEEP_S)
+            queue = self._action_queue
+            if not self._cfg.rtc_enabled and queue.qsize() > 0:
+                time.sleep(_IDLE_SLEEP_S)
+                continue
+
+            with self._lifecycle_lock:
+                with self._obs_lock:
+                    obs = self._obs
+                    generation = self._generation
+
+            if obs is None:
+                time.sleep(_IDLE_SLEEP_S)
+                continue
+
+            t0 = time.perf_counter()
+            chunk2_start, prev_full, prev_left_over = queue.snapshot()
+
+            latency = latency_tracker.p95() if self._cfg.rtc_enabled else 0.0
+            delay = math.ceil(latency / time_per_step) if latency else 0
+            guidance_prev = (
+                aligned_guidance_window(
+                    prev_left_over, delay, self._cfg.execution_horizon
+                )
+                if self._cfg.rtc_enabled else None
+            )
+            with self._prev_chunk_lock:
+                self._current_prev_chunk = guidance_prev
+
+            result = self._predict_fn(obs, delay, guidance_prev)
+            chunk_np = np.asarray(result["chunk"], dtype=np.float32)
+            if not np.isfinite(chunk_np).all():
+                raise ValueError("predict_fn returned NaN/Inf in chunk")
+            step_info = result.get("_step_info")
+            chunk_nortc = (
+                np.asarray(result["_chunk_nortc"], dtype=np.float32)
+                if "_chunk_nortc" in result else None
+            )
+            with self._lifecycle_lock:
+                result_is_current = (
+                    generation == self._generation
+                    and self._policy_active.is_set()
+                    and not self._shutdown_event.is_set()
+                )
+                if not result_is_current:
                     continue
 
-                with self._lifecycle_lock:
-                    with self._obs_lock:
-                        obs = self._obs
-                        generation = self._generation
+                elapsed = time.perf_counter() - t0
+                new_delay = math.ceil(elapsed / time_per_step)
+                latency_tracker.add(elapsed)
+                self._next_chunk_id += 1
+                chunk_id = self._next_chunk_id
+                items = [(chunk_id, action) for action in chunk_np]
+                queue.merge(chunk_np, items, delay if self._cfg.rtc_enabled else 0)
 
-                if obs is None:
-                    time.sleep(_IDLE_SLEEP_S)
-                    continue
+            if self._chunk_debugger is not None and prev_full is not None:
+                self._chunk_debugger.record(
+                    prev_full, chunk_np, chunk_nortc, delay,
+                    chunk2_start=chunk2_start,
+                    step_info=step_info,
+                )
 
-                queue = self._action_queue
-
-                try:
-                    t0 = time.perf_counter()
-                    # Atomically capture consumption index, full prev chunk (for
-                    # visualisation) and the unconsumed leftover (for guidance).
-                    chunk2_start, prev_full, prev_left_over = queue.snapshot()
-
-                    latency = latency_tracker.p95()
-                    delay = math.ceil(latency / time_per_step) if latency else 0
-
-                    # Preserve time alignment between old and new chunks. The
-                    # first `delay` rows correspond to actions executed while
-                    # inference is running; the following H rows form the handoff
-                    # window. merge() later discards the new chunk's first delay
-                    # rows, so old[i] must guide new[i], not new[i - delay].
-                    H = self._cfg.execution_horizon
-                    guidance_prev = aligned_guidance_window(prev_left_over, delay, H)
-                    with self._prev_chunk_lock:
-                        self._current_prev_chunk = guidance_prev
-
-                    result = self._predict_fn(obs, delay, guidance_prev)
-                    chunk_np = np.asarray(result["chunk"], dtype=np.float32)
-                    if not np.isfinite(chunk_np).all():
-                        raise ValueError("predict_fn returned NaN/Inf in chunk")
-                    step_info = result.get("_step_info")
-                    chunk_nortc = (
-                        np.asarray(result["_chunk_nortc"], dtype=np.float32)
-                        if "_chunk_nortc" in result else None
-                    )
-                    items = list(chunk_np)
-
-                    with self._lifecycle_lock:
-                        result_is_current = (
-                            generation == self._generation
-                            and self._policy_active.is_set()
-                            and not self._shutdown_event.is_set()
-                        )
-                        if not result_is_current:
-                            continue
-
-                        elapsed = time.perf_counter() - t0
-                        new_delay = math.ceil(elapsed / time_per_step)
-                        latency_tracker.add(elapsed)
-                        # Use the guidance delay for the queue splice as well.
-                        queue.merge(chunk_np, items, delay)
-
-                    if self._chunk_debugger is not None and prev_full is not None:
-                        self._chunk_debugger.record(
-                            prev_full, chunk_np, chunk_nortc, delay,
-                            chunk2_start=chunk2_start,
-                            step_info=step_info,
-                        )
-
-                    consecutive_errors = 0
-                    logger.debug(
-                        "Chunk scheduled: latency=%.3fs delay=%d qsize=%d",
-                        elapsed, new_delay, queue.qsize(),
-                    )
-
-                except Exception as exc:
-                    consecutive_errors += 1
-                    logger.error(
-                        "Chunk scheduler inference error (%d/%d): %s",
-                        consecutive_errors, _MAX_CONSECUTIVE_ERRORS, exc,
-                    )
-                    logger.debug(traceback.format_exc())
-                    if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
-                        raise
-                    time.sleep(_ERROR_RETRY_DELAY_S)
-
-        except Exception as exc:
-            logger.error("Fatal chunk scheduler thread error: %s", exc)
-            logger.error(traceback.format_exc())
-            self._error_event.set()
+            logger.debug(
+                "Chunk scheduled: latency=%.3fs measured_delay=%d applied_delay=%d qsize=%d",
+                elapsed, new_delay, delay if self._cfg.rtc_enabled else 0,
+                queue.qsize(),
+            )

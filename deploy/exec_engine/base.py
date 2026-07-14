@@ -19,3 +19,6 @@ class InferBackend(Protocol):
 
     @property
     def failed(self) -> bool: ...
+
+    @property
+    def action_chunk_id(self) -> int | None: ...

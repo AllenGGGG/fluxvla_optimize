@@ -92,6 +92,7 @@ class RerunVisualizer:
         self._warn = warn
         self._info = info or (lambda _message: None)
         self._recording: Any | None = None
+        self._joint_ranges: dict[str, list[float]] = {}
         self.enabled = False
         if not enabled:
             return
@@ -127,6 +128,17 @@ class RerunVisualizer:
                 pass
 
     def _log_series_styles(self) -> None:
+        for group_name in JOINT_GROUPS:
+            self._recording.log(
+                f"joints/{group_name}/inference_boundaries",
+                rr.SeriesLines(
+                    colors=[180, 180, 180],
+                    widths=2.0,
+                    names="inference boundary",
+                    aggregation_policy=rr.components.AggregationPolicy.MinMax,
+                ),
+                static=True,
+            )
         for joint_name in ALL_JOINT_NAMES:
             base = self._joint_path(joint_name)
             self._recording.log(
@@ -203,6 +215,16 @@ class RerunVisualizer:
     def _log_joint_values(
         self, values: Mapping[str, float], kind: str, timestamp_s: float
     ) -> None:
+        for joint_name, value in values.items():
+            group_name = JOINT_GROUP_BY_NAME.get(joint_name)
+            if group_name is None:
+                continue
+            bounds = self._joint_ranges.setdefault(
+                group_name, [float(value), float(value)]
+            )
+            bounds[0] = min(bounds[0], float(value))
+            bounds[1] = max(bounds[1], float(value))
+
         def log(recording: Any) -> None:
             self._set_time(recording, timestamp_s)
             for joint_name, value in values.items():
@@ -212,6 +234,23 @@ class RerunVisualizer:
                     f"{self._joint_path(joint_name)}/{kind}",
                     rr.Scalars(float(value)),
                 )
+
+        self._run(log)
+
+    def log_inference_boundary(self, *, timestamp_s: float) -> None:
+        """Draw one vertical separator in every joint plot for a new chunk."""
+        def log(recording: Any) -> None:
+            for group_name in JOINT_GROUPS:
+                lower, upper = self._joint_ranges.get(group_name, [-1.0, 1.0])
+                span = max(upper - lower, 0.2)
+                margin = 0.05 * span
+                path = f"joints/{group_name}/inference_boundaries"
+                self._set_time(recording, timestamp_s)
+                recording.log(path, rr.Scalars(lower - margin))
+                self._set_time(recording, timestamp_s + 1e-4)
+                recording.log(path, rr.Scalars(upper + margin))
+                self._set_time(recording, timestamp_s + 2e-4)
+                recording.log(path, rr.Clear(recursive=False))
 
         self._run(log)
 

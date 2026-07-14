@@ -110,9 +110,9 @@ the Viewer or a visualization error does not stop inference or command safety
 checks. Recordings are not written to disk.
 
 The default task text is the parcel-sorting instruction used by the dataset.
-After the node reports that all gates pass, enable it with the existing control
-signal `/xr/controller_state=15`; use value `16` to pause. Keep `AUTO_START`
-and `REQUIRE_DIRECT_MOVEJ` at their safe defaults for the first robot test.
+With `AUTO_START=true`, inference starts when all camera and joint inputs are
+ready. Set it to `false` to require `/xr/controller_state=15`; use value `16`
+to pause.
 
 Inference runs asynchronously: `deploy/exec_engine`'s `ChunkScheduler`
 keeps a background thread producing action chunks while the 30 Hz control

@@ -206,17 +206,21 @@ class FluxVLAPolicy(BaseInferenceRunner):
         )
 
         inference_cfg = Config.fromfile(str(inference_config_path))
+        inference_options = inference_cfg.get('inference_options', {})
+        for name, value in inference_options.items():
+            if hasattr(worker_cfg, name):
+                setattr(worker_cfg, name, value)
         if worker_cfg.num_inference_steps_override > 0:
             inference_cfg.inference_model['num_steps'] = (
                 worker_cfg.num_inference_steps_override)
-        # dataset['transforms'][0] is NormalizeStatesAndActions (see
-        # pi05_parcel_sort_inference.py); it and denormalize_action must use
-        # the same norm_type as whatever dataset_statistics.json contains.
-        inference_cfg.dataset['transforms'][0]['norm_type'] = worker_cfg.norm_type
-        inference_cfg.denormalize_action['norm_type'] = worker_cfg.norm_type
+        norm_type = inference_cfg.dataset['transforms'][0]['norm_type']
+        if inference_cfg.denormalize_action['norm_type'] != norm_type:
+            raise ValueError(
+                "dataset and action denormalization norm_type must match"
+            )
         log_success(
             f"inference config loaded: type={inference_cfg.inference_model['type']} "
-            f"norm_type={worker_cfg.norm_type}"
+            f"norm_type={norm_type} rtc_method={worker_cfg.rtc_method}"
         )
 
         super().__init__(
@@ -256,7 +260,7 @@ class FluxVLAPolicy(BaseInferenceRunner):
             self.dataset.norm_stats = norm_stats
             self.denormalize_action.norm_stats = norm_stats
             log_success(f"norm_stats overridden: path={norm_stats_path}")
-        log_success(f"norm_stats loaded: {self.dataset.norm_stats}")
+        # log_success(f"norm_stats loaded: {self.dataset.norm_stats}")
 
         # run_setup() moves the model to CUDA and sets the global seed; it
         # does not depend on ROS being available.
@@ -322,16 +326,87 @@ class FluxVLAPolicy(BaseInferenceRunner):
         }
 
     def _preprocess(self, obs: dict[str, Any]) -> dict[str, Any]:
-        return self.dataset(obs)
+        image_keys = tuple(self.dataset.img_keys)
+        for key in image_keys:
+            if key not in obs or obs[key] is None:
+                raise ValueError(f"missing inference image field: {key}")
+            image = np.asarray(obs[key])
+            if image.size == 0:
+                raise ValueError(f"empty inference image field: {key}")
+            if image.ndim != 3 or image.shape[-1] != 3:
+                raise ValueError(
+                    f"inference image {key} must be HWC RGB, got {image.shape}"
+                )
+
+        if 'qpos' not in obs or obs['qpos'] is None:
+            raise ValueError("missing inference state field: qpos")
+        qpos = np.asarray(obs['qpos'])
+        if qpos.shape != (MODEL_TENSOR_DIM,):
+            raise ValueError(
+                f"inference qpos must have shape ({MODEL_TENSOR_DIM},), "
+                f"got {qpos.shape}"
+            )
+        if not np.isfinite(qpos).all():
+            raise ValueError("inference qpos contains NaN or Inf")
+
+        task = obs.get('task_description')
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("missing or empty inference field: task_description")
+
+        inputs = self.dataset(obs)
+        for key in ('images', 'img_masks', 'lang_tokens', 'lang_masks', 'states'):
+            value = inputs.get(key)
+            if value is None:
+                raise ValueError(f"preprocessed model field is missing: {key}")
+            if not isinstance(value, torch.Tensor) or value.numel() == 0:
+                raise ValueError(f"preprocessed model field is empty: {key}")
+        return inputs
 
     def _forward(
         self, inputs: dict[str, Any], **rtc_kwargs: Any
     ) -> torch.Tensor:
-        return self.vla.predict_action(**inputs, **rtc_kwargs)
+        # The shared PI0 sampler creates float32 noise by default. The eager
+        # deployment model is converted to bf16, so provide a matching noise
+        # tensor explicitly rather than relying on that training-time default.
+        action_proj = getattr(self.vla, 'action_in_proj', None)
+        action_param = next(action_proj.parameters(), None) if action_proj else None
+        action_dtype = action_param.dtype if action_param is not None else None
+        if action_dtype is not None:
+            states = inputs['states']
+            noise = torch.randn(
+                states.shape[0],
+                int(self.vla.n_action_steps),
+                int(self.vla.max_action_dim),
+                device=states.device,
+                dtype=action_dtype,
+            )
+            rtc_kwargs = dict(rtc_kwargs)
+            rtc_kwargs['noise'] = noise
+            with torch.inference_mode():
+                if states.device.type == 'cuda':
+                    with torch.autocast(
+                            device_type='cuda', dtype=action_dtype):
+                        return self.vla.predict_action(**inputs, **rtc_kwargs)
+                return self.vla.predict_action(**inputs, **rtc_kwargs)
+        with torch.inference_mode():
+            return self.vla.predict_action(**inputs, **rtc_kwargs)
 
     def _postprocess(self, raw_action: torch.Tensor) -> np.ndarray:
-        return self.denormalize_action(
-            dict(action=raw_action.detach().float().cpu().numpy()))
+        actions = np.asarray(self.denormalize_action(
+            dict(action=raw_action.detach().float().cpu().numpy())))
+        # PI0.5 predicts the 32-D training tensor, while Pistar06 exposes only
+        # 28 controllable joints. The final four tensor dimensions are padding
+        # (their normalization mask is false) and must never enter the ROS
+        # command queue or RTC prefix history.
+        if actions.shape[-1] == MODEL_TENSOR_DIM:
+            actions = actions[..., :MODEL_JOINT_DIM]
+        if actions.shape[-1] != MODEL_JOINT_DIM:
+            raise ValueError(
+                "inference action has unexpected dimension: "
+                f"expected {MODEL_JOINT_DIM} or {MODEL_TENSOR_DIM}, "
+                f"got shape {actions.shape}"
+            )
+        return actions
 
     def _predict_once(self, obs: dict[str, Any], **rtc_kwargs: Any) -> np.ndarray:
         inputs = self._preprocess(obs)

@@ -14,6 +14,9 @@ from dataclasses import dataclass
 
 @dataclass
 class ChunkSchedulerConfig:
+    # Latency alignment is only meaningful for RTC prefix/guidance execution.
+    rtc_enabled: bool = False
+
     # How many unconsumed queue steps to hand to predict_fn as RTC prefix
     # context (clamped to whatever is actually left in the queue).
     execution_horizon: int = 10

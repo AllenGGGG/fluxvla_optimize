@@ -17,7 +17,6 @@ from .aloha_rtc_inference_runner import \
     AlohaRTCInferenceRunner  # noqa: F401, F403
 from .base_eval_runner import BaseEvalRunner  # noqa: F401, F403
 from .base_train_runner import BaseTrainRunner  # noqa: F401, F403
-from .ddp_train_runner import DDPTrainRunner  # noqa: F401, F403
 from .fluxbisim_aloha_inference_runner import \
     AlohaInferenceRunnerSim  # noqa: F401, F403
 from .fluxbisim_base_inference_runner import \
@@ -30,6 +29,14 @@ from .tron2_rtc_inference_runner import \
     Tron2RTCInferenceRunner  # noqa: F401, F403
 from .ur_inference_runner import URInferenceRunner  # noqa: F401, F403
 from .ur_rtc_inference_runner import URRTCInferenceRunner  # noqa: F401, F403
+
+try:
+    from .ddp_train_runner import DDPTrainRunner  # noqa: F401, F403
+except ModuleNotFoundError as exc:
+    # PEFT is only needed by the DDP training runner. Keep local inference
+    # importable in deployment environments that intentionally omit it.
+    if exc.name != 'peft':
+        raise
 
 try:
     from .libero_eval_runner import LiberoEvalRunner  # noqa: F401, F403

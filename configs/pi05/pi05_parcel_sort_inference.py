@@ -11,26 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Real-robot inference config for the pi05_parcel_sort checkpoint.
-# Mirrors pi05_parcel_sort.py's model/dataset definitions exactly so
-# preprocessing/postprocessing reuse the training-native transform classes
-# (fluxvla.transforms) instead of any hand-rolled reimplementation.
+# Complete plain PyTorch eager inference config for the parcel-sort checkpoint.
 
 _JOINT_DIM = 28
 _MODEL_ACTION_DIM = 32
 _ACTION_HORIZON = 50
-_NUM_VIEWS = 3
+_NORM_TYPE = 'min_max'
 
 inference_model = dict(
-    type='PI05FlowMatchingInference',
-    num_views=_NUM_VIEWS,
-    # Must be >= dataset.transforms' ProcessPrompts.max_len (200 below):
-    # the Triton CUDA-graph prompt buffer overflows if a real prompt (task
-    # text + 32-value discretized state) exceeds this bound. The class
-    # default of 48 is far too small for PreparePromptWithState's prompts.
-    triton_max_prompt_len=200,
+    type='PI05FlowMatching',
     llm_backbone=dict(
-        type='ConditionGemmaInferenceModel',
+        type='ConditionGemmaModel',
         adarms_cond_dim=None,
         attention_bias=False,
         attention_dropout=0.0,
@@ -54,7 +45,7 @@ inference_model = dict(
         vocab_size=257152,
     ),
     vision_backbone=dict(
-        type='SigLIPViTBackboneInference',
+        type='SigLIPViTBackbone',
         vision_backbone_id='siglip_224',
         vision_config=dict(
             attention_dropout=0.0,
@@ -75,25 +66,21 @@ inference_model = dict(
         ),
     ),
     projector=dict(
-        type='LinearProjectorInference',
+        type='LinearProjector',
         in_dim=1152,
         out_dim=2048,
     ),
     proj_width=1024,
     n_action_steps=_ACTION_HORIZON,
     action_in_proj=dict(
-        type='LinearProjectorInference', in_dim=_MODEL_ACTION_DIM,
-        out_dim=1024),
+        type='LinearProjector', in_dim=_MODEL_ACTION_DIM, out_dim=1024),
     action_out_proj=dict(
-        type='LinearProjectorInference', in_dim=1024,
-        out_dim=_MODEL_ACTION_DIM),
-    time_mlp_in=dict(
-        type='LinearProjectorInference', in_dim=1024, out_dim=1024),
-    time_mlp_out=dict(
-        type='LinearProjectorInference', in_dim=1024, out_dim=1024),
+        type='LinearProjector', in_dim=1024, out_dim=_MODEL_ACTION_DIM),
+    time_mlp_in=dict(type='LinearProjector', in_dim=1024, out_dim=1024),
+    time_mlp_out=dict(type='LinearProjector', in_dim=1024, out_dim=1024),
     max_action_dim=_MODEL_ACTION_DIM,
     llm_expert=dict(
-        type='ConditionGemmaInferenceModel',
+        type='ConditionGemmaModel',
         attention_bias=False,
         adarms_cond_dim=1024,
         attention_dropout=0.0,
@@ -135,6 +122,12 @@ inference_model = dict(
         'action_out_proj.projector': 'action_out_proj',
         'llm_backbone.embed_tokens': 'paligemma_with_expert.paligemma.lm_head',
     },
+    params_to_change_dtype=[
+        'llm_expert.llm.model.layers',
+        'vlm_backbone.vlm.model.language_model.layers',
+        'vlm_backbone.vlm.model.vision_tower',
+        'vlm_backbone.vlm.model.multi_modal_projector',
+    ],
     ori_action_dim=_JOINT_DIM,
 )
 
@@ -156,7 +149,7 @@ dataset = dict(
             state_dim=_MODEL_ACTION_DIM,
             state_key='proprio',
             action_key='action',
-            norm_type='quantile',
+            norm_type=_NORM_TYPE,
             state_norm_mask=[True] * _JOINT_DIM + [False] *
             (_MODEL_ACTION_DIM - _JOINT_DIM),
             action_norm_mask=[True] * _JOINT_DIM + [False] *
@@ -175,13 +168,26 @@ dataset = dict(
     ],
 )
 
-# norm_type must match whatever the deployed checkpoint was actually
-# trained with (currently 'quantile', see train_dataloader.dataset.datasets
-# in pi05_parcel_sort.py). Keep in sync by hand if that ever changes.
 denormalize_action = dict(
     type='DenormalizePrivateAction',
-    norm_type='quantile',
+    norm_type=_NORM_TYPE,
     action_dim=_MODEL_ACTION_DIM,
     action_norm_mask=[True] * _JOINT_DIM + [False] *
     (_MODEL_ACTION_DIM - _JOINT_DIM),
+)
+
+inference_options = dict(
+    num_inference_steps_override=0,
+    rtc_method='none',
+    rtc_execution_horizon=10,
+    rtc_max_guidance_weight=10.0,
+    rtc_schedule='linear',
+    advantage_enabled=False,
+    cfg_enabled=False,
+    cfg_scale=2.0,
+    cfg_scale_joint=-1.0,
+    cfg_scale_gripper=-1.0,
+    cfg_cond_advantage_tag='positive',
+    cfg_uncond_advantage_tag=None,
+    arm_dof=7,
 )
