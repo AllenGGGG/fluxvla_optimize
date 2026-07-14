@@ -14,7 +14,6 @@
 
 model = dict(
     type='PI05FlowMatching',
-    use_language=True,
     llm_backbone=dict(
         type='ConditionGemmaModel',
         adarms_cond_dim=None,
@@ -61,12 +60,9 @@ model = dict(
         ),
     ),
     projector=dict(
-        type='PixelUnshuffleMLPProjector',
+        type='LinearProjector',
         in_dim=1152,
         out_dim=2048,
-        grid_size=16,
-        downscale_factor=2,
-        reduction='concat',
     ),
     proj_width=1024,
     n_action_steps=50,
@@ -128,16 +124,10 @@ model = dict(
 )
 
 inference_model = dict(
-<<<<<<<< HEAD:configs/pi05/pi05_libero10_task0_with_l_pixshuffle_mlp_inference.py
-    type='PI05FlowMatchingInference',
-    num_views=2,
-    use_language=True,
-========
     type='PI05FlowMatchingRTCInference',
     num_view=3,
     triton_max_prompt_len=48,
     num_steps=10,
->>>>>>>> v0.1.4:configs/pi05/pi05_paligemma_aloha_rtc_kernel_inference.py
     llm_backbone=dict(
         type='ConditionGemmaInferenceModel',
         adarms_cond_dim=None,
@@ -184,12 +174,9 @@ inference_model = dict(
         ),
     ),
     projector=dict(
-        type='PixelUnshuffleMLPProjectorInference',
+        type='LinearProjectorInference',
         in_dim=1152,
         out_dim=2048,
-        grid_size=16,
-        downscale_factor=2,
-        reduction='concat',
     ),
     proj_width=1024,
     n_action_steps=50,
@@ -259,61 +246,6 @@ train_dataloader = dict(
     per_device_num_workers=4,
     dataset=dict(
         type='DistributedRepeatingDataset',
-<<<<<<<< HEAD:configs/pi05/pi05_libero10_task0_with_l_pixshuffle_mlp_inference.py
-        name_mappings={
-            'observation.state': ['proprio'],
-            'action': ['action']
-        },
-        statistic_keys=['observation.state', 'timestamp', 'action'],
-        statistic_name='libero_10_no_noops',
-        datasets=dict(
-            type='ParquetDataset',
-            data_root_path=  # noqa: E251
-            './datasets/libero_10_no_noops_lerobotv2.1',  # noqa: E501
-            task_indices=[0],
-            transforms=[
-                dict(
-                    type='ProcessParquetInputs',
-                    parquet_keys=[
-                        'observation.state', 'timestamp', 'actions', 'info',
-                        'stats', 'action_masks'
-                    ],
-                    video_keys=[
-                        'observation.images.image',
-                        'observation.images.wrist_image',
-                    ],
-                    name_mappings={
-                        'observation.state': ['states'],
-                        'actions': ['actions']
-                    }),
-                dict(type='ParquetPrompter', use_conversation=False),
-                dict(
-                    type='ProcessPrompts',
-                    tokenizer=dict(type='PaligemmaTokenizer'
-                                   # special_tokens={'pad_token': '<PAD>'}
-                                   )),
-                dict(type='ResizeImages', height=224, width=224),
-                dict(
-                    type='NormalizeImages',
-                    means=[[123.515625, 116.04492188, 103.59375],
-                           [123.515625, 116.04492188, 103.59375]],
-                    stds=[[58.27148438, 57.02636719, 57.27539062],
-                          [58.27148438, 57.02636719, 57.27539062]],
-                ),
-                dict(
-                    type='NormalizeStatesAndActions',
-                    action_dim=32,
-                    state_dim=32,
-                    state_key='proprio',
-                    action_key='action',
-                    norm_type='mean_std')
-            ],
-            action_window_size=10,
-            action_key='action',
-            use_delta=False,
-            statistic_name='libero_10_no_noops',
-            window_start_idx=0)))
-========
         name_mappings={'observation.state': ['proprio', 'action']},
         statistic_keys=[
             'observation.state', 'observation.eepose', 'timestamp'
@@ -363,7 +295,6 @@ train_dataloader = dict(
                 ],
                 action_window_size=50)
         ]))
->>>>>>>> v0.1.4:configs/pi05/pi05_paligemma_aloha_rtc_kernel_inference.py
 
 runner = dict(
     type='FSDPTrainRunner',
@@ -423,8 +354,6 @@ inference = dict(
         '10': 'place it in the brown flat cardboard box with right arm',
     },
     seed=7,
-    # Dataset task_index=0 maps to LIBERO benchmark task id 4.
-    eval_task_ids=[4],
     dataset=dict(
         type='PrivateInferenceDataset',
         img_keys=['cam_high', 'cam_left_wrist', 'cam_right_wrist'],

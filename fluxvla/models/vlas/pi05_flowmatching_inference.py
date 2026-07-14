@@ -831,6 +831,17 @@ class PI05FlowMatchingInference(PI05FlowMatching):
         self._triton_weights.update(
             {'decoder_time_embeds': self._prepare_adarms_cond(num_steps)})
 
+        # v0.1.4's per-backbone materialize_weights() preallocates final
+        # tensors on CPU (torch.empty(...) with no device=) to lower
+        # prepare-time peak memory, but never moves the result back to the
+        # model's device. Triton kernels require CUDA tensors, so do that
+        # move here, once, at the single point all backbones' weights meet.
+        device = next(self.parameters()).device
+        self._triton_weights = {
+            key: (value.to(device) if isinstance(value, torch.Tensor) else value)
+            for key, value in self._triton_weights.items()
+        }
+
         self._max_prompt_len = max_prompt_len
         self._num_steps = num_steps
 

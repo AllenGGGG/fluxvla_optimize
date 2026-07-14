@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import gc
 import inspect
 import math
@@ -21,11 +22,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
-from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -33,10 +32,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from fluxvla.engines.utils import check_bloat16_supported
 from fluxvla.engines.utils.name_map import str_to_dtype
 from fluxvla.engines.utils.torch_utils import worker_init_function
-from fluxvla.optimizers.schedulers import (get_constant_schedule,
-                                           get_cosine_schedule_with_warmup,
-                                           get_step_based_schedule)
-from ..utils import build_tokenizer_from_cfg, initialize_overwatch
+from ..utils import (build_evaluator_from_cfg, build_lr_scheduler_from_cfg,
+                     build_tokenizer_from_cfg, initialize_overwatch)
 
 overwatch = initialize_overwatch(__name__)
 
@@ -52,7 +49,6 @@ class BaseTrainRunner(ABC):
         device_id (int): Device ID for training.
         epochs (int): Number of epochs to train.
         max_steps (int): Maximum number of training steps.
-        learning_rate (int): Learning rate for the optimizer.
         collator (Dict): Collator configuration.
         save_iter_interval (int, optional): Interval for saving checkpoints
             based on iterations. Defaults to 10000.
@@ -60,10 +56,8 @@ class BaseTrainRunner(ABC):
             based on epochs. Defaults to 10000.
         max_keep_ckpts (int, optional): Maximum number of checkpoints to keep.
             Defaults to 2.
-        lr_scheduler_type (str, optional): Type of learning rate scheduler.
-            Defaults to 'constant'.
-        warmup_ratio (int, optional): Warm-up ratio for learning rate
-            scheduler. Defaults to 0.
+        optimizer (Dict): Optimizer configuration.
+        lr_scheduler (Dict): Learning rate scheduler policy configuration.
         enable_gradient_checkpointing (bool, optional): Enable gradient
             checkpointing. Defaults to True.
         enable_mixed_precision_training (bool, optional): Enable mixed
@@ -79,31 +73,37 @@ class BaseTrainRunner(ABC):
     def __init__(self,
                  cfg: dict,
                  device_id: int,
-                 learning_rate: int,
                  collator: Dict,
                  sampler: str,
                  metric: Dict,
+                 optimizer: Optional[Dict] = None,
                  max_epochs: int = None,
                  max_steps: Optional[int] = None,
                  save_epoch_interval: int = 1,
                  save_iter_interval: int = 10000,
                  max_keep_ckpts: int = 2,
-                 lr_scheduler_type: str = 'constant',
-                 lr_schedule: Optional[Dict[float, float]] = None,
-                 warmup_ratio: int = 0,
+                 lr_scheduler: Dict = None,
                  enable_gradient_checkpointing: bool = True,
                  enable_mixed_precision_training: bool = True,
                  reduce_in_full_precision: bool = True,
                  mixed_precision_dtype: str = 'bf16',
+                 grad_accumulation_steps: int = 1,
+                 evaluator: Optional[Dict] = None,
                  tokenizer: Optional[Dict] = None,
                  resume_from: Optional[str] = None):
         from ..utils.builder import (build_collator_from_cfg,
                                      build_metric_from_cfg, build_vla_from_cfg)
 
+        grad_accumulation_steps = int(grad_accumulation_steps)
+        assert grad_accumulation_steps >= 1, \
+            'Gradient accumulation steps must be >= 1!'
+
+        metric = metric.copy()
         metric['hparams'] = cfg
+        metric['grad_accumulation_steps'] = grad_accumulation_steps
         timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
-        metric[
-            'run_id'] = f"{os.path.basename(cfg.filename).replace('.py', '')}_{timestamp}"  # noqa: E501
+        metric['run_id'] = (
+            f"{os.path.basename(cfg.filename).replace('.py', '')}_{timestamp}")
         self.metric = build_metric_from_cfg(metric)
 
         # Ensure only one training mode is set
@@ -125,24 +125,29 @@ class BaseTrainRunner(ABC):
         else:
             self.llm_transformer_layer_cls = None
 
+        optimizer_cfg = self._normalize_optimizer_cfg(optimizer)
+
         self.device_id = device_id
         self.max_epochs = max_epochs
         self.max_steps = max_steps
-        self.learning_rate = learning_rate
+        self.optimizer_cfg = optimizer_cfg
         self.collator = build_collator_from_cfg(collator)
         self.sampler = sampler
         self.save_iter_interval = save_iter_interval
         self.save_epoch_interval = save_epoch_interval
         self.max_keep_ckpts = max_keep_ckpts
-        self.lr_scheduler_type = lr_scheduler_type
-        self.warmup_ratio = warmup_ratio
+        self.lr_scheduler_cfg = lr_scheduler
         self.enable_gradient_checkpointing = enable_gradient_checkpointing
         self.enable_mixed_precision_training = enable_mixed_precision_training
         self.reduce_in_full_precision = reduce_in_full_precision
         self.mixed_precision_dtype = str_to_dtype(mixed_precision_dtype)
         self.per_device_batch_size = cfg.train_dataloader.per_device_batch_size
+        self.grad_accumulation_steps = grad_accumulation_steps
+        self.evaluator = (
+            build_evaluator_from_cfg(evaluator)
+            if evaluator is not None else None)
         self.global_batch_size = self.per_device_batch_size * \
-            overwatch.world_size()
+            overwatch.world_size() * self.grad_accumulation_steps
         if hasattr(cfg.train_dataloader, 'per_device_num_workers'):
             self.per_device_num_workers = cfg.train_dataloader.per_device_num_workers  # noqa: E501
         else:
@@ -157,9 +162,6 @@ class BaseTrainRunner(ABC):
         self.steps_per_epoch = None  # Determined at runtime
         # Accumulate losses for checkpoint interval averaging
         self._loss_accumulator = []
-        # Log a sample-input visualization to wandb exactly once, on the
-        # first training step.
-        self._logged_input_sample = False
 
         # Optimizers & Scheduler (initialized in `run_setup`)
         self.optimizer, self.lr_scheduler = None, None
@@ -167,16 +169,13 @@ class BaseTrainRunner(ABC):
         self.resume_from = resume_from
         # Track if optimizer state was successfully loaded
         self.optimizer_state_loaded = False
-        # Store lr_schedule for step-based scheduler
-        self.lr_schedule = lr_schedule
+        self.num_training_steps = None
         self._active_dataloader = None
 
         # Lightweight Validation
         assert (
             self.global_batch_size % self.per_device_batch_size == 0
         ), 'Per-device batch size must evenly divide global batch size!'
-        self.grad_accumulation_steps = self.global_batch_size // self.per_device_batch_size // overwatch.world_size(  # noqa: E501
-        )
 
         if self.enable_mixed_precision_training:
             assert self.mixed_precision_dtype == torch.bfloat16, \
@@ -184,46 +183,87 @@ class BaseTrainRunner(ABC):
             assert check_bloat16_supported(), \
                 'BFloat16 is not supported on this hardware; unset `mixed_precision`'  # noqa: E501
 
-    def _convert_batch_to_dtype(self, batch: Dict, dtype: torch.dtype) -> Dict:
-        """Convert floating point tensors in batch to specified dtype.
+    @staticmethod
+    def _normalize_optimizer_cfg(optimizer: Optional[Dict]) -> Dict:
+        if optimizer is None:
+            raise ValueError('runner.optimizer must be provided.')
+        optimizer_cfg = dict(optimizer)
+        optimizer_type = optimizer_cfg.get('type', 'AdamW')
+        if 'lr' not in optimizer_cfg:
+            raise ValueError('optimizer.lr must be provided.')
 
-        This method automatically converts all floating point tensors in
-        the batch to the target dtype (e.g., bfloat16), while preserving
-        integer tensors and other data types.
+        normalized_cfg = dict(optimizer_cfg)
+        normalized_cfg['type'] = optimizer_type
+        normalized_cfg['lr'] = float(normalized_cfg['lr'])
+
+        if 'betas' in normalized_cfg:
+            normalized_cfg['betas'] = tuple(
+                float(beta) for beta in normalized_cfg['betas'])
+            if len(normalized_cfg['betas']) != 2:
+                raise ValueError(
+                    'optimizer.betas must contain two values when provided.')
+        if 'eps' in normalized_cfg:
+            normalized_cfg['eps'] = float(normalized_cfg['eps'])
+        if (normalized_cfg.get('weight_decay') is not None
+                and 'weight_decay' in normalized_cfg):
+            normalized_cfg['weight_decay'] = float(
+                normalized_cfg['weight_decay'])
+        normalized_cfg['paramwise_learning_rate'] = dict(
+            normalized_cfg.get('paramwise_learning_rate', {}) or {})
+        return normalized_cfg
+
+    def _prepare_batch(self,
+                       batch: Dict,
+                       device: torch.device | int,
+                       dtype: Optional[torch.dtype] = None) -> Dict:
+        """Move tensor batch values to device and optionally cast floats.
+
+        Floating point tensors are cast to ``dtype`` when provided. Integer
+        and bool tensors keep their dtype.
 
         Args:
             batch (Dict): Input batch dictionary.
-            dtype (torch.dtype): Target dtype (e.g., torch.bfloat16).
+            device: Target device.
+            dtype (torch.dtype): Optional floating point target dtype.
 
         Returns:
-            Dict: Batch with converted dtypes.
+            Dict: Batch with tensors on the target device.
         """
         converted_batch = {}
+        target_device = (
+            torch.device('cuda', device)
+            if isinstance(device, int) else device)
 
         for key, value in batch.items():
             if isinstance(value, torch.Tensor):
-                # Convert floating point tensors to target dtype
-                # Keep integer tensors (int, long, bool) as is
-                if value.dtype.is_floating_point:
-                    converted_batch[key] = value.to(dtype=dtype)
+                if dtype is not None and value.dtype.is_floating_point:
+                    converted_batch[key] = value.to(
+                        device=target_device, dtype=dtype, non_blocking=True)
                 else:
-                    # Keep integer tensors unchanged
-                    converted_batch[key] = value
+                    converted_batch[key] = value.to(
+                        device=target_device, non_blocking=True)
             elif isinstance(value, dict):
                 # Recursively handle nested dictionaries
-                converted_batch[key] = self._convert_batch_to_dtype(
-                    value, dtype)
+                converted_batch[key] = self._prepare_batch(
+                    value, device, dtype)
             elif isinstance(value, (list, tuple)):
                 # Handle lists/tuples that may contain tensors
                 converted_list = []
                 for item in value:
-                    if isinstance(
-                            item,
-                            torch.Tensor) and item.dtype.is_floating_point:
-                        converted_list.append(item.to(dtype=dtype))
+                    if isinstance(item, torch.Tensor):
+                        if dtype is not None and item.dtype.is_floating_point:
+                            converted_list.append(
+                                item.to(
+                                    device=target_device,
+                                    dtype=dtype,
+                                    non_blocking=True))
+                        else:
+                            converted_list.append(
+                                item.to(
+                                    device=target_device, non_blocking=True))
                     elif isinstance(item, dict):
                         converted_list.append(
-                            self._convert_batch_to_dtype(item, dtype))
+                            self._prepare_batch(item, device, dtype))
                     else:
                         converted_list.append(item)
                 converted_batch[key] = (
@@ -234,6 +274,10 @@ class BaseTrainRunner(ABC):
                 converted_batch[key] = value
 
         return converted_batch
+
+    def _convert_batch_to_dtype(self, batch: Dict, dtype: torch.dtype) -> Dict:
+        """Convert floating point tensors in batch to specified dtype."""
+        return self._prepare_batch(batch, self.device_id, dtype)
 
     @staticmethod
     def _shutdown_dataloader(dataloader: Optional[DataLoader]) -> None:
@@ -345,7 +389,7 @@ class BaseTrainRunner(ABC):
         if overwatch.is_rank_zero():
             overwatch.info(
                 f'Resuming training from checkpoint: {self.resume_from}')
-        checkpoint_info = torch.load(self.resume_from, map_location='cpu')
+        checkpoint_info = torch.load(self.resume_from)
 
         # Restore model state (delegated to subclasses for FSDP/DDP-specific
         # handling)
@@ -425,7 +469,7 @@ class BaseTrainRunner(ABC):
         return (self.current_epoch % self.save_epoch_interval) == 0
 
     def _get_effective_dataset_size(self, dataset, sampler):
-        """Get effective dataset size, handling RLDS datasets
+        """Get effective dataset size for finite and sampler-backed datasets.
 
         Args:
             dataset: The dataset object.
@@ -443,7 +487,7 @@ class BaseTrainRunner(ABC):
                 return None
 
     def _estimate_steps_per_epoch(self, dataset, sampler):
-        """Estimate steps per epoch, handling RLDS datasets"""
+        """Estimate steps per epoch for finite and sampler-backed datasets."""
         if sampler is not None:
             # Effective size after DistributedSampler processing
             return len(sampler)
@@ -451,6 +495,23 @@ class BaseTrainRunner(ABC):
             dataset_len = len(dataset)
             # If dataset has a finite length, use it
             return math.ceil(dataset_len / self.global_batch_size)
+
+    @staticmethod
+    def _build_dataloader_generator() -> Optional[torch.Generator]:
+        seed = os.environ.get('EXPERIMENT_GLOBAL_SEED')
+        if seed is None:
+            return None
+
+        generator = torch.Generator()
+        generator.manual_seed(int(seed) + overwatch.rank())
+        return generator
+
+    @staticmethod
+    def _tensor_for_safetensors(tensor):
+        """Return a contiguous tensor for safetensors export."""
+        if isinstance(tensor, torch.Tensor) and not tensor.is_contiguous():
+            return tensor.contiguous()
+        return tensor
 
     @staticmethod
     def _save_model_safetensors(model_state_dicts, safetensors_path):
@@ -463,9 +524,10 @@ class BaseTrainRunner(ABC):
         for key, value in model_state_dicts.items():
             if isinstance(value, dict):
                 for sub_key, tensor in value.items():
-                    flat_dict[f'{key}.{sub_key}'] = tensor
+                    flat_dict[f'{key}.{sub_key}'] = (
+                        BaseTrainRunner._tensor_for_safetensors(tensor))
             elif isinstance(value, torch.Tensor):
-                flat_dict[key] = value
+                flat_dict[key] = BaseTrainRunner._tensor_for_safetensors(value)
         if flat_dict:
             save_file(flat_dict, safetensors_path)
 
@@ -491,168 +553,38 @@ class BaseTrainRunner(ABC):
                     overwatch.warning(
                         f'Failed to remove checkpoint {old_ckpt}: {e}')
 
+    def _resolve_lr_scheduler_cfg(self) -> Dict:
+        if self.lr_scheduler_cfg is None:
+            raise ValueError('runner.lr_scheduler must be provided.')
+        return dict(self.lr_scheduler_cfg)
+
     def _setup_optimizer_and_scheduler(
         self,
         n_train_examples: int,
-        weight_decay: Optional[float] = None,
-        lr_schedule: Optional[Dict[float, float]] = None,
     ) -> None:
-        """Setup optimizer and learning rate scheduler.
-
-        This method handles the creation of optimizer and scheduler based on
-        the configured lr_scheduler_type. It supports parameter grouping
-        with weight decay when weight_decay is provided.
-
-        Args:
-            n_train_examples: Number of training examples.
-            weight_decay: Weight decay value for optimizer. If provided, will
-                create parameter groups (decay/no_decay). If None, uses
-                simple parameter list.
-            lr_schedule: Dictionary mapping ratio (0-1) to learning rate for
-                step-based scheduler. Required when lr_scheduler_type is
-                'step-based'.
-        """
-        # Calculate number of training steps
+        """Setup optimizer and learning rate scheduler policy."""
         n_train_examples = math.ceil(
             n_train_examples / self.global_batch_size) * self.global_batch_size
         if self.max_steps is None:
-            num_training_steps = (n_train_examples *
-                                  self.max_epochs) // self.global_batch_size
+            self.num_training_steps = (
+                n_train_examples * self.max_epochs) // self.global_batch_size
         else:
-            num_training_steps = self.max_steps
+            self.num_training_steps = self.max_steps
 
-        if self.lr_scheduler_type == 'linear-warmup+cosine-decay':
-            # Set warm-up steps (floor) based on `warmup_ratio`
-            # (should be 0.03 - 0.05)
-            num_warmup_steps = int(num_training_steps * self.warmup_ratio)
+        scheduler_cfg = self._resolve_lr_scheduler_cfg()
+        self.lr_scheduler = build_lr_scheduler_from_cfg(scheduler_cfg)
+        self.lr_scheduler_policy_type = scheduler_cfg['type']
+        self.optimizer, self.lr_scheduler = self.lr_scheduler.build(self)
 
-            # Create Parameter Groups --> bias terms, normalization
-            # layer parameters shouldn't be decayed!
-            if weight_decay is not None:
-                decay, no_decay = [], []
-                for name, param in self.vla.named_parameters():
-                    if not param.requires_grad:
-                        continue
+    def _get_log_lr(self) -> float:
+        if hasattr(self.lr_scheduler, 'get_log_lr'):
+            return self.lr_scheduler.get_log_lr(self)
+        return self.lr_scheduler.get_last_lr()[0]
 
-                    # Check on any parameters with fewer than 2 dimensions
-                    # or with "bias" in the name
-                    if param.ndim <= 1 or name.endswith('.bias'):
-                        no_decay.append(param)
-                    else:
-                        decay.append(param)
-
-                # Build Parameter Groups
-                groups = [{
-                    'params': decay,
-                    'weight_decay': weight_decay
-                }, {
-                    'params': no_decay,
-                    'weight_decay': 0.0
-                }]
-            else:
-                # Simple parameter list
-                groups = [
-                    param for param in self.vla.parameters()
-                    if param.requires_grad
-                ]
-
-            # Create Optimizer & LR Scheduler
-            # NOTE: get_cosine_schedule_with_warmup's LambdaLR base class
-            # already sets each param_group['lr'] from lr_lambda(0) during
-            # construction, so no manual reset is needed here. Forcing
-            # lr=0.0 unconditionally previously meant the first optimizer
-            # step after resume() (which restores the scheduler's step
-            # count but does not push a recomputed lr into the optimizer
-            # until the next .step() call) ran at lr=0.0 instead of the
-            # correct mid-schedule value.
-            self.optimizer = AdamW(groups, lr=self.learning_rate)
-            self.lr_scheduler = get_cosine_schedule_with_warmup(
-                self.optimizer, num_warmup_steps, num_training_steps)
-
-        elif self.lr_scheduler_type == 'constant':
-            # Create Parameter Groups --> bias terms, normalization
-            # layer parameters shouldn't be decayed!
-            if weight_decay is not None:
-                decay, no_decay = [], []
-                for name, param in self.vla.named_parameters():
-                    if not param.requires_grad:
-                        continue
-
-                    # Check on any parameters with fewer than 2 dimensions
-                    # or with "bias" in the name
-                    if param.ndim <= 1 or name.endswith('.bias'):
-                        no_decay.append(param)
-                    else:
-                        decay.append(param)
-
-                # Build Parameter Groups
-                groups = [{
-                    'params': decay,
-                    'weight_decay': weight_decay
-                }, {
-                    'params': no_decay,
-                    'weight_decay': 0.0
-                }]
-            else:
-                # Simple parameter list
-                groups = [
-                    param for param in self.vla.parameters()
-                    if param.requires_grad
-                ]
-
-            # Create Optimizer & LR Scheduler
-            self.optimizer = AdamW(groups, lr=self.learning_rate)
-            self.lr_scheduler = get_constant_schedule(self.optimizer)
-
-        elif self.lr_scheduler_type == 'step-based':
-            if lr_schedule is None:
-                raise ValueError('lr_schedule must be provided when using '
-                                 'step-based scheduler')
-
-            # Create Parameter Groups --> bias terms, normalization
-            # layer parameters shouldn't be decayed!
-            if weight_decay is not None:
-                decay, no_decay = [], []
-                for name, param in self.vla.named_parameters():
-                    if not param.requires_grad:
-                        continue
-
-                    # Check on any parameters with fewer than 2 dimensions
-                    # or with "bias" in the name
-                    if param.ndim <= 1 or name.endswith('.bias'):
-                        no_decay.append(param)
-                    else:
-                        decay.append(param)
-
-                # Build Parameter Groups
-                groups = [{
-                    'params': decay,
-                    'weight_decay': weight_decay
-                }, {
-                    'params': no_decay,
-                    'weight_decay': 0.0
-                }]
-            else:
-                # Simple parameter list
-                groups = [
-                    param for param in self.vla.parameters()
-                    if param.requires_grad
-                ]
-
-            # Create Optimizer & Step-based LR Scheduler
-            self.optimizer = AdamW(groups, lr=self.learning_rate)
-            self.lr_scheduler = get_step_based_schedule(
-                self.optimizer, num_training_steps, lr_schedule)
-
-        else:
-            raise ValueError(f'Learning Rate Schedule with type '
-                             f"'{self.lr_scheduler_type}' is not supported!")
-
-    def run(self, vla_dataset) -> None:
+    def run(self, vla_dataset, eval_dataset=None) -> None:
         """Train the VLA model."""
-        assert self.grad_accumulation_steps == 1, \
-            'VLA training does not support gradient accumulation!'
-
+        training_eval_dataset = (
+            vla_dataset if eval_dataset is None else eval_dataset)
         # Setup dataloader
         sampler = torch.utils.data.distributed.DistributedSampler(
             vla_dataset,
@@ -669,6 +601,7 @@ class BaseTrainRunner(ABC):
             collate_fn=self.collator,
             num_workers=self.per_device_num_workers,
             worker_init_fn=worker_init_function,
+            generator=self._build_dataloader_generator(),
             pin_memory=True,
             prefetch_factor=2 if use_workers else None,
             persistent_workers=use_workers)
@@ -685,15 +618,68 @@ class BaseTrainRunner(ABC):
 
         try:
             if self.training_mode == 'step_based':
-                return self._run_step_based(dataloader, sampler)
+                self._sync_step_based_epoch_with_global_step()
+                return self._run_step_based(dataloader, sampler,
+                                            training_eval_dataset)
             else:
-                return self._run_epoch_based(dataloader, sampler)
+                return self._run_epoch_based(dataloader, sampler,
+                                             training_eval_dataset)
         finally:
             self._shutdown_dataloader(self._active_dataloader)
             self._active_dataloader = None
             gc.collect()
 
-    def _run_step_based(self, dataloader, sampler) -> str:
+    def _next_batch(self, dataloader, dataloader_iter, sampler):
+        """Fetch a micro-batch, restarting the epoch if the iterator ends."""
+        while True:
+            if dataloader_iter is None:
+                if sampler:
+                    sampler.set_epoch(self.current_epoch)
+                dataloader_iter = iter(dataloader)
+
+            try:
+                return next(dataloader_iter), dataloader_iter
+            except StopIteration:
+                self.current_epoch += 1
+                dataloader_iter = None
+
+    def _run_accumulated_training_step(self, dataloader, dataloader_iter,
+                                       sampler):
+        """Run one optimizer step made of one or more micro-batches."""
+        losses = []
+        for micro_step in range(self.grad_accumulation_steps):
+            batch, dataloader_iter = self._next_batch(dataloader,
+                                                      dataloader_iter, sampler)
+            should_step = micro_step == self.grad_accumulation_steps - 1
+            # Skip the DDP/FSDP gradient all-reduce on non-final
+            # micro-steps; gradients are synchronized only once when the
+            # accumulated optimizer step is taken.
+            with self._grad_sync_context(should_sync=should_step):
+                loss = self._training_step(batch, should_step=should_step)
+            losses.append(loss.detach())
+        mean_loss = torch.stack(losses).mean()
+        return float(mean_loss.item()), dataloader_iter
+
+    def _grad_sync_context(self, should_sync: bool):
+        """Return the gradient synchronization context for a micro-step.
+
+        For DDP/FSDP-wrapped models, ``no_sync()`` suppresses the gradient
+        all-reduce during ``backward``. We only need to synchronize on the
+        last micro-step of a gradient-accumulation window, which cuts the
+        gradient communication volume by a factor of
+        ``grad_accumulation_steps``. Falls back to a no-op context for the
+        final micro-step, single-GPU runs, or any model lacking
+        ``no_sync``.
+        """
+        if should_sync:
+            return contextlib.nullcontext()
+        no_sync = getattr(self.vla, 'no_sync', None)
+        if callable(no_sync):
+            return no_sync()
+        return contextlib.nullcontext()
+
+    def _run_step_based(self, dataloader, sampler,
+                        training_eval_dataset) -> str:
         """Step-based training loop. Handles infinite dataloaders."""
         with tqdm(
                 total=self.max_steps,
@@ -706,34 +692,21 @@ class BaseTrainRunner(ABC):
             epoch_step_count = 0
 
             while self.metric.global_step < self.max_steps:
-                # Init/reset iterator at epoch start
-                if dataloader_iter is None:
-                    if sampler:
-                        sampler.set_epoch(self.current_epoch)
-                    dataloader_iter = iter(dataloader)
-                    epoch_step_count = 0
-
-                # Get next batch
-                try:
-                    batch = next(dataloader_iter)
-                except StopIteration:
-                    # Finite dataloader exhausted, start new epoch
-                    self.current_epoch += 1
-                    dataloader_iter = None
-                    continue
-
-                loss = self._training_step(batch)
-                self._loss_accumulator.append(
-                    float(loss.detach().cpu().numpy().copy()))
+                loss, dataloader_iter = self._run_accumulated_training_step(
+                    dataloader, dataloader_iter, sampler)
+                self._loss_accumulator.append(loss)
                 epoch_step_count += 1
 
                 # Update metrics
                 self.metric.commit(
                     global_step=self.metric.global_step + 1,
                     epoch=self.current_epoch,
-                    lr=self.lr_scheduler.get_last_lr()[0])
+                    lr=self._get_log_lr())
                 progress.set_description(self.metric.push(), refresh=False)
                 progress.update()
+                if (self.evaluator is not None
+                        and self.evaluator.should_run(self)):
+                    self.evaluator.run(self, training_eval_dataset)
 
                 # Save checkpoint
                 if self._should_save_step_checkpoint():
@@ -743,11 +716,38 @@ class BaseTrainRunner(ABC):
                 if (self.steps_per_epoch
                         and epoch_step_count >= self.steps_per_epoch):
                     self.current_epoch += 1
+                    epoch_step_count = 0
                     dataloader_iter = None
 
         return self._get_checkpoint_path()
 
-    def _run_epoch_based(self, dataloader, sampler) -> str:
+    def _sync_step_based_epoch_with_global_step(self) -> None:
+        """Keep step-based epoch display derived from the global step.
+
+        Step-based training does not persist dataloader iterator position, so
+        after resume the least surprising epoch value is the completed number
+        of full dataset passes implied by ``global_step``.
+        """
+        if (self.training_mode != 'step_based' or not self.steps_per_epoch
+                or self.metric.global_step == 0):
+            return
+
+        expected_epoch = self.metric.global_step // self.steps_per_epoch
+        if self.current_epoch == expected_epoch:
+            return
+
+        if overwatch.is_rank_zero():
+            overwatch.warning(
+                'Correcting step-based epoch from '
+                f'{self.current_epoch} to {expected_epoch} based on '
+                f'global_step={self.metric.global_step} and '
+                f'steps_per_epoch={self.steps_per_epoch}.')
+        self.current_epoch = expected_epoch
+        if hasattr(self.metric, 'epoch'):
+            self.metric.epoch = expected_epoch
+
+    def _run_epoch_based(self, dataloader, sampler,
+                         training_eval_dataset) -> str:
         """Epoch-based training with nested progress bars. Handles
             infinite dataloaders.
 
@@ -780,25 +780,22 @@ class BaseTrainRunner(ABC):
                         disable=not overwatch.is_rank_zero()) as iter_pbar:
 
                     while True:
-                        # Get next batch
-                        try:
-                            batch = next(dataloader_iter)
-                        except StopIteration:
-                            # Finite dataloader exhausted
-                            break
-
-                        loss = self._training_step(batch)
-                        self._loss_accumulator.append(
-                            float(loss.detach().cpu().numpy().copy()))
+                        loss, dataloader_iter = \
+                            self._run_accumulated_training_step(
+                                dataloader, dataloader_iter, sampler)
+                        self._loss_accumulator.append(loss)
                         epoch_step_count += 1
 
                         # Update metrics
                         self.metric.commit(
                             global_step=self.metric.global_step + 1,
                             epoch=self.current_epoch,
-                            lr=self.lr_scheduler.get_last_lr()[0])
+                            lr=self._get_log_lr())
                         iter_pbar.set_description(self.metric.push())
                         iter_pbar.update()
+                        if (self.evaluator is not None
+                                and self.evaluator.should_run(self)):
+                            self.evaluator.run(self, training_eval_dataset)
 
                         # For infinite dataloaders: end epoch by step count
                         if (self.steps_per_epoch
@@ -834,7 +831,8 @@ class BaseTrainRunner(ABC):
             f'Training: mode={self.training_mode}, epochs={self.max_epochs}, '
             f'steps/epoch={self.steps_per_epoch}, '
             f'batch={self.global_batch_size} '
-            f'({self.per_device_batch_size}x{overwatch.world_size()})')
+            f'({self.per_device_batch_size}x{overwatch.world_size()}'
+            f'x{self.grad_accumulation_steps})')
 
     def _vla_accepts_kwarg(self, key: str) -> bool:
         """Return whether the wrapped VLA forward accepts ``key``."""
@@ -851,52 +849,29 @@ class BaseTrainRunner(ABC):
         self._vla_accepts_kwarg_cache = cache
         return accepts
 
-    def _log_input_sample_images(self, batch) -> None:
-        """Log a visualization of the first 5 samples' camera views to
-        wandb, once, on the first training step.
+    @staticmethod
+    def _collect_output_loss_metrics(output) -> Dict[str, torch.Tensor]:
+        """Collect scalar loss components returned by a VLA forward pass."""
+        if not hasattr(output, 'items'):
+            return {}
 
-        Each sample's ``images`` tensor is ``(num_cameras * 3, H, W)``
-        (channels 0:3=head/base, 3:6=left wrist, 6:9=right wrist,
-        normalized to [-1, 1]). For each of the first 5 samples (in order,
-        no skipping) the three camera views are concatenated side-by-side
-        into one row image; the 5 row images are logged as separate panels
-        (not stacked into a single combined image).
-        """
-        if (self._logged_input_sample or not overwatch.is_rank_zero()
-                or 'images' not in batch):
-            return
-        self._logged_input_sample = True
+        metrics = {}
+        reserved_keys = {'loss'}
+        for key, value in output.items():
+            if key in reserved_keys:
+                continue
+            if not (key.startswith('loss_') or key.endswith('_loss')):
+                continue
+            if isinstance(value, torch.Tensor) and value.numel() == 1:
+                metrics[key] = value
+        return metrics
 
-        images = batch['images']
-        if isinstance(images, torch.Tensor):
-            images = images.detach().float().cpu().numpy()
-        n_samples = min(5, images.shape[0])
-        n_cameras = images.shape[1] // 3
-        if n_cameras == 0:
-            # Fewer than 3 channels total (e.g. single-channel/depth-only
-            # observations) -- this visualization assumes stacked 3-channel
-            # RGB camera views, so there's nothing sensible to log.
-            return
-
-        sample_images = {}
-        for i in range(n_samples):
-            cams = [
-                images[i, c * 3:(c + 1) * 3] for c in range(n_cameras)
-            ]  # each (3, H, W) in [-1, 1]
-            row = np.concatenate(cams, axis=2)  # (3, H, W * n_cameras)
-            # [-1, 1] -> [0, 255] uint8, CHW -> HWC for image logging.
-            row = np.clip((row + 1.0) * 127.5, 0, 255).astype(np.uint8)
-            row = row.transpose(1, 2, 0)
-            sample_images[f'input_sample/{i}'] = row
-
-        self.metric.log_images(self.metric.global_step, sample_images)
-
-    def _training_step(self, batch) -> torch.Tensor:
+    def _training_step(self, batch, should_step: bool = True) -> torch.Tensor:
         """Execute single training step: forward, backward, optimize."""
-        self._log_input_sample_images(batch)
-        if self.enable_mixed_precision_training:
-            batch = self._convert_batch_to_dtype(batch,
-                                                 self.mixed_precision_dtype)
+        self.lr_scheduler.prepare_step(self)
+        batch = self._prepare_batch(
+            batch, self.device_id, self.mixed_precision_dtype
+            if self.enable_mixed_precision_training else None)
         if ('sample_weight' in batch
                 and not self._vla_accepts_kwarg('sample_weight')):
             batch = dict(batch)
@@ -907,6 +882,7 @@ class BaseTrainRunner(ABC):
                 enabled=self.enable_mixed_precision_training):
             output: CausalLMOutputWithPast = self.vla(**batch)
             loss = output['loss']
+            loss_metrics = self._collect_output_loss_metrics(output)
 
         # Average the loss across ranks for logging only -- the local
         # (unreduced) `loss` tensor below still drives the backward pass,
@@ -919,8 +895,8 @@ class BaseTrainRunner(ABC):
             logged_loss /= dist.get_world_size()
         else:
             logged_loss = loss.detach()
-        self.metric.commit(loss=logged_loss)
-        loss.backward()
+        self.metric.commit(loss=logged_loss, **loss_metrics)
+        (loss / self.grad_accumulation_steps).backward()
 
         # Commit per-dataset metrics
         if overwatch.is_rank_zero() and all(k in output for k in [
@@ -932,6 +908,9 @@ class BaseTrainRunner(ABC):
                 self.metric.commit_for_dataset(
                     dataset_name=ds.decode(), action_accuracy=acc, l1_loss=l1)
 
+        if not should_step:
+            return loss.detach()
+
         # Gradient step with fallback on optimizer state mismatch
         self.clip_grad_norm()
         try:
@@ -942,14 +921,14 @@ class BaseTrainRunner(ABC):
                 self.optimizer.step()
             else:
                 raise
-        self.lr_scheduler.step()
+        self.lr_scheduler.step(self)
         self.optimizer.zero_grad()
 
         # Custom hook for subclasses
         if hasattr(self, '_custom_training_step'):
             custom_loss = self._custom_training_step(batch, output, loss)
             if custom_loss is not None:
-                loss = torch.tensor(custom_loss)
+                loss = loss.detach().new_tensor(custom_loss)
 
         return loss
 
@@ -957,39 +936,13 @@ class BaseTrainRunner(ABC):
         """Reinitialize optimizer on state mismatch."""
         if overwatch.is_rank_zero():
             overwatch.warning('Optimizer state mismatch. Reinitializing.')
-        current_lr = self.optimizer.param_groups[0]['lr']
-        weight_decay = getattr(self, 'weight_decay', None)
-
-        # Rebuild the same decay/no-decay parameter grouping used in
-        # `_setup_optimizer_and_scheduler` -- otherwise AdamW's default
-        # weight_decay silently applies to every parameter (including
-        # biases/norm weights that were deliberately excluded), changing
-        # the optimization objective for the rest of training.
-        if weight_decay is not None:
-            decay, no_decay = [], []
-            for name, param in self.vla.named_parameters():
-                if not param.requires_grad:
-                    continue
-                if param.ndim <= 1 or name.endswith('.bias'):
-                    no_decay.append(param)
-                else:
-                    decay.append(param)
-            groups = [{
-                'params': decay,
-                'weight_decay': weight_decay
-            }, {
-                'params': no_decay,
-                'weight_decay': 0.0
-            }]
-        else:
-            groups = [
-                p for p in self.vla.parameters() if p.requires_grad
-            ]
-
-        self.optimizer = torch.optim.AdamW(groups, lr=current_lr)
+        last_lrs = self.lr_scheduler.get_last_lr()
+        self.optimizer = self.lr_scheduler.build_optimizer(self)
+        for group, lr in zip(self.optimizer.param_groups, last_lrs):
+            group['lr'] = lr
+        self.lr_scheduler.bind_optimizer(self.optimizer)
+        self.lr_scheduler.prepare_step(self)
         self.optimizer_state_loaded = False
-        if self.lr_scheduler and hasattr(self.lr_scheduler, 'optimizer'):
-            self.lr_scheduler.optimizer = self.optimizer
 
     def _save_and_sync(self, loss_value: float = None):
         """Save checkpoint and synchronize.
