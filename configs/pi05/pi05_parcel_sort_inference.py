@@ -16,7 +16,7 @@
 _JOINT_DIM = 28
 _MODEL_ACTION_DIM = 32
 _ACTION_HORIZON = 50
-_NORM_TYPE = 'quantile'
+_NORM_TYPE = 'min_max'
 
 inference_model = dict(
     type='PI05FlowMatching',
