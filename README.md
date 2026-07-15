@@ -18,6 +18,44 @@ English | [简体中文](README_zh-CN.md) | [日本語](README_ja.md)
 
 </div>
 
+## 本分支（fsdp）快速上手
+
+### 1. 创建 conda 环境并安装依赖
+
+```bash
+conda create -n fluxvla_p1p99 python=3.10 -y
+conda activate fluxvla_p1p99
+bash scripts/install_env.sh full        # 仅训练+仿真: sim-only；仅真机部署: real-only
+```
+
+`scripts/install_env.sh` 不会自己创建 conda 环境，需要先 `conda activate` 到目标环境再运行；`--with-ros2` 可以额外装 ROS2 Jazzy 用于真机部署。
+
+### 2. 启动训练
+
+```bash
+conda activate fluxvla_p1p99
+bash scripts/train.sh
+```
+
+`scripts/train.sh` 现在是写死的单机 8 卡配置（`NPROC_PER_NODE=8`、`CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`），不再依赖环境变量兜底（之前因为环境变量没设置，脚本默默退化成单卡导致过 FSDP 报错，故去掉了这层自动探测）。断点续训用 `RESUME_FROM=<ckpt路径> bash scripts/train.sh`。
+
+### 3. 部署到真机
+
+```bash
+cd deploy
+./launch.sh   # 参数集中在 launch.sh 顶部，改模型/推理模式/安全阈值直接改那里
+```
+
+详细的关节顺序约定、安全联锁条件见 [`deploy/README.md`](deploy/README.md)。
+
+### 4. 当前分支相对官方改了什么
+
+- 合并了官方 `v0.1.4`（`merge/upstream-v0.1.4`），并重新对齐了 FSDP/deploy 相关的本地改动
+- 新增 FSDP 训练支持（`fluxvla/engines/runners/fsdp_train_runner.py`），修复了 checkpoint/resume/metrics 的相关 bug
+- 新增 `pi05_parcel_sort` 真机部署栈（ROS2、RTC、CFG/advantage guidance），见 `deploy/`
+- 训练侧新增 mask/noise 数据增强（`RandomMaskImages`、`AddStateGaussianNoise`）
+- `scripts/install_env.sh` 合并了训练和部署的安装脚本（原来分开的 `deploy/install_env.sh` 已并入）
+
 FluxVLA Engine is a full-stack, end-to-end engineering platform for deploying embodied intelligence applications. Built on the core design principles of unified configuration, standardized interfaces, module decoupling, and deployability, it creates a complete engineering loop from data to real-device deployment. With the goal of providing a standardized industry–academia–research foundation, it significantly lowers the engineering barrier for VLA research and development.
 
 ## Framework

@@ -1,39 +1,33 @@
 #!/bin/bash
-# Unified launcher for single-node or multi-node distributed training.
-# Auto-detects common distributed environment variable conventions:
-#   - Standard torchrun / ali-style: NPROC_PER_NODE, WORLD_SIZE, RANK,
-#     MASTER_ADDR, MASTER_PORT
-#   - Vol-platform: MLP_WORKER_GPU, MLP_WORKER_NUM, MLP_ROLE_INDEX,
-#     MLP_WORKER_0_HOST, MLP_WORKER_0_PORT
-# Falls back to a sensible single-node default when none are set.
-#
-# WANDB_API_KEY must be set in the calling shell environment (e.g. in your
-# ~/.bashrc or CI secrets) -- never hardcode it here, this file is meant
-# to be committed -- unless WANDB_MODE is set to something other than
-# "online" (e.g. "disabled" or "offline").
+# Single-node, 8-GPU launcher for pi05_parcel_sort training.
 
 set -euo pipefail
 
-WANDB_MODE="${WANDB_MODE:-online}"
-if [[ "${WANDB_MODE}" == "online" ]]; then
-  : "${WANDB_API_KEY:?WANDB_API_KEY is not set. Export it in your shell before running this script, or set WANDB_MODE=offline/disabled to skip wandb.}"
-  export WANDB_API_KEY
+export WANDB_API_KEY=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
+if [[ -z "${WANDB_API_KEY}" ]]; then
+  echo "WANDB_API_KEY is empty -- set it in scripts/train.sh before running." >&2
+  exit 1
 fi
-export WANDB_MODE
+export WANDB_MODE=online
 
-export PATH=/data/wqz/miniconda/envs/fluxvla/bin:$PATH
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+FLUXVLA_ENV_PREFIX=/data/wqz/miniconda/envs/fluxvla_p1p99
+export PATH="${FLUXVLA_ENV_PREFIX}/bin:$PATH"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-CONFIG=${1:-"configs/gr00t/gr00t_eagle_3b_libero_10_full_finetune.py"}
-WORK_DIR=${2:-"work_dirs/gr00t_eagle_3b_libero_10_full_finetune"}
+CONFIG="configs/pi05/pi05_parcel_sort.py"
+WORK_DIR="work_dirs/pi05_parcel_sort"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-${MLP_WORKER_GPU:-1}}"
-WORLD_SIZE="${WORLD_SIZE:-${MLP_WORKER_NUM:-1}}"
-NODE_RANK="${RANK:-${MLP_ROLE_INDEX:-0}}"
-MASTER_ADDR="${MASTER_ADDR:-${MLP_WORKER_0_HOST:-localhost}}"
-MASTER_PORT="${MASTER_PORT:-${MLP_WORKER_0_PORT:-29500}}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-export CUDA_VISIBLE_DEVICES
+NPROC_PER_NODE=8
+WORLD_SIZE=1
+NODE_RANK=0
+MASTER_ADDR=localhost
+MASTER_PORT=29500
+
+RESUME_ARGS=()
+if [[ -n "${RESUME_FROM:-}" ]]; then
+  RESUME_ARGS=(--resume-from "${RESUME_FROM}")
+fi
 
 torchrun \
   --nproc-per-node="${NPROC_PER_NODE}" \
@@ -44,4 +38,6 @@ torchrun \
   "scripts/train.py" \
   --config "${CONFIG}" \
   --work-dir "${WORK_DIR}" \
-  ${@:3}
+  "${RESUME_ARGS[@]}" \
+  --cfg-options 'runner.metric.active_trackers=("jsonl","wandb")' \
+  'model.pretrained_name_or_path=./checkpoints/pi05_base/model.safetensors'

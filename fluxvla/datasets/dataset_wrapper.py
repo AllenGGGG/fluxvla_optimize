@@ -58,6 +58,16 @@ class DistributedRepeatingDataset(IterableDataset):
             multiple of this dimension. Defaults to None.
         statistics_overrides (dict, optional): Nested statistic values to
             override after collecting dataset statistics.
+        episode_stratified_shuffle (bool): Whether to reorder each shuffled
+            worker shard so that consecutive samples come from distinct
+            episodes (round-robin over episodes) whenever the wrapped
+            dataset(s) expose an ``episode_index`` column. This raises
+            per-batch episode diversity above what a plain global shuffle
+            gives when the episode count is small relative to batch size.
+            Silently falls back to the plain shuffle order when episode
+            metadata cannot be extracted (e.g. grouped datasets, or a
+            dataset type without an ``episode_index`` column). Defaults to
+            True.
     """
 
     def __init__(self,
@@ -71,7 +81,8 @@ class DistributedRepeatingDataset(IterableDataset):
                  dim: Optional[int] = None,
                  dataset_statistics: Optional[Dict] = None,
                  statistics_overrides: Optional[Dict] = None,
-                 dataset_statistics_path: Optional[str] = None) -> None:
+                 dataset_statistics_path: Optional[str] = None,
+                 episode_stratified_shuffle: bool = True) -> None:
         if (dataset_statistics is not None
                 and dataset_statistics_path is not None):
             raise ValueError(
@@ -85,6 +96,8 @@ class DistributedRepeatingDataset(IterableDataset):
         self.seed = seed
         self.statistic_name = statistic_name
         self.dim = dim
+        self.episode_stratified_shuffle = episode_stratified_shuffle
+        self._episode_keys: Optional[np.ndarray] = None
         # Determine the dataset format and initialize accordingly
         if isinstance(datasets, dict) and not (isinstance(
                 list(datasets.values())[0], list) if datasets else False):
@@ -209,10 +222,103 @@ class DistributedRepeatingDataset(IterableDataset):
                 self._apply_statistics_overrides(self.dataset_statistics,
                                                  statistics_overrides)
 
+        if self.episode_stratified_shuffle:
+            self._episode_keys = self._build_episode_keys()
+
         # Get the rank and world size from the overwatch
         self.rank = overwatch.rank()
         self.world_size = overwatch.world_size()
         self._epoch = 0
+
+    def _extract_episode_index_column(self, ds) -> Optional[np.ndarray]:
+        """Best-effort extraction of a per-row ``episode_index`` column.
+
+        Returns None (rather than raising) whenever the wrapped dataset
+        doesn't expose the column in the expected shape, so callers can
+        gracefully fall back to the plain shuffle order.
+        """
+        underlying = getattr(ds, 'dataset', None)
+        column_names = getattr(underlying, 'column_names', None)
+        if underlying is None or column_names is None or \
+                'episode_index' not in column_names:
+            return None
+        try:
+            column = np.asarray(underlying['episode_index']).reshape(-1)
+        except Exception:
+            return None
+        if len(column) != len(ds):
+            return None
+        return column.astype(np.int64)
+
+    def _build_episode_keys(self) -> Optional[np.ndarray]:
+        """Build a global array mapping each virtual index to an episode key.
+
+        Episode indices are only unique within a single underlying dataset,
+        so each dataset's episode indices are offset by a large constant to
+        keep episodes from different datasets from colliding. Returns None
+        (disabling episode-stratified reordering) whenever the mapping can't
+        be built for every underlying dataset, e.g. grouped datasets or a
+        dataset type that doesn't expose ``episode_index``.
+        """
+        # A single episode_index column is at most a few million; this is
+        # large enough that per-dataset key ranges never overlap.
+        dataset_key_stride = 10_000_000
+
+        if self.is_grouped:
+            # Not supported yet -- grouped datasets aren't used by any
+            # current training config; fall back to the plain shuffle order.
+            return None
+        elif self.is_list:
+            parts = []
+            for dataset_idx, ds in enumerate(self.datasets):
+                column = self._extract_episode_index_column(ds)
+                if column is None:
+                    return None
+                parts.append(column + dataset_idx * dataset_key_stride)
+            return np.concatenate(parts)
+        else:
+            return self._extract_episode_index_column(self.dataset)
+
+    def _episode_interleave(self, shard: List[int],
+                            rng: np.random.Generator) -> List[int]:
+        """Reorder a worker's shard so consecutive samples span distinct
+        episodes as much as possible (round-robin over episode buckets),
+        instead of relying on a plain shuffle to avoid same-episode
+        collisions within a batch by chance.
+
+        Args:
+            shard (list[int]): Global indices assigned to this
+                (rank, worker), already shuffled.
+            rng (np.random.Generator): RNG used to randomize the order in
+                which episode buckets are visited.
+
+        Returns:
+            list[int]: ``shard`` reordered so that any window no larger
+            than the number of distinct episodes in ``shard`` contains no
+            repeated episode.
+        """
+        if self._episode_keys is None or len(shard) == 0:
+            return shard
+
+        shard_arr = np.asarray(shard)
+        keys = self._episode_keys[shard_arr]
+        order = np.argsort(keys, kind='stable')
+        sorted_keys = keys[order]
+        boundaries = np.flatnonzero(np.diff(sorted_keys)) + 1
+        groups = np.split(order, boundaries)
+
+        group_order = rng.permutation(len(groups))
+        max_group_len = max(len(g) for g in groups)
+        interleaved = np.empty(len(order), dtype=order.dtype)
+        pos = 0
+        for round_idx in range(max_group_len):
+            for group_idx in group_order:
+                group = groups[group_idx]
+                if round_idx < len(group):
+                    interleaved[pos] = group[round_idx]
+                    pos += 1
+
+        return shard_arr[interleaved].tolist()
 
     def _apply_statistics_overrides(self, statistics: Dict,
                                     overrides: Dict) -> None:
@@ -554,13 +660,21 @@ class DistributedRepeatingDataset(IterableDataset):
 
             # Create indices for the entire virtual concatenated dataset
             indices = np.arange(self.total_len)
+            epoch_offset = epoch if self.reshuffle_each_epoch else 0
+            rng = np.random.default_rng(self.seed + epoch_offset)
             if self.shuffle:
-                epoch_offset = epoch if self.reshuffle_each_epoch else 0
-                rng = np.random.default_rng(self.seed + epoch_offset)
                 rng.shuffle(indices)
 
             # Distribute indices across distributed ranks and workers.
             shard = indices[total_rank::total_world].tolist()
+
+            if self.shuffle and self._episode_keys is not None:
+                # A plain global shuffle still leaves a nontrivial chance of
+                # the same episode landing twice in one batch when the
+                # episode count is small relative to batch size; round-robin
+                # over episode buckets pushes per-batch episode diversity up
+                # to the true maximum.
+                shard = self._episode_interleave(shard, rng)
 
             for idx in shard:
                 yield self._get_item_from_global_idx(idx)
