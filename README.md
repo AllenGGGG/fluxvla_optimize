@@ -23,12 +23,10 @@ English | [简体中文](README_zh-CN.md) | [日本語](README_ja.md)
 ### 1. 创建 conda 环境并安装依赖
 
 ```bash
-conda create -n fluxvla_p1p99 python=3.10 -y
-conda activate fluxvla_p1p99
 bash scripts/install_env.sh full        # 仅训练+仿真: sim-only；仅真机部署: real-only
 ```
 
-`scripts/install_env.sh` 不会自己创建 conda 环境，需要先 `conda activate` 到目标环境再运行；`--with-ros2` 可以额外装 ROS2 Jazzy 用于真机部署。
+没有已激活的 conda 环境时（或当前激活的是 base），`scripts/install_env.sh` 会自动创建/复用并激活目标环境（默认环境名 `fluxvla`，Python 3.12，可用 `--env-name`/`--python-version` 或 `FLUXVLA_CONDA_ENV_NAME`/`FLUXVLA_PYTHON_VERSION` 覆盖；目标环境已存在就直接激活它，不存在才新建）。如果已经 `conda activate` 到某个非 base 的环境，脚本会直接复用该环境安装。
 
 ### 2. 启动训练
 
@@ -131,14 +129,19 @@ Choose one of the following installation paths:
 ### Recommended: one-command installer
 
 ```bash
-conda create -n fluxvla python=3.10 -y
-conda activate fluxvla
-
 # Choose one mode: sim-only, real-only, or full.
 bash scripts/install_env.sh sim-only
 # bash scripts/install_env.sh real-only
 # bash scripts/install_env.sh full
 ```
+
+If no conda environment is currently active, the installer creates and
+activates one for you (default name `fluxvla`, Python 3.12; override with
+`--env-name`/`--python-version` or `FLUXVLA_CONDA_ENV_NAME`/`FLUXVLA_PYTHON_VERSION`).
+If you already ran `conda activate <env>`, the installer reuses that
+environment instead. If an environment with the target name already exists
+but isn't active, the installer stops and asks you to `conda activate` it
+first, rather than silently installing into the wrong place.
 
 <details>
 <summary><b>If the installer has issues: check modes and CUDA profile selection</b></summary>

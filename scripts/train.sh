@@ -3,14 +3,14 @@
 
 set -euo pipefail
 
-export WANDB_API_KEY=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
-if [[ -z "${WANDB_API_KEY}" ]]; then
-  echo "WANDB_API_KEY is empty -- set it in scripts/train.sh before running." >&2
+if [[ -z "${WANDB_API_KEY:-}" ]]; then
+  echo "WANDB_API_KEY is empty -- export it in your shell before running," >&2
+  echo "or run: export WANDB_MODE=disabled" >&2
   exit 1
 fi
 export WANDB_MODE=online
 
-FLUXVLA_ENV_PREFIX=/data/wqz/miniconda/envs/fluxvla_p1p99
+FLUXVLA_ENV_PREFIX=/data/wqz/miniconda/envs/fluxvla
 export PATH="${FLUXVLA_ENV_PREFIX}/bin:$PATH"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
