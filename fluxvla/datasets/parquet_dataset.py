@@ -15,7 +15,7 @@ import json
 import os
 import shlex
 from collections import deque
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -109,8 +109,13 @@ class ParquetDataset(Dataset):
         all_tasks = []
         all_episodes = []
         info_list = []
+        # (dataset_idx, episode_index) -> episodes.jsonl record (may include
+        # advantage/intervention if `scripts/migrate_episode_advantage.py`
+        # has been run against this dataset root).
+        episode_metadata_by_key: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
-        for dataset_root, root in zip(data_root_path, meta_root):
+        for dataset_idx, (dataset_root, root) in enumerate(
+                zip(data_root_path, meta_root)):
             info_path = os.path.join(root, 'info.json')
             assert os.path.exists(info_path), \
                 f'Metadata file not found at {info_path}'
@@ -140,12 +145,17 @@ class ParquetDataset(Dataset):
             assert os.path.exists(episodes_path), \
                 f'Episodes file not found at {episodes_path}'
             with open(episodes_path, 'r', encoding='utf-8') as f:
-                all_episodes.extend([json.loads(line) for line in f])
+                root_episodes = [json.loads(line) for line in f]
+            all_episodes.extend(root_episodes)
+            for record in root_episodes:
+                episode_metadata_by_key[(dataset_idx,
+                                         record['episode_index'])] = record
 
         self.info = info_list
         self.stats = all_stats
         self.tasks = all_tasks
         self.episodes = all_episodes
+        self.episode_metadata_by_key = episode_metadata_by_key
         # Summarize all data_root
         datasets = []
         dataset_sizes = []  # Record the size of each dataset
@@ -374,6 +384,12 @@ class ParquetDataset(Dataset):
             data['index'] = np.array(index, dtype=np.int64)
         data['task_description'] = self._get_task_name(dataset_idx, index)
         data['data_root'] = self.data_root_path[dataset_idx]
+        # advantage/intervention/length, if migrated into episodes.jsonl by
+        # scripts/migrate_episode_advantage.py; {} otherwise. Consumed by
+        # EpisodeMetadataPrompter to build the "Advantage: ..." / "Speed: ..."
+        # prompt text.
+        data['episode_metadata'] = self.episode_metadata_by_key.get(
+            (dataset_idx, data['episode_index']), {})
         for transform in self.transforms:
             data = transform(data)
 

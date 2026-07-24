@@ -19,7 +19,7 @@ ensure consistent formatting across turns and models, with special
 handling for different roles (e.g., human vs. LLM).
 """
 from abc import ABC, abstractmethod
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -271,6 +271,139 @@ class ParquetPrompter:
         self.turn_count += 1
 
         return wrapped_message
+
+
+@TRANSFORMS.register_module()
+class EpisodeMetadataPrompter:
+    """Appends pi0.7-style episode metadata to `task_description`.
+
+    Must run BEFORE any transform that wraps `task_description` into the
+    final `prompt` string (e.g. `ParquetPrompter`, `PreparePromptWithState`),
+    mirroring the pi0.7 prompt layout where metadata sits alongside the task
+    text inside the context, not after an "Out:"/"Action:" completion
+    marker:
+
+        Task: peel vegetables. Subtask: pick up the peeler.
+        Speed: 8000. Advantage: true. Control Mode: joint.
+
+    This is a general-purpose transform (not task/embodiment-specific): the
+    same class is used for both training (with dropout) and eval (fixed
+    desired values, no dropout) by toggling `training`.
+
+    Speed text:
+        Two-step derivation. (1) `VSTADataset` samples a
+        `tempo_speed` multiplier and resamples the action window with it
+        (window-level VSTA augmentation). (2) This transform combines that
+        `tempo_speed` with the episode's *original* length (from
+        `episode_metadata['length']`, i.e. `episodes.jsonl`) to estimate the
+        actual execution length after augmentation:
+            estimated_steps = original_length / tempo_speed
+        (tempo_speed > 1 -> fewer steps -> faster execution, matching the
+        q/p convention used by the VSTA resampler), then buckets it to the
+        nearest `speed_bucket_size` steps. Samples without `tempo_speed` (no
+        VSTA augmentation applied) use `original_length` directly.
+
+    Advantage text:
+        Read verbatim from `episode_metadata['advantage']` (1/0). 
+
+    Args:
+        training (bool): If True, apply block/field dropout using sampled
+            values from `inputs`. If False (eval), use `desired_speed` /
+            `desired_advantage` verbatim and never drop anything.
+        speed_bucket_size (int): Bucket width in timesteps for the Speed
+            field (pi0.7 uses 500).
+        block_dropout_prob (float): Probability of omitting the entire
+            metadata block (training only).
+        field_dropout_prob (float): Probability of omitting Speed/Advantage
+            individually (training only; Control Mode is never dropped).
+        control_mode (str | None): Static text identifier (e.g. 'joint',
+            'ee'). If None, the Control Mode field is omitted entirely.
+        desired_speed (int | None): Eval-only fixed Speed bucket value.
+        desired_advantage (bool | None): Eval-only fixed Advantage value.
+        seed (int | None): RNG seed for dropout sampling.
+    """
+
+    def __init__(self,
+                 training: bool = True,
+                 speed_bucket_size: int = 500,
+                 block_dropout_prob: float = 0.15,
+                 field_dropout_prob: float = 0.05,
+                 control_mode: Optional[str] = 'joint',
+                 desired_speed: Optional[int] = None,
+                 desired_advantage: Optional[bool] = None,
+                 seed: Optional[int] = None,
+                 *args,
+                 **kwargs) -> None:
+        self.training = training
+        self.speed_bucket_size = speed_bucket_size
+        self.block_dropout_prob = block_dropout_prob
+        self.field_dropout_prob = field_dropout_prob
+        self.control_mode = control_mode
+        self.desired_speed = desired_speed
+        self.desired_advantage = desired_advantage
+        self._rng = np.random.default_rng(seed)
+
+    def _speed_bucket(self, inputs: Dict[str, Any]) -> Optional[int]:
+        if not self.training:
+            return self.desired_speed
+
+        episode_metadata = inputs.get('episode_metadata') or {}
+        original_length = episode_metadata.get('length')
+        if original_length is None:
+            return None
+
+        tempo_speed = inputs.get('tempo_speed', 1.0) or 1.0
+        estimated_steps = original_length / tempo_speed
+        bucket = round(estimated_steps / self.speed_bucket_size)
+        return int(bucket) * self.speed_bucket_size
+
+    def _advantage(self, inputs: Dict[str, Any]) -> Optional[bool]:
+        if not self.training:
+            return self.desired_advantage
+
+        episode_metadata = inputs.get('episode_metadata') or {}
+        advantage = episode_metadata.get('advantage')
+        if advantage is None:
+            return None
+        return bool(advantage)
+
+    def _keep_field(self) -> bool:
+        if not self.training:
+            return True
+        return self._rng.random() >= self.field_dropout_prob
+
+    def __call__(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        assert 'task_description' in inputs, \
+            "Data must contain 'task_description' key."
+        assert 'prompt' not in inputs, (
+            'EpisodeMetadataPrompter must run BEFORE the transform that '
+            "builds inputs['prompt'] (e.g. ParquetPrompter, "
+            'PreparePromptWithState) — it appends to task_description, '
+            'which is read too late otherwise and the metadata silently '
+            'never reaches the final prompt.')
+
+        if self.training and self._rng.random() < self.block_dropout_prob:
+            return inputs
+
+        parts = []
+
+        speed_bucket = self._speed_bucket(inputs)
+        if speed_bucket is not None and self._keep_field():
+            parts.append(f'Speed: {speed_bucket}.')
+
+        advantage = self._advantage(inputs)
+        if advantage is not None and self._keep_field():
+            parts.append(f"Advantage: {'true' if advantage else 'false'}.")
+
+        if self.control_mode is not None:
+            parts.append(f'Control Mode: {self.control_mode}.')
+
+        if parts:
+            task_description = str(inputs['task_description']).rstrip()
+            inputs['task_description'] = (
+                f"{task_description} {' '.join(parts)}")
+
+        return inputs
 
 
 @TRANSFORMS.register_module()
