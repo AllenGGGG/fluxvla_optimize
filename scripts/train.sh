@@ -15,8 +15,8 @@ export PATH="${FLUXVLA_ENV_PREFIX}/bin:$PATH"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-CONFIG="configs/pi05/pi05_parcel_sort.py"
-WORK_DIR="work_dirs/pi05_parcel_sort"
+CONFIG="configs/pi05/pi05_parcel_sort_recap.py"
+WORK_DIR="work_dirs/pi05_parcel_sort_recap"
 
 NPROC_PER_NODE=8
 WORLD_SIZE=1
@@ -39,5 +39,4 @@ torchrun \
   --config "${CONFIG}" \
   --work-dir "${WORK_DIR}" \
   "${RESUME_ARGS[@]}" \
-  --cfg-options 'runner.metric.active_trackers=("jsonl","wandb")' \
-  'model.pretrained_name_or_path=./checkpoints/pi05_base/model.safetensors'
+  --cfg-options 'runner.metric.active_trackers=("jsonl","wandb")'
