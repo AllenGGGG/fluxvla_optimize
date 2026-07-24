@@ -344,6 +344,9 @@ class NormalizeStatesAndActions:
             that contains the state information.
         action_key (str | None): The key in the data dictionary
             that contains the action information. If None, actions are skipped.
+        state_norm_mask (List[bool], optional): Per-dim mask selecting which
+            `data['states']` entries get normalized (e.g. skip
+            `SelectJointDims` padding dims). Mirrors `action_norm_mask`.
     """
 
     def __init__(self,
@@ -355,6 +358,7 @@ class NormalizeStatesAndActions:
                  state_norm_type: str = None,
                  action_norm_type: str = None,
                  pad_value: float = 0.0,
+                 state_norm_mask: List[bool] = None,
                  action_norm_mask: List[bool] = None,
                  clip_norm: bool = False,
                  normalize_states: bool = True,
@@ -370,6 +374,12 @@ class NormalizeStatesAndActions:
         self.state_dim = state_dim
         self.clip_norm = clip_norm
         self.normalize_states = normalize_states
+        if state_norm_mask is not None:
+            assert len(state_norm_mask) == state_dim, \
+                f'State norm mask must be of length {state_dim}'
+            self.state_norm_mask = state_norm_mask
+        else:
+            self.state_norm_mask = None
         if action_norm_mask is not None:
             assert len(action_norm_mask) == action_dim, \
                 f'Action norm mask must be of length {action_dim}'
@@ -393,7 +403,8 @@ class NormalizeStatesAndActions:
         if needs_state_stats:
             state_stats = data['stats'][self.state_key]
             states = self._normalize_by_type(states, state_stats,
-                                             self.state_norm_type)
+                                             self.state_norm_type,
+                                             self.state_norm_mask)
         data['states'] = states
 
         if actions is not None:
