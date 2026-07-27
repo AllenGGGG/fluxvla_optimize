@@ -12,6 +12,7 @@ from .action_queue import ActionQueue
 from .config import ChunkSchedulerConfig
 from .latency_tracker import LatencyTracker
 from .scheduler import ChunkScheduler
+from .serial import SerialInferenceBackend
 
 __all__ = [
     "InferBackend",
@@ -19,4 +20,5 @@ __all__ = [
     "ChunkSchedulerConfig",
     "LatencyTracker",
     "ChunkScheduler",
+    "SerialInferenceBackend",
 ]

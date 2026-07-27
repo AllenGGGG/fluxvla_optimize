@@ -682,6 +682,15 @@ class VSTAPackedParquetDatasetV3(PackedParquetDatasetV3):
             # index, so the same config stays correct even if a different
             # dataset's recorder config orders its joints differently.
             'info': data['info'],
+            # Per-frame advantage parquet column (0/1), written directly by
+            # ros2_data_collection's recorder -- consumed by
+            # EpisodeMetadataPrompter._advantage(). Must be threaded through
+            # explicitly here: unlike VSTADataset._build_sample's `dict(data)`
+            # copy, this dict is built from scratch, so any column not listed
+            # here silently never reaches _post_transforms. Absent (older
+            # datasets with no advantage column) becomes None, which
+            # EpisodeMetadataPrompter already treats as "omit the field".
+            'advantage': data.get('advantage'),
         }
 
         for transform in self._post_transforms:

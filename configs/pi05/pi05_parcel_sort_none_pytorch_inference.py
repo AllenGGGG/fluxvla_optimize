@@ -11,36 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Real-robot inference config for the pi05_parcel_sort checkpoint, for
-# deploy/'s rtc_method="prefix" (see deploy/config.py's VALID_RTC_METHODS).
-#
-# Identical to pi05_parcel_sort_inference.py except inference_model.type:
-# PI05FlowMatchingRTCInference (fluxvla/models/vlas/
-# pi05_flowmatching_inference_rtc.py) is a Triton/CUDA-graph-accelerated
-# variant that implements real RTC prefix guidance (prev_actions/prefix_len
-# are baked into the same captured graph as data, not Python branching);
-# plain PI05FlowMatchingInference silently ignores those kwargs. It only
-# supports rtc_config['method']='prefix' (raises NotImplementedError for
-# 'guidance') -- see pi05_parcel_sort_inference_guidance_rtc.py for that case.
-
-_base_ = ['./pi05_parcel_sort_inference.py']
+# Complete plain PyTorch eager inference config for the parcel-sort checkpoint.
 
 _JOINT_DIM = 28
 _MODEL_ACTION_DIM = 32
 _ACTION_HORIZON = 50
-_NUM_VIEWS = 3
+_NORM_TYPE = 'min_max'
 
 inference_model = dict(
-    _delete_=True,
-    type='PI05FlowMatchingRTCInference',
-    num_views=_NUM_VIEWS,
-    # Must be >= dataset.transforms' ProcessPrompts.max_len (200 below):
-    # the Triton CUDA-graph prompt buffer overflows if a real prompt (task
-    # text + 32-value discretized state) exceeds this bound. The class
-    # default of 48 is far too small for PreparePromptWithState's prompts.
-    triton_max_prompt_len=200,
+    type='PI05FlowMatching',
     llm_backbone=dict(
-        type='ConditionGemmaInferenceModel',
+        type='ConditionGemmaModel',
         adarms_cond_dim=None,
         attention_bias=False,
         attention_dropout=0.0,
@@ -64,7 +45,7 @@ inference_model = dict(
         vocab_size=257152,
     ),
     vision_backbone=dict(
-        type='SigLIPViTBackboneInference',
+        type='SigLIPViTBackbone',
         vision_backbone_id='siglip_224',
         vision_config=dict(
             attention_dropout=0.0,
@@ -85,25 +66,21 @@ inference_model = dict(
         ),
     ),
     projector=dict(
-        type='LinearProjectorInference',
+        type='LinearProjector',
         in_dim=1152,
         out_dim=2048,
     ),
     proj_width=1024,
     n_action_steps=_ACTION_HORIZON,
     action_in_proj=dict(
-        type='LinearProjectorInference', in_dim=_MODEL_ACTION_DIM,
-        out_dim=1024),
+        type='LinearProjector', in_dim=_MODEL_ACTION_DIM, out_dim=1024),
     action_out_proj=dict(
-        type='LinearProjectorInference', in_dim=1024,
-        out_dim=_MODEL_ACTION_DIM),
-    time_mlp_in=dict(
-        type='LinearProjectorInference', in_dim=1024, out_dim=1024),
-    time_mlp_out=dict(
-        type='LinearProjectorInference', in_dim=1024, out_dim=1024),
+        type='LinearProjector', in_dim=1024, out_dim=_MODEL_ACTION_DIM),
+    time_mlp_in=dict(type='LinearProjector', in_dim=1024, out_dim=1024),
+    time_mlp_out=dict(type='LinearProjector', in_dim=1024, out_dim=1024),
     max_action_dim=_MODEL_ACTION_DIM,
     llm_expert=dict(
-        type='ConditionGemmaInferenceModel',
+        type='ConditionGemmaModel',
         attention_bias=False,
         adarms_cond_dim=1024,
         attention_dropout=0.0,
@@ -145,7 +122,78 @@ inference_model = dict(
         'action_out_proj.projector': 'action_out_proj',
         'llm_backbone.embed_tokens': 'paligemma_with_expert.paligemma.lm_head',
     },
+    params_to_change_dtype=[
+        'llm_expert.llm.model.layers',
+        'vlm_backbone.vlm.model.language_model.layers',
+        'vlm_backbone.vlm.model.vision_tower',
+        'vlm_backbone.vlm.model.multi_modal_projector',
+    ],
     ori_action_dim=_JOINT_DIM,
 )
 
-inference_options = dict(rtc_method='prefix')
+# Same transform pipeline as pi05_parcel_sort_recap.py's training dataset
+# (norm_type, EpisodeMetadataPrompter's advantage-conditioning text), reused
+# verbatim via PrivateInferenceDataset (fluxvla/datasets/
+# parquet_dataset.py:531) so a training-side transform change propagates
+# automatically instead of drifting. desired_advantage=True is a static
+# eval-time prompt condition, not a runtime toggle -- see deploy/model.py's
+# predict_chunk, which used to switch this via a CFG dual-pass; that
+# mechanism is gone, replaced by this transform matching training's own
+# "Advantage: true/false." text exactly (see
+# fluxvla/transforms/prompters.py's EpisodeMetadataPrompter).
+dataset = dict(
+    type='PrivateInferenceDataset',
+    img_keys=[
+        'observation.images.base_0_rgb',
+        'observation.images.left_wrist_0_rgb',
+        'observation.images.right_wrist_0_rgb',
+    ],
+    transforms=[
+        dict(
+            type='NormalizeStatesAndActions',
+            action_dim=_MODEL_ACTION_DIM,
+            state_dim=_MODEL_ACTION_DIM,
+            state_key='proprio',
+            action_key='action',
+            norm_type=_NORM_TYPE,
+            action_norm_mask=[True] * _JOINT_DIM + [False] *
+            (_MODEL_ACTION_DIM - _JOINT_DIM)),
+        dict(
+            type='EpisodeMetadataPrompter',
+            training=False,
+            control_mode='joint',
+            desired_advantage=True),
+        dict(type='PreparePromptWithState'),
+        dict(
+            type='ProcessPrompts',
+            max_len=200,
+            tokenizer=dict(
+                type='PretrainedTokenizer',
+                model_path='checkpoints/pi05_base',
+            )),
+        dict(type='ResizeImages', height=224, width=224),
+        dict(type='SimpleNormalizeImages'),
+    ],
+)
+
+denormalize_action = dict(
+    type='DenormalizePrivateAction',
+    norm_type=_NORM_TYPE,
+    action_dim=_MODEL_ACTION_DIM,
+    action_norm_mask=[True] * _JOINT_DIM + [False] *
+    (_MODEL_ACTION_DIM - _JOINT_DIM),
+)
+
+inference_options = dict(
+    num_inference_steps_override=10,
+    rtc_method='none', # none guidance
+    rtc_execution_horizon=10,
+    # 0 = automatically keep inference-delay + 2 * RTC handoff steps.
+    rtc_replan_remaining=0,
+    chunk_publish_horizon=50,
+    # Keep the RTC guidance window at 10. RTC keeps the full 50-step model
+    # chunk so latency alignment does not consume the guidance prefix.
+    rtc_publish_horizon=0,
+    rtc_max_guidance_weight=5.0,
+    rtc_schedule='linear',
+)

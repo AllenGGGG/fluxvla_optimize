@@ -331,6 +331,8 @@ def matmul_rope_qkv(
                 (offs_j < (num_heads + 2) * head_dim),
                 other=0)
             accumulator = tl.dot(x, w, accumulator)
+        # Eager Linear returns BF16 before Q/K enter RoPE.
+        accumulator = accumulator.to(tl.bfloat16)
         if start_j < (num_heads + 1) * head_dim:
             x0, x1 = tl.split(
                 accumulator.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))

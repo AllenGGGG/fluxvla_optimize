@@ -304,7 +304,14 @@ class EpisodeMetadataPrompter:
         VSTA augmentation applied) use `original_length` directly.
 
     Advantage text:
-        Read verbatim from `episode_metadata['advantage']` (1/0). 
+        Read verbatim from the per-frame `inputs['advantage']` column (1/0),
+        written directly into the main parquet by the data-collection pipeline
+        (ros2_data_collection's recorder_node / Phase 2's VLM boundary
+        correction) -- not from `episode_metadata`, which only ever held a
+        coarser episode-level judgement and no longer carries advantage at
+        all. No merge step: HF `datasets.load_dataset('parquet', ...)` exposes
+        every parquet column verbatim in the row dict, so this value is
+        already present on `inputs` by the time this transform runs.
 
     Args:
         training (bool): If True, apply block/field dropout using sampled
@@ -361,8 +368,7 @@ class EpisodeMetadataPrompter:
         if not self.training:
             return self.desired_advantage
 
-        episode_metadata = inputs.get('episode_metadata') or {}
-        advantage = episode_metadata.get('advantage')
+        advantage = inputs.get('advantage')
         if advantage is None:
             return None
         return bool(advantage)

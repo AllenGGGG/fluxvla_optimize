@@ -606,8 +606,14 @@ class PI05FlowMatchingInference(PI05FlowMatching):
             torch.zeros(dec, dh, dtype=bf, device=dev),
             'gate_buf':
             torch.zeros(dec, dh, dtype=bf, device=dev),
+            # fp32: this buffer is the ODE integration state across all
+            # denoise steps. Keeping it bf16 would re-quantize x_t on every
+            # step's read-modify-write, compounding error ~90x over 10 steps
+            # vs. accumulating in fp32 (measured on a matched toy kernel).
+            # matmul_bias_small/matmul_small_bias_res cast their bf16-matmul
+            # operands explicitly, so this doesn't change matmul precision.
             'diffusion_noise':
-            torch.zeros(dec, ad, dtype=bf, device=dev),
+            torch.zeros(dec, ad, dtype=torch.float32, device=dev),
         }
 
     def _init_rope_table(self):
@@ -627,8 +633,7 @@ class PI05FlowMatchingInference(PI05FlowMatching):
             self._rope_table[:prefix_alloc])
 
     def _get_decoder_rope_weights(self, prompt_len):
-        start = (
-            self.num_views * self._visual_tokens_per_view + prompt_len - 1)
+        start = self.num_views * self._visual_tokens_per_view + prompt_len
         end = start + self._decoder_seq_len
         return self._rope_table[start:end]
 
@@ -641,11 +646,19 @@ class PI05FlowMatchingInference(PI05FlowMatching):
                    self._visual_token_downscale_factor)
 
     def _build_cuda_graph(self):
+        """Warm up/capture without consuming the first request inputs."""
         print('[Triton Inference] Recording CUDA Graph ...')
+        initial_noise = self._triton_bufs['diffusion_noise'].clone()
+        initial_encoder_x = self._triton_bufs['encoder_x'].clone()
         for _ in range(3):
+            self._triton_bufs['diffusion_noise'].copy_(initial_noise)
+            self._triton_bufs['encoder_x'].copy_(initial_encoder_x)
             self._run_forward()
         torch.cuda.synchronize()
 
+        self._triton_bufs['diffusion_noise'].copy_(initial_noise)
+        self._triton_bufs['encoder_x'].copy_(initial_encoder_x)
+        torch.cuda.synchronize()
         self._cuda_graph = torch.cuda.CUDAGraph()
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
@@ -654,6 +667,10 @@ class PI05FlowMatchingInference(PI05FlowMatching):
             self._cuda_graph.capture_end()
         torch.cuda.synchronize()
 
+        # _triton_forward replays once after this method returns. Restore the
+        # real request so the first replay is identical to subsequent calls.
+        self._triton_bufs['diffusion_noise'].copy_(initial_noise)
+        self._triton_bufs['encoder_x'].copy_(initial_encoder_x)
         self._cuda_graph_ready = True
         print('[Triton Inference] CUDA Graph recorded successfully!')
 
@@ -665,10 +682,10 @@ class PI05FlowMatchingInference(PI05FlowMatching):
             images_nhwc: images in [num_views, H, W, C] bfloat16 format.
             prompt_embeds: language embeddings [prompt_len, 2048] bfloat16.
             prompt_len: actual prompt token count (int).
-            diffusion_noise: initial noise [chunk_size, 32] bfloat16.
+            diffusion_noise: initial noise [chunk_size, 32] float32.
 
         Returns:
-            Denoised actions [chunk_size, 32] bfloat16.
+            Denoised actions [chunk_size, 32] float32.
         """
         self._triton_bufs['observation_images_normalized'].copy_(images_nhwc)
         start = self.num_views * self._visual_tokens_per_view
@@ -752,25 +769,34 @@ class PI05FlowMatchingInference(PI05FlowMatching):
                     flush=True)
 
         chunk_size = self.n_action_steps
+        # fp32 to match diffusion_noise's fp32 integration state (copy_ below
+        # upcasts bf16 input harmlessly, but sampling directly in fp32 avoids
+        # quantizing the initial noise before it even enters the ODE loop).
         if noise is None:
             noise_t = torch.randn(
                 chunk_size,
                 self.max_action_dim,
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
                 device=states.device)
         else:
-            noise_t = noise[0].to(dtype=torch.bfloat16)
+            noise_t = noise[0].to(dtype=torch.float32)
         if noise_t.shape[-1] < 32:
             pad = torch.zeros(
                 noise_t.shape[0],
                 32 - noise_t.shape[-1],
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
                 device=noise_t.device)
             noise_t = torch.cat([noise_t, pad], dim=-1)
 
         denoised = self._triton_forward(images_nhwc, lang_emb, prompt_len,
                                         noise_t)
-        result = denoised[:, :self.max_action_dim].unsqueeze(0).float()
+        # clone(): denoised is now fp32, so .float() below is a dtype-only
+        # no-op (same storage) instead of an implicit copy. denoised aliases
+        # the CUDA graph's static diffusion_noise buffer, which the next
+        # predict_action call overwrites in place on graph replay. Without
+        # an explicit copy, a caller holding this return value would see it
+        # silently change after the next inference call.
+        result = denoised[:, :self.max_action_dim].unsqueeze(0).float().clone()
 
         return result
 

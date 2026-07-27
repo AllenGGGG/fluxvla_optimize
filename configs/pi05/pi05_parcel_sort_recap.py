@@ -157,7 +157,7 @@ train_dataloader = dict(
                 type='VSTAPackedParquetDatasetV3',
                 data_root_path=  # noqa: E251
                 [
-                    './work_dirs/dataset/dummy_parcel_sort_v3/20260724_145851',
+                    './work_dirs/dataset/dummy_parcel_sort_v3_advantage/20260727_190150',
                 ],
                 video_keys=[
                     'observation.images.base_0_rgb',
@@ -237,7 +237,7 @@ runner = dict(
         ],
         meta_keys=[
             'task_description', 'prompt', 'stats', 'episode_metadata',
-            'tempo_speed', 'info'
+            'tempo_speed', 'info', 'advantage'
         ]),
     sampler=None,
     tokenizer=dict(

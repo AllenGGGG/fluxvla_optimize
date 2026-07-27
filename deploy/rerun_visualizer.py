@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
+import queue
 import sys
+import threading
+import time
 from typing import Any
 
 try:
@@ -95,6 +98,15 @@ class RerunVisualizer:
         self._joint_ranges: dict[str, list[float]] = {}
         self._inference_marker_logged = False
         self.enabled = False
+        # Logging calls come from ROS subscriber/timer callbacks (30Hz+ control
+        # loop). Rerun's own client-side buffering doesn't protect against a
+        # slow/stalled viewer backpressuring recording.log(), so operations are
+        # queued here and executed on a dedicated worker thread -- a full queue
+        # drops the oldest entries rather than blocking the control loop.
+        self._queue: queue.Queue[Callable[[Any], None] | None] = queue.Queue(maxsize=512)
+        self._worker: threading.Thread | None = None
+        self._dropped_since_warn = 0
+        self._last_drop_warn = 0.0
         if not enabled:
             return
         if rr is None or rrb is None:
@@ -113,6 +125,10 @@ class RerunVisualizer:
             self._recording.send_blueprint(layout, make_active=True, make_default=True)
             self.enabled = True
             self._log_series_styles()
+            self._worker = threading.Thread(
+                target=self._worker_loop, name="rerun-visualizer", daemon=True
+            )
+            self._worker.start()
             self._info("[startup] Rerun Viewer initialized: app=fluxvla_deploy")
         except Exception as exc:
             self._disable(f"Rerun initialization failed: {exc}")
@@ -166,12 +182,46 @@ class RerunVisualizer:
         return f"joints/{JOINT_GROUP_BY_NAME[joint_name]}/{joint_name}"
 
     def _run(self, operation: Callable[[Any], None]) -> None:
+        """Queue a logging operation for the worker thread.
+
+        Called from ROS callbacks on the control loop, so this must never
+        block: on a full queue, the oldest queued entry is dropped in favor
+        of the new one (staying current matters more than completeness for
+        a live view).
+        """
         if not self.enabled or self._recording is None:
             return
         try:
-            operation(self._recording)
-        except Exception as exc:
-            self._disable(f"Rerun logging failed: {exc}")
+            self._queue.put_nowait(operation)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(operation)
+            except queue.Full:
+                pass
+            self._dropped_since_warn += 1
+            now = time.monotonic()
+            if now - self._last_drop_warn > 5.0:
+                self._warn(
+                    f"Rerun log queue full; dropped {self._dropped_since_warn} "
+                    "entries (viewer too slow to keep up)"
+                )
+                self._dropped_since_warn = 0
+                self._last_drop_warn = now
+
+    def _worker_loop(self) -> None:
+        while True:
+            operation = self._queue.get()
+            if operation is None:
+                return
+            try:
+                operation(self._recording)
+            except Exception as exc:
+                self._disable(f"Rerun logging failed: {exc}")
+                return
 
     @staticmethod
     def _set_time(recording: Any, timestamp_s: float) -> None:
@@ -264,9 +314,19 @@ class RerunVisualizer:
         self._run(log)
 
     def close(self) -> None:
-        recording = self._recording
-        self._recording = None
+        # Stop new work first, but keep self._recording alive until the worker
+        # has drained its queue -- clearing it early would hand queued
+        # operations a None recording (they call operation(self._recording)).
         self.enabled = False
+        recording = self._recording
+        if self._worker is not None:
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+            self._worker.join(timeout=2.0)
+            self._worker = None
+        self._recording = None
         if recording is None:
             return
         try:

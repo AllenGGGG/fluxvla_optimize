@@ -384,10 +384,12 @@ class ParquetDataset(Dataset):
             data['index'] = np.array(index, dtype=np.int64)
         data['task_description'] = self._get_task_name(dataset_idx, index)
         data['data_root'] = self.data_root_path[dataset_idx]
-        # advantage/intervention/length, if migrated into episodes.jsonl by
-        # scripts/migrate_episode_advantage.py; {} otherwise. Consumed by
-        # EpisodeMetadataPrompter to build the "Advantage: ..." / "Speed: ..."
-        # prompt text.
+        # length (and legacy advantage/intervention, if migrated into
+        # episodes.jsonl by scripts/migrate_episode_advantage.py against an
+        # older dataset); {} otherwise. Consumed by EpisodeMetadataPrompter to
+        # build the "Speed: ..." prompt text -- "Advantage: ..." is read from
+        # the per-frame `advantage` parquet column on `data` directly, not
+        # from here (see EpisodeMetadataPrompter._advantage).
         data['episode_metadata'] = self.episode_metadata_by_key.get(
             (dataset_idx, data['episode_index']), {})
         for transform in self.transforms:

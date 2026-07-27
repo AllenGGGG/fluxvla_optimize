@@ -48,7 +48,9 @@ class ChunkScheduler:
     predict_fn protocol:
         ``predict_fn(obs: dict, delay: int, prev_chunk: np.ndarray | None) -> dict``
         ``prev_chunk`` is the time-aligned leftover from the action queue
-        (up to ``delay + execution_horizon`` rows, or ``None`` on the first call).
+        (up to ``delay + 2 * execution_horizon`` rows -- the locked handoff
+        window plus a trailing horizon of real data for the RTC guidance
+        decay taper -- or ``None`` on the first call).
         The returned dict must contain:
           ``"chunk"``: np.ndarray (T, A) — raw action array for RTC guidance
         Optional keys:
@@ -230,6 +232,17 @@ class ChunkScheduler:
 
         result = self._predict_fn(obs, delay, guidance_prev)
         chunk_np = np.asarray(result["chunk"], dtype=np.float32)
+        # RTC needs enough queued actions to cover both inference latency and
+        # its guidance prefix.  A short plain-mode horizon can leave too few
+        # actions for that alignment, causing discontinuities when the queue
+        # is replaced.  In RTC mode, zero means keep the full model chunk.
+        publish_horizon = (
+            self._cfg.rtc_publish_horizon
+            if self._cfg.rtc_enabled
+            else self._cfg.publish_horizon
+        )
+        if publish_horizon > 0:
+            chunk_np = chunk_np[:publish_horizon]
         if not np.isfinite(chunk_np).all():
             raise ValueError("predict_fn returned NaN/Inf in chunk")
         step_info = result.get("_step_info")
@@ -265,6 +278,22 @@ class ChunkScheduler:
             "Chunk scheduled: latency=%.3fs measured_delay=%d applied_delay=%d qsize=%d",
             elapsed, new_delay, merge_delay, queue.qsize(),
         )
+        # merge_delay was chosen *before* this call using the latency
+        # tracker's p95 estimate (or 0 in plain mode) -- it cannot know this
+        # specific call's real elapsed time. If new_delay (measured from what
+        # actually just happened) exceeds merge_delay by more than one step,
+        # the splice consumed fewer stale rows than it should have: the
+        # robot re-executes a short already-elapsed stretch of the old
+        # trajectory, which shows up as a stutter/backtrack rather than a
+        # hard glitch. Surfaced as its own line so it's grep-able without
+        # wading through every debug-level chunk log.
+        if new_delay > merge_delay + 1:
+            logger.warning(
+                "Splice underestimated inference delay: measured_delay=%d > "
+                "applied_delay=%d (latency=%.3fs) -- new chunk's first "
+                "%d step(s) overlap already-elapsed time",
+                new_delay, merge_delay, elapsed, new_delay - merge_delay,
+            )
         return True
 
     def _scheduler_loop_plain(self) -> None:
@@ -320,13 +349,37 @@ class ChunkScheduler:
                 time.sleep(_IDLE_SLEEP_S)
                 continue
 
-            t0 = time.perf_counter()
-            chunk2_start, prev_full, prev_left_over = queue.snapshot()
-
             latency = latency_tracker.p95()
             delay = math.ceil(latency / time_per_step) if latency else 0
+            chunk2_start, prev_full, prev_left_over = queue.snapshot()
+
+            # Keep enough old actions for the measured inference delay, the
+            # RTC handoff window, and a trailing horizon of real data for
+            # the guidance decay taper (see aligned_guidance_window below --
+            # it can only return data that is still in the leftover queue,
+            # so if we let the queue drain below delay + 2H before
+            # replanning, the decay region has nothing to taper against and
+            # collapses back to a hard cut). The explicit value is only a
+            # minimum; latency always wins so the splice has valid context.
+            required_remaining = delay + 2 * self._cfg.execution_horizon
+            replan_remaining = max(
+                self._cfg.replan_remaining,
+                required_remaining,
+            )
+            if (
+                prev_left_over is not None
+                and len(prev_left_over) > replan_remaining
+            ):
+                time.sleep(_IDLE_SLEEP_S)
+                continue
+
+            t0 = time.perf_counter()
+            # Fetch delay+2H of old queue so the locked prefix (delay+H) has
+            # a full H-step tail left over for the RTC decay region. Without
+            # the extra H, decay_end collapses onto prefix_len and guidance
+            # weight drops from 1.0 straight to 0 with no taper.
             guidance_prev = aligned_guidance_window(
-                prev_left_over, delay, self._cfg.execution_horizon
+                prev_left_over, delay, 2 * self._cfg.execution_horizon
             )
 
             self._predict_and_merge(

@@ -1,6 +1,7 @@
 import math
 
 import torch
+import torch.nn.functional as F
 
 from fluxvla.engines import VLAS
 # yapf: disable
@@ -21,8 +22,23 @@ from fluxvla.ops.triton.attention_triton_ops import (
 from .pi05_flowmatching import PI05FlowMatching
 
 
-def _swish(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.sigmoid(x)
+def _linear_bf16(x: torch.Tensor, weight: torch.Tensor,
+                 bias: torch.Tensor) -> torch.Tensor:
+    """Run a materialized transposed Linear with eager BF16 semantics."""
+    if x.ndim == 1:
+        return torch.addmm(bias, x.unsqueeze(0), weight)[0]
+    return torch.addmm(bias, x, weight)
+
+
+def _project_adarms_bf16(time_emb: torch.Tensor, weights: torch.Tensor,
+                         biases: torch.Tensor) -> torch.Tensor:
+    """Match the per-step, per-layer BF16 Linear calls made by eager."""
+    return torch.stack([
+        torch.stack([
+            _linear_bf16(time_emb[step], weights[layer], biases[layer])
+            for layer in range(weights.shape[0])
+        ]) for step in range(time_emb.shape[0])
+    ])
 
 
 def _posemb_sincos_torch(t: torch.Tensor,
@@ -428,22 +444,41 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
             torch.zeros(dec, dh, dtype=bf, device=dev),
             'gate_buf':
             torch.zeros(dec, dh, dtype=bf, device=dev),
+            # fp32: prefill_actions holds the hard-pinned prev_actions data
+            # that gets copied verbatim into diffusion_noise (now fp32) for
+            # the locked prefix positions in 'prefix' RTC. Keeping this bf16
+            # would quantize prev_actions (measured ~0.00195 max / ~0.00065
+            # mean error on representative [-1,1] data) before that copy, so
+            # the "hard pin" would not exactly reproduce the previous fp32
+            # action even though the destination buffer is now fp32.
             'prefill_actions':
-            torch.zeros((dec, ad), dtype=bf, device=dev),
+            torch.zeros((dec, ad), dtype=torch.float32, device=dev),
+            # 0/1 mask values are exact in bf16; no precision to lose here.
             'prefill_mask':
             torch.zeros((dec, 1), dtype=bf, device=dev),
             'prefill_inv_mask':
             torch.ones((dec, 1), dtype=bf, device=dev),
+            # fp32: ODE integration state across all denoise steps (see
+            # matching comment in pi05_flowmatching_inference.py). Kept fp32
+            # here too so guidance RTC's x_1 reconstruction operates on an
+            # unquantized x_t.
             'diffusion_noise':
-            torch.zeros(dec, ad, dtype=bf, device=dev),
+            torch.zeros(dec, ad, dtype=torch.float32, device=dev),
         }
 
     def _init_rope_table(self):
         prefix_alloc = self.num_views * 256 + self._max_prompt_len
         max_pos = prefix_alloc - 1 + self._decoder_seq_len
         position_ids = torch.arange(max_pos + 1, device='cuda')
-        inv_freq = 1.0 / (10000**(
-            torch.arange(0, 256, 2, dtype=torch.float32, device='cuda') / 256))
+        # Match the BF16 eager model exactly.  Loading the model as BF16 also
+        # quantizes GemmaRotaryEmbedding.inv_freq before its forward pass
+        # casts that buffer back to FP32.  Keeping a newly generated FP32
+        # inv_freq here produces a different phase at the large prefix
+        # positions used by PI0.5 and can be amplified across denoising steps.
+        inv_freq = (1.0 / (10000**(
+            torch.arange(
+                0, 256, 2, dtype=torch.float32, device='cuda') / 256))).to(
+                    torch.bfloat16).float()
         k_phase = inv_freq[None, :] * position_ids[:, None]
         k_cos = torch.cos(k_phase).to(torch.bfloat16)
         k_sin = torch.sin(k_phase).to(torch.bfloat16)
@@ -458,65 +493,56 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
         return self._rope_table[start:end]
 
     def _build_adarms_mod_bases(self):
-        '''
-        precompute the time embeddings for each step
-        '''
-        t_embeds = []
-        for step in range(self._num_steps):
-            time_embed = self._triton_weights['decoder_time_embeds'][
-                step].float()
-            time_embed = _swish(
-                torch.matmul(
-                    time_embed,
-                    self._triton_weights['decoder_time_mlp_in_w'].float()) +
-                self._triton_weights['decoder_time_mlp_in_b'].float())
-            time_embed = _swish(
-                torch.matmul(
-                    time_embed,
-                    self._triton_weights['decoder_time_mlp_out_w'].float()) +
-                self._triton_weights['decoder_time_mlp_out_b'].float())
-            t_embeds.append(time_embed)
-        self._time_step_emb = torch.stack(t_embeds, dim=0).to(torch.float32)
+        """Precompute timestep modulation using the eager BF16 operation order."""
+        time_in_w = self._triton_weights['decoder_time_mlp_in_w']
+        time_in_b = self._triton_weights['decoder_time_mlp_in_b']
+        time_out_w = self._triton_weights['decoder_time_mlp_out_w']
+        time_out_b = self._triton_weights['decoder_time_mlp_out_b']
 
-        zero_embed = _posemb_sincos_torch(
-            torch.zeros(1, dtype=torch.float32, device='cuda'))[0]
-        zero_embed = _swish(
-            torch.matmul(zero_embed, self.
-                         _triton_weights['decoder_time_mlp_in_w'].float()) +
-            self._triton_weights['decoder_time_mlp_in_b'].float())
-        zero_embed = _swish(
-            torch.matmul(
-                zero_embed,
-                self._triton_weights['decoder_time_mlp_out_w'].float()) +
-            self._triton_weights['decoder_time_mlp_out_b'].float())
-        self._time_zero_emb = zero_embed.to(torch.float32)
-
-        attn_w = self._triton_weights['decoder_pre_attn_norm_mod_w'].float()
-        attn_b = self._triton_weights['decoder_pre_attn_norm_mod_b'].float()
-        ffn_w = self._triton_weights['decoder_pre_ffn_norm_mod_w'].float()
-        ffn_b = self._triton_weights['decoder_pre_ffn_norm_mod_b'].float()
-        final_w = self._triton_weights['decoder_final_norm_mod_w'].float()
-        final_b = self._triton_weights['decoder_final_norm_mod_b'].float()
-
-        self._base_adarms_mod_attn_vec = (
-            torch.einsum('sd,ldh->slh', self._time_step_emb, attn_w) +
-            attn_b[None, :, :]).to(torch.bfloat16)
-        self._base_adarms_mod_ffn_vec = (
-            torch.einsum('sd,ldh->slh', self._time_step_emb, ffn_w) +
-            ffn_b[None, :, :]).to(torch.bfloat16)
-        self._base_adarms_mod_final_vec = (
-            torch.matmul(self._time_step_emb, final_w) + final_b[None, :]).to(
+        self._time_step_emb = torch.stack([
+            F.silu(
+                _linear_bf16(
+                    F.silu(_linear_bf16(step, time_in_w, time_in_b)),
+                    time_out_w,
+                    time_out_b,
+                )) for step in self._triton_weights['decoder_time_embeds']
+        ])
+        zero_posemb = _posemb_sincos_torch(
+            torch.zeros(1, dtype=torch.float32, device='cuda')).to(
                 torch.bfloat16)
+        self._time_zero_emb = F.silu(
+            _linear_bf16(
+                F.silu(_linear_bf16(zero_posemb, time_in_w, time_in_b)),
+                time_out_w,
+                time_out_b,
+            ))[0]
 
-        self._base_adarms_mod_attn_t0 = (
-            torch.einsum('d,ldh->lh', self._time_zero_emb, attn_w) +
-            attn_b).to(torch.bfloat16)
-        self._base_adarms_mod_ffn_t0 = (
-            torch.einsum('d,ldh->lh', self._time_zero_emb, ffn_w) + ffn_b).to(
-                torch.bfloat16)
-        self._base_adarms_mod_final_t0 = (
-            torch.matmul(self._time_zero_emb, final_w) + final_b).to(
-                torch.bfloat16)
+        attn_w = self._triton_weights['decoder_pre_attn_norm_mod_w']
+        attn_b = self._triton_weights['decoder_pre_attn_norm_mod_b']
+        ffn_w = self._triton_weights['decoder_pre_ffn_norm_mod_w']
+        ffn_b = self._triton_weights['decoder_pre_ffn_norm_mod_b']
+        final_w = self._triton_weights['decoder_final_norm_mod_w']
+        final_b = self._triton_weights['decoder_final_norm_mod_b']
+
+        self._base_adarms_mod_attn_vec = _project_adarms_bf16(
+            self._time_step_emb, attn_w, attn_b)
+        self._base_adarms_mod_ffn_vec = _project_adarms_bf16(
+            self._time_step_emb, ffn_w, ffn_b)
+        self._base_adarms_mod_final_vec = torch.stack([
+            _linear_bf16(step, final_w, final_b)
+            for step in self._time_step_emb
+        ])
+
+        self._base_adarms_mod_attn_t0 = torch.stack([
+            _linear_bf16(self._time_zero_emb, attn_w[layer], attn_b[layer])
+            for layer in range(attn_w.shape[0])
+        ])
+        self._base_adarms_mod_ffn_t0 = torch.stack([
+            _linear_bf16(self._time_zero_emb, ffn_w[layer], ffn_b[layer])
+            for layer in range(ffn_w.shape[0])
+        ])
+        self._base_adarms_mod_final_t0 = _linear_bf16(
+            self._time_zero_emb, final_w, final_b)
 
     def _update_runtime_adarms_mods(self, prefill_len: int):
         '''
@@ -553,15 +579,20 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
         if prefill_actions is None:
             raise ValueError('prefix_len > 0 requires prev_actions.')
 
+        # fp32: prefill_actions/diffusion_noise are now fp32 (see
+        # _init_buffers); constructing `pref` in bf16 here would quantize
+        # prev_actions before the hard-pin copy below, undermining the
+        # "exact previous action" guarantee even though both destination
+        # buffers are fp32.
         pref = torch.as_tensor(
-            prefill_actions, device='cuda', dtype=torch.bfloat16)
+            prefill_actions, device='cuda', dtype=torch.float32)
         if pref.ndim == 3:
             pref = pref[0]
         if pref.shape[-1] < self._action_dim:
             pad = torch.zeros(
                 pref.shape[0],
                 self._action_dim - pref.shape[-1],
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
                 device=pref.device)
             pref = torch.cat([pref, pad], dim=-1)
 
@@ -580,11 +611,19 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
                       self._num_steps)
 
     def _build_cuda_graph(self):
+        """Warm up/capture without consuming the first request inputs."""
         print('[Triton Inference] Recording CUDA Graph ...')
+        initial_noise = self._triton_bufs['diffusion_noise'].clone()
+        initial_encoder_x = self._triton_bufs['encoder_x'].clone()
         for _ in range(3):
+            self._triton_bufs['diffusion_noise'].copy_(initial_noise)
+            self._triton_bufs['encoder_x'].copy_(initial_encoder_x)
             self._run_forward()
         torch.cuda.synchronize()
 
+        self._triton_bufs['diffusion_noise'].copy_(initial_noise)
+        self._triton_bufs['encoder_x'].copy_(initial_encoder_x)
+        torch.cuda.synchronize()
         self._cuda_graph = torch.cuda.CUDAGraph()
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
@@ -593,6 +632,10 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
             self._cuda_graph.capture_end()
         torch.cuda.synchronize()
 
+        # _triton_forward replays once after this method returns. Restore the
+        # real request so the first replay is identical to subsequent calls.
+        self._triton_bufs['diffusion_noise'].copy_(initial_noise)
+        self._triton_bufs['encoder_x'].copy_(initial_encoder_x)
         self._cuda_graph_ready = True
         print('[Triton Inference] CUDA Graph recorded successfully!')
 
@@ -609,10 +652,10 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
             images_nhwc: images in [num_views, H, W, C] bfloat16 format.
             prompt_embeds: language embeddings [prompt_len, 2048] bfloat16.
             prompt_len: actual prompt token count (int).
-            diffusion_noise: initial noise [chunk_size, 32] bfloat16.
+            diffusion_noise: initial noise [chunk_size, 32] float32.
 
         Returns:
-            Denoised actions [chunk_size, 32] bfloat16.
+            Denoised actions [chunk_size, 32] float32.
         """
         self._triton_bufs['observation_images_normalized'].copy_(images_nhwc)
         start = self.num_views * 256
@@ -666,19 +709,20 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
             device='cuda', dtype=torch.bfloat16)
 
         chunk_size = self.n_action_steps
+        # fp32 to match diffusion_noise's fp32 integration state.
         if noise is None:
             noise_t = torch.randn(
                 chunk_size,
                 self.max_action_dim,
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
                 device=states.device)
         else:
-            noise_t = noise[0].to(dtype=torch.bfloat16)
+            noise_t = noise[0].to(dtype=torch.float32)
         if noise_t.shape[-1] < self._action_dim:
             pad = torch.zeros(
                 noise_t.shape[0],
                 self._action_dim - noise_t.shape[-1],
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
                 device=noise_t.device)
             noise_t = torch.cat([noise_t, pad], dim=-1)
 
@@ -697,7 +741,13 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
             noise_t,
             prev_actions=prev_actions,
             prefix_len=prefix_len if rtc_method == 'prefix' else 0)
-        result = denoised[:, :self.max_action_dim].unsqueeze(0).float()
+        # clone(): denoised is now fp32, so .float() below is a dtype-only
+        # no-op (same storage) instead of an implicit copy. denoised aliases
+        # the CUDA graph's static diffusion_noise buffer, which the next
+        # predict_action call overwrites in place on graph replay. Without
+        # an explicit copy, a caller holding this return value would see it
+        # silently change after the next inference call.
+        result = denoised[:, :self.max_action_dim].unsqueeze(0).float().clone()
 
         return result
 
@@ -710,11 +760,12 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
         embedding_dim = 1024
         fraction = torch.linspace(0.0, 1.0, embedding_dim // 2, device='cuda')
         period = min_period * (max_period / min_period)**fraction
+        scaling_factor = 1.0 / period * 2 * math.pi
         time_embs = []
         for _ in range(num_steps):
-            sinusoid_input = (
-                time_val.unsqueeze(-1) * (1.0 / period).unsqueeze(0) * 2 *
-                math.pi)
+            # Keep the same FP32 operation order as
+            # create_sinusoidal_pos_embedding used by eager inference.
+            sinusoid_input = time_val.reshape(1, 1) * scaling_factor
             emb = torch.cat(
                 [torch.sin(sinusoid_input),
                  torch.cos(sinusoid_input)], dim=-1)

@@ -26,13 +26,16 @@ def matmul_small_bias(inp_ptr, weight_ptr, out_ptr, bias_ptr,
             mask=((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
             other=0.0)
         for k in range(0, features, BLOCK_SIZE_K):
+            # Explicit cast: inp_ptr may now be fp32 (e.g. diffusion_noise),
+            # but tl.dot requires matching bf16 operands for the Tensor Core
+            # path. This is a no-op when inp_ptr is already bf16.
             x = tl.load(
                 inp_ptr +
                 (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features +
                 (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
                 mask=((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) &
                 ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
-                other=0.0)
+                other=0.0).to(tl.bfloat16)
             w = tl.load(
                 weight_ptr +
                 (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden +
@@ -41,10 +44,13 @@ def matmul_small_bias(inp_ptr, weight_ptr, out_ptr, bias_ptr,
                 ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
                 other=0.0)
             acc = tl.dot(x, w, acc)
+        # No explicit dtype cast on store: tl.store implicitly casts `value`
+        # to out_ptr's element dtype, so this kernel's output precision is
+        # whatever the caller's `out` buffer declares (bf16 or fp32).
         tl.store(
             out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden +
             (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-            acc.to(tl.bfloat16),
+            acc,
             mask=((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) &
             ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden))
 
@@ -88,10 +94,16 @@ def matmul_small_bias_res(inp_ptr, weight_ptr, out_ptr, bias_ptr, res_ptr,
                 ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
                 other=0.0).to(tl.bfloat16)
             acc = tl.dot(x, w, acc)
+        # No explicit dtype cast: `acc` is fp32 (loaded from res_ptr with
+        # .to(tl.float32) above), and tl.store implicitly casts it to
+        # out_ptr's element dtype. This preserves fp32 precision end-to-end
+        # when res_ptr/out_ptr is diffusion_noise (fp32), and is a no-op
+        # (same result as the old explicit .to(tl.bfloat16)) for any bf16
+        # out_ptr.
         tl.store(
             out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden +
             (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-            acc.to(tl.bfloat16),
+            acc,
             mask=((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) &
             ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden))
 
@@ -791,8 +803,10 @@ def matmul_small_res_gate(inp_ptr, weight_ptr, out_ptr, res_ptr, gate_ptr,
             (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
             mask=((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) &
             ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
-            other=0.0).to(tl.float32)
-        acc += matmul_acc * gate
+            other=0.0)
+        matmul_acc = matmul_acc.to(tl.bfloat16)
+        gated_update = (matmul_acc * gate).to(tl.bfloat16)
+        acc += gated_update
         tl.store(
             out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden +
             (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
@@ -835,8 +849,14 @@ def matmul_small_gate(inp_ptr,
                              (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) *
                              hidden + j + tl.arange(0, BLOCK_SIZE_M))
                 acc2 = tl.dot(x, w2, acc2)
+            # Eager materializes both Linear projections as BF16 tensors
+            # before GELU and the gated product.
+            acc = acc.to(tl.bfloat16)
+            acc2 = acc2.to(tl.bfloat16)
+            acc = acc.to(tl.float32)
             acc = acc * tl.sigmoid(1.5957691216057308 * acc *
                                    (1 + 0.044715 * acc * acc))
+            acc = acc.to(tl.bfloat16)
             acc = (acc * acc2).to(tl.bfloat16)
             tl.store(
                 out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * hidden +

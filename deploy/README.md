@@ -81,7 +81,9 @@ other workflows.
 ## Run
 
 Use one Python environment containing ROS2 Jazzy `rclpy`, AccVLA dependencies,
-PyTorch, OpenCV, MMEngine, safetensors, and the pinned visualization packages:
+PyTorch, OpenCV, MMEngine, safetensors, and the pinned visualization packages.
+
+**x86_64 (with an x86 ROS2 install to set up):**
 
 ```bash
 conda activate fluxvla_infer
@@ -96,6 +98,25 @@ reinstall; installing ROS2 runs `apt-get` as root and adds the ros2.org apt
 source system-wide. There used to be a separate `deploy/install_env.sh` for
 this; it's been folded into `scripts/install_env.sh` so there's a single
 installer for both training and deploy.
+
+**ARM/Jetson AGX Orin (`allen_agx_orin` container, ROS2 Jazzy already
+installed system-wide):**
+
+```bash
+bash scripts/install_env_orin.sh
+```
+
+`scripts/install_env.sh` pulls PyTorch from `download.pytorch.org`, which has
+no aarch64 wheels — it cannot install on Jetson. `install_env_orin.sh` is a
+separate script for this platform: it provisions a Python 3.12 conda env
+(matching the system ROS2 install's `rclpy` ABI — `rclpy` cannot be installed
+via pip, so the interpreter version must match exactly), installs
+PyTorch/torchvision/torchaudio/triton from the Jetson community wheel index
+(`pypi.jetson-ai-lab.io`), installs cuDNN/libopenblas into the container (the
+default cuDNN install path usually isn't bind-mounted from the host, unlike
+the CUDA Toolkit), and builds FluxVLA's custom CUDA extensions against the
+host's mounted CUDA Toolkit. See the root [`README.md`](../README.md#本分支allen_infer快速上手)
+for the full breakdown and the host-side CUDA Toolkit prerequisite.
 
 All deployment parameters are grouped at the top of `launch.sh`. Edit those
 values directly when changing the model, inference mode, or safety thresholds,
@@ -124,19 +145,21 @@ the scheduler hands `FluxVLAPolicy.predict_chunk` (`deploy/model.py`) the
 queue's real unconsumed tail as RTC prefix context, so consecutive chunks
 splice together instead of jumping.
 
-`RTC_METHOD` (default `none`) is fluxvla's own RTC guidance -- the async
-engine above only supplies the prefix context, it does not reimplement the
-guidance math. It needs a matching `INFERENCE_CONFIG`, since which model
-class actually implements it depends on the method:
+The interactive launcher defaults to asynchronous guidance RTC. The async
+engine supplies the unconsumed queue context and the selected model applies
+the guidance update. Available built-in combinations are:
 
-| `RTC_METHOD` | `INFERENCE_CONFIG` | Backend |
+| RTC | Acceleration | `INFERENCE_CONFIG` |
 |---|---|---|
-| `none` | `pi05_parcel_sort_inference.py` | Triton (no RTC) |
-| `prefix` | `pi05_parcel_sort_inference_prefix_rtc.py` | Triton (`PI05FlowMatchingRTCInference`) |
-| `guidance` | `pi05_parcel_sort_inference_guidance_rtc.py` | eager PyTorch (`PI05FlowMatching`), no CUDA graph, slower |
+| `guidance` | Triton + CUDA Graph | `pi05_parcel_sort_guidance_triton_inference.py` |
+| `guidance` | PyTorch | `pi05_parcel_sort_guidance_pytorch_inference.py` |
+| `prefix` | Triton + CUDA Graph | `pi05_parcel_sort_prefix_triton_inference.py` |
+| `prefix` | PyTorch | `pi05_parcel_sort_prefix_pytorch_inference.py` |
+| off | Triton + CUDA Graph | `pi05_parcel_sort_none_triton_inference.py` |
+| off | PyTorch | `pi05_parcel_sort_none_pytorch_inference.py` |
 
-Pointing `RTC_METHOD` at a config that doesn't implement it fails fast at
-startup instead of silently running un-guided.
+A mismatched custom config fails fast at startup instead of silently running
+unguided.
 
 ## Dataset warning
 

@@ -1,4 +1,4 @@
-"""ROS2 sensor input, asynchronous inference, and guarded joint control."""
+"""ROS2 sensor input, selectable inference scheduling, and guarded control."""
 
 from __future__ import annotations
 
@@ -33,7 +33,12 @@ from .utils import (
     WBC_JOINT_NAMES,
     JointCommands,
 )
-from .exec_engine import ChunkScheduler, ChunkSchedulerConfig, InferBackend
+from .exec_engine import (
+    ChunkScheduler,
+    ChunkSchedulerConfig,
+    InferBackend,
+    SerialInferenceBackend,
+)
 from .rerun_visualizer import RerunVisualizer
 
 
@@ -144,7 +149,7 @@ class JointInferenceNode(Node):
 
         self._backend.start()
         self.get_logger().info(
-            f"[startup] inference backend thread started: "
+            f"[startup] inference backend started: "
             f"type={type(self._backend).__name__}"
         )
         self.timer = self.create_timer(self.step_interval_s, self._control_step)
@@ -167,8 +172,10 @@ class JointInferenceNode(Node):
         self.declare_parameter("dtype", "bf16")
         self.declare_parameter("task", DEFAULT_TASK)
         self.declare_parameter("norm_stats_path", "")
+        self.declare_parameter("tokenizer_path", "")
 
         self.declare_parameter("robot_exec_hz", 30.0)
+        self.declare_parameter("execution_mode", "async")
         self.declare_parameter("auto_start", False)
         self.declare_parameter("wbc_controller_node", "/ocs2_wbc_controller")
 
@@ -206,6 +213,12 @@ class JointInferenceNode(Node):
         self.task = str(value("task"))
         self.robot_exec_hz = float(value("robot_exec_hz"))
         self.step_interval_s = 1.0 / max(self.robot_exec_hz, 1e-6)
+        self.execution_mode = str(value("execution_mode")).strip().lower()
+        if self.execution_mode not in {"async", "serial"}:
+            raise ValueError(
+                "execution_mode must be 'async' or 'serial', got "
+                f"{self.execution_mode!r}"
+            )
         self.auto_start = bool(value("auto_start"))
         self.wbc_controller_node = str(value("wbc_controller_node"))
 
@@ -227,6 +240,7 @@ class JointInferenceNode(Node):
             device=str(value("device")),
             dtype=str(value("dtype")),
             norm_stats_path=str(value("norm_stats_path")).strip() or None,
+            tokenizer_path=str(value("tokenizer_path")).strip() or None,
         )
 
     def _create_backend(self) -> InferBackend:
@@ -252,11 +266,25 @@ class JointInferenceNode(Node):
                 raise
 
         bundle.fn = logged_predict
+        if self.execution_mode == "serial":
+            if self.worker_cfg.rtc_method != "none":
+                raise ValueError(
+                    "serial execution requires rtc_method='none'; RTC needs "
+                    "an unconsumed async queue prefix"
+                )
+            return SerialInferenceBackend(
+                bundle,
+                publish_horizon=self.worker_cfg.chunk_publish_horizon,
+            )
+
         return ChunkScheduler(
             bundle,
             ChunkSchedulerConfig(
                 rtc_enabled=self.worker_cfg.rtc_method != "none",
                 execution_horizon=self.worker_cfg.rtc_execution_horizon,
+                replan_remaining=self.worker_cfg.rtc_replan_remaining,
+                publish_horizon=self.worker_cfg.chunk_publish_horizon,
+                rtc_publish_horizon=self.worker_cfg.rtc_publish_horizon,
                 debug=debug,
                 debug_dir=debug_dir or "/tmp/rtc_debug",
             ),
@@ -400,6 +428,28 @@ class JointInferenceNode(Node):
         self._maybe_auto_start()
 
     def _build_sample(self) -> dict[str, Any]:
+        image_sources = {
+            "observation.images.base_0_rgb": self.head_image,
+            "observation.images.left_wrist_0_rgb": self.left_wrist_image,
+            "observation.images.right_wrist_0_rgb": self.right_wrist_image,
+        }
+        images: dict[str, np.ndarray] = {}
+        for key, image in image_sources.items():
+            if image is None:
+                raise ValueError(f"missing inference image: {key}")
+            array = np.asarray(image)
+            if array.ndim != 3 or array.shape[-1] != 3:
+                raise ValueError(
+                    f"inference image {key} must be HWC RGB, got {array.shape}"
+                )
+            images[key] = array
+
+        missing_joints = [
+            name for name in MODEL_JOINT_NAMES if name not in self.joint_positions
+        ]
+        if missing_joints:
+            raise ValueError(f"missing inference joints: {missing_joints}")
+
         state = np.zeros(MODEL_TENSOR_DIM, dtype=np.float32)
         state[:MODEL_JOINT_DIM] = [
             self.joint_positions[name] for name in MODEL_JOINT_NAMES
@@ -408,9 +458,7 @@ class JointInferenceNode(Node):
         # hard-requires data['qpos'] and data.get('task_description', ...), and
         # calls data[img_key].transpose(2, 0, 1) -- a numpy HWC array, not PIL.
         return {
-            "observation.images.base_0_rgb": np.asarray(self.head_image),
-            "observation.images.left_wrist_0_rgb": np.asarray(self.left_wrist_image),
-            "observation.images.right_wrist_0_rgb": np.asarray(self.right_wrist_image),
+            **images,
             "qpos": state,
             "task_description": self.task,
         }

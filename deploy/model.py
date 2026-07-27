@@ -1,11 +1,11 @@
-"""FluxVLA PI0.5 loading and CFG/advantage/RTC-aware inference.
+"""FluxVLA PI0.5 loading and RTC-aware inference.
 
 All preprocessing/postprocessing (image resize+normalize, state
 normalization, prompt building, action denormalization) go through
 ``self.dataset``/``self.denormalize_action`` (built by
 ``BaseInferenceRunner.__init__`` via ``fluxvla.engines``'
 ``build_dataset_from_cfg``/``build_transform_from_cfg`` reading
-``configs/pi05/pi05_parcel_sort_inference.py``) - the exact same
+``configs/pi05/pi05_parcel_sort_none_pytorch_inference.py``) - the exact same
 ``fluxvla.transforms`` classes used by training. There is no hand-rolled
 normalize/denormalize/prompt-building code in this file.
 """
@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import copy
 import json
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,8 +52,16 @@ class NullOperator:
 # **kwargs and produces un-guided actions -- see FluxVLAPolicy.__init__'s
 # startup check below.
 _RTC_METHOD_SUPPORTED_TYPES = {
-    "prefix": {"PI05FlowMatchingRTCInference", "PI05FlowMatching", "PI0FlowMatching"},
-    "guidance": {"PI05FlowMatching", "PI0FlowMatching"},
+    "prefix": {
+        "PI05FlowMatchingRTCInference",
+        "PI05FlowMatching",
+        "PI0FlowMatching",
+    },
+    "guidance": {
+        "PI05FlowMatchingGuidanceInference",
+        "PI05FlowMatching",
+        "PI0FlowMatching",
+    },
 }
 
 
@@ -69,105 +76,18 @@ class PredictBundle:
         return self.fn(*args, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# CFG / advantage-conditioning support.
-#
-# Ported from fluxvla_deploy main branch's inference.config module. main's
-# advantage-mode switch worked by scanning a LeRobot preprocessor for a
-# TokenizerProcessorStep and toggling its `advantage_mode` attribute - a
-# mechanism specific to LeRobot's processor pipeline that fluxvla.transforms
-# has no equivalent of (pi05_parcel_sort.py has no "advantage" concept at
-# all yet). Re-expressed here against fluxvla's own prompt convention: the
-# cond/uncond distinction is carried entirely in the task-description text
-# fed into PreparePromptWithState/ProcessPrompts (an "Advantage:positive" /
-# "Advantage:negative" suffix, matching main's DEFAULT_TASK tagging
-# convention), and the two forward passes are two independent calls into the
-# *same* dataset transform pipeline used for the untagged case - no
-# hand-rolled preprocessing either way.
-#
-# Since the currently deployed checkpoint was never trained on
-# advantage-tagged prompts, this is infrastructure for *collecting* the
-# advantage signal during rollouts; the blend is inert (or meaningless)
-# until a future checkpoint is trained on advantage-tagged data.
-# ---------------------------------------------------------------------------
-
-_ADVANTAGE_TAG_RE = re.compile(
-    r"\s*Advantage\s*:\s*(positive|negative)\s*", re.IGNORECASE)
-
-
-def _strip_advantage_text(task: str) -> str:
-    """Remove any existing 'Advantage:positive/negative' tag from a task string."""
-    if not isinstance(task, str):
-        return task
-    task = _ADVANTAGE_TAG_RE.sub(" ", task)
-    return re.sub(r"\s+", " ", task).strip()
-
-
-def _with_advantage_tag(task: str, tag: str | None) -> str:
-    """Replace any existing advantage tag on ``task`` with ``tag`` (or none)."""
-    base = _strip_advantage_text(task)
-    if not tag:
-        return base
-    return f"{base}Advantage:{tag}"
-
-
-def apply_cfg_blend(
-    cond: np.ndarray,
-    uncond: np.ndarray,
-    *,
-    scale: float,
-    scale_joint: float,
-    scale_gripper: float,
-    arm_dof: int,
-) -> np.ndarray:
-    """Classifier-free-guidance blend of cond/uncond denormalized actions.
-
-    Ported verbatim (pure array math, no LeRobot dependency) from
-    fluxvla_deploy main branch's ``inference.config.apply_cfg_blend``.
-
-    pistar06's 28-D body+dual-arm+dual-hand action layout does not match
-    this function's built-in left-arm/left-gripper/right-arm/right-gripper
-    index split (that assumption fit main's single-arm+gripper robot). With
-    the default ``scale_joint=scale_gripper=-1`` ("use scale"), the
-    per-segment split reduces algebraically to a uniform
-    ``uncond + scale * (cond - uncond)`` regardless of ``arm_dof``, so it is
-    safe to keep the function unmodified until a real per-limb scale is
-    defined for this robot's joint layout.
-    """
-    if cond.shape != uncond.shape:
-        return uncond + float(scale) * (cond - uncond)
-
-    s_j = float(scale_joint) if scale_joint >= 0.0 else float(scale)
-    s_g = float(scale_gripper) if scale_gripper >= 0.0 else float(scale)
-    delta = cond - uncond
-    out = uncond.copy()
-
-    action_dim = 2 * arm_dof + 2
-    if out.shape[-1] < action_dim:
-        return uncond + float(scale) * delta
-
-    left_grip = arm_dof
-    right_grip = 2 * arm_dof + 1
-
-    out[..., :arm_dof] = uncond[..., :arm_dof] + s_j * delta[..., :arm_dof]
-    out[..., left_grip] = uncond[..., left_grip] + s_g * delta[..., left_grip]
-    out[..., arm_dof + 1:right_grip] = (
-        uncond[..., arm_dof + 1:right_grip]
-        + s_j * delta[..., arm_dof + 1:right_grip])
-    out[..., right_grip] = uncond[..., right_grip] + s_g * delta[..., right_grip]
-    if out.shape[-1] > action_dim:
-        out[..., action_dim:] = (
-            uncond[..., action_dim:] + float(scale) * delta[..., action_dim:])
-    return out
-
-
 class FluxVLAPolicy(BaseInferenceRunner):
-    """Loads the pi05_parcel_sort checkpoint and runs cond/uncond/CFG-blended
-    inference using fluxvla's training-native transform pipeline.
+    """Loads the pi05_parcel_sort checkpoint and runs single-pass inference
+    using fluxvla's training-native transform pipeline.
+
+    Advantage-conditioning, if any, is a static prompt condition set by the
+    inference config's EpisodeMetadataPrompter (dataset.transforms), not a
+    runtime CFG toggle -- there used to be a dual cond/uncond forward pass
+    blended via apply_cfg_blend here; it has no equivalent now.
 
     Subclasses BaseInferenceRunner directly (rather than composing an
     instance of it) so ``self.dataset``/``self.vla``/``self.denormalize_action``
-    -- built by BaseInferenceRunner.__init__ from pi05_parcel_sort_inference.py
+    -- built by BaseInferenceRunner.__init__ from the selected inference config
     -- are used as-is, with no wrapper class or extra attribute indirection
     in between. Its ROS1-shaped run()/get_ros_observation()/etc. are never
     called (ros_node.JointInferenceNode owns real ROS I/O).
@@ -213,6 +133,21 @@ class FluxVLAPolicy(BaseInferenceRunner):
         if worker_cfg.num_inference_steps_override > 0:
             inference_cfg.inference_model['num_steps'] = (
                 worker_cfg.num_inference_steps_override)
+        if worker_cfg.tokenizer_path:
+            tokenizer_path = Path(
+                worker_cfg.tokenizer_path).expanduser().resolve()
+            if not tokenizer_path.exists():
+                raise FileNotFoundError(
+                    f"tokenizer path does not exist: {tokenizer_path}")
+            if not any(
+                    transform.get('type') == 'ProcessPrompts'
+                    for transform in inference_cfg.dataset['transforms']):
+                raise ValueError(
+                    "inference config has no ProcessPrompts tokenizer transform"
+                )
+            # PrivateInferenceDataset gives this explicit path precedence over
+            # its normal <checkpoint-root>/tokenizer convention.
+            inference_cfg.dataset['tokenizer_path'] = str(tokenizer_path)
         norm_type = inference_cfg.dataset['transforms'][0]['norm_type']
         if inference_cfg.denormalize_action['norm_type'] != norm_type:
             raise ValueError(
@@ -296,7 +231,9 @@ class FluxVLAPolicy(BaseInferenceRunner):
         return result['actions']
 
     def _build_rtc_kwargs(
-        self, guidance_prev: np.ndarray | None
+        self,
+        guidance_prev: np.ndarray | None,
+        prefix_len: int | None = None,
     ) -> dict[str, Any]:
         """predict_action's RTC kwargs from the caller-supplied prefix
         context (empty = no RTC: method 'none', or no prefix context yet).
@@ -310,7 +247,9 @@ class FluxVLAPolicy(BaseInferenceRunner):
                 guidance_prev):
             return {}
         previous = self._normalize_prev_actions(guidance_prev)
-        prefix_len = min(cfg.rtc_execution_horizon, len(previous))
+        if prefix_len is None:
+            prefix_len = cfg.rtc_execution_horizon
+        prefix_len = min(prefix_len, len(previous))
         if prefix_len <= 0:
             return {}
         return {
@@ -318,7 +257,10 @@ class FluxVLAPolicy(BaseInferenceRunner):
             "prefix_len": prefix_len,
             "rtc_config": {
                 "method": cfg.rtc_method,
-                "decay_end": min(2 * cfg.rtc_execution_horizon, len(previous)),
+                "decay_end": min(
+                    prefix_len + cfg.rtc_execution_horizon,
+                    len(previous),
+                ),
                 "schedule": cfg.rtc_schedule,
                 "max_guidance_weight": cfg.rtc_max_guidance_weight,
                 "use_vjp": False,
@@ -365,9 +307,18 @@ class FluxVLAPolicy(BaseInferenceRunner):
     def _forward(
         self, inputs: dict[str, Any], **rtc_kwargs: Any
     ) -> torch.Tensor:
-        # The shared PI0 sampler creates float32 noise by default. The eager
-        # deployment model is converted to bf16, so provide a matching noise
-        # tensor explicitly rather than relying on that training-time default.
+        # Sample the initial noise in fp32, not in the model's compute dtype
+        # (bf16). predict_action's denoise loop accumulates the ODE state
+        # with in-place ops (x_t += dt * v_t), which preserve x_t's own
+        # dtype regardless of v_t's dtype -- confirmed: even under
+        # autocast(bfloat16), where v_t is forced to bf16, an fp32 x_t stays
+        # fp32 through all 10 steps. Seeding with bf16 noise instead would
+        # make x_t itself bf16 for the whole loop, re-quantizing the ODE
+        # state every step -- the same class of error the fp32
+        # diffusion_noise buffer fix (triton path) exists to avoid, and it
+        # would apply here to the eager path too. autocast below still
+        # controls the actual matmul/attention compute dtype; only the
+        # persistent integration state is kept fp32.
         action_proj = getattr(self.vla, 'action_in_proj', None)
         action_param = next(action_proj.parameters(), None) if action_proj else None
         action_dtype = action_param.dtype if action_param is not None else None
@@ -378,7 +329,7 @@ class FluxVLAPolicy(BaseInferenceRunner):
                 int(self.vla.n_action_steps),
                 int(self.vla.max_action_dim),
                 device=states.device,
-                dtype=action_dtype,
+                dtype=torch.float32,
             )
             rtc_kwargs = dict(rtc_kwargs)
             rtc_kwargs['noise'] = noise
@@ -422,43 +373,33 @@ class FluxVLAPolicy(BaseInferenceRunner):
         """``ChunkScheduler``'s predict_fn protocol: predict_fn(obs,
         delay, prev_chunk) -> {"chunk": ndarray}.
 
-        ``guidance_prev`` is the exec engine's real unconsumed queue tail
-        (already delay-aligned by ``aligned_guidance_window``, length up to
-        ``delay + rtc_execution_horizon``). Its first ``delay`` rows are
-        already stale -- they will have been executed by the time this call
-        returns -- so only the remainder anchors the RTC prefix.
+        ``guidance_prev`` is the old queue segment beginning at the
+        observation time and extending ``delay + 2 * rtc_execution_horizon``
+        steps deep: the first ``delay`` rows are stale by the time this
+        call returns, the next ``rtc_execution_horizon`` rows are the locked
+        handoff window, and the final ``rtc_execution_horizon`` rows exist
+        only to give the RTC guidance decay region real data to taper
+        against (see ``_build_rtc_kwargs``'s ``decay_end``) instead of
+        collapsing decay_end onto prefix_len and dropping guidance weight
+        straight from 1.0 to 0 with no taper.
         """
         cfg = self.cfg
-        anchor = (
-            guidance_prev[delay:]
-            if guidance_prev is not None and len(guidance_prev) > delay
+        prefix_len = (
+            delay + cfg.rtc_execution_horizon
+            if guidance_prev is not None
             else None
         )
-        rtc_kwargs = self._build_rtc_kwargs(anchor)
+        rtc_kwargs = self._build_rtc_kwargs(guidance_prev, prefix_len=prefix_len)
 
-        if not cfg.advantage_enabled:
-            result = self._predict_once(obs, **rtc_kwargs)
-        else:
-            cond_obs = dict(obs)
-            cond_obs['task_description'] = _with_advantage_tag(
-                obs['task_description'], cfg.cfg_cond_advantage_tag)
-            if not cfg.cfg_enabled:
-                result = self._predict_once(cond_obs, **rtc_kwargs)
-            else:
-                uncond_obs = dict(obs)
-                uncond_obs['task_description'] = _with_advantage_tag(
-                    obs['task_description'], cfg.cfg_uncond_advantage_tag)
-
-                cond = self._predict_once(cond_obs, **rtc_kwargs)
-                uncond = self._predict_once(uncond_obs, **rtc_kwargs)
-                result = apply_cfg_blend(
-                    cond,
-                    uncond,
-                    scale=cfg.cfg_scale,
-                    scale_joint=cfg.cfg_scale_joint,
-                    scale_gripper=cfg.cfg_scale_gripper,
-                    arm_dof=cfg.arm_dof,
-                )
+        # Advantage-conditioning is no longer a runtime CFG toggle here: it is
+        # a static prompt condition declared in the inference config's
+        # dataset.transforms (EpisodeMetadataPrompter(training=False,
+        # desired_advantage=...)), applied by self.dataset itself before this
+        # method ever sees obs -- see fluxvla/transforms/prompters.py. There
+        # is exactly one forward pass; the old dual cond/uncond pass +
+        # apply_cfg_blend has no equivalent, matching training's own prompt
+        # convention exactly instead of a deploy-only regex-built tag.
+        result = self._predict_once(obs, **rtc_kwargs)
 
         return {"chunk": result}
 
