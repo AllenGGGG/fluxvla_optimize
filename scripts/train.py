@@ -71,6 +71,12 @@ def parse_args():
         help='The directory to save logs and checkpoints.',
     )
     parser.add_argument(
+        '--log-dir',
+        type=str,
+        default=None,
+        help='The directory to save metric logs. Defaults to --work-dir.',
+    )
+    parser.add_argument(
         '--cfg-options',
         nargs='+',
         action=DictAction,
@@ -381,7 +387,9 @@ def train(args, cfg):
         if overwatch.is_rank_zero():
             overwatch.info(f'Training seed set to {seed}.')
 
+    log_dir = args.log_dir or args.work_dir
     os.makedirs(args.work_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
     dataset = build_dataset_from_cfg(cfg.train_dataloader.dataset)
     eval_dataset = _build_optional_training_eval_dataset(cfg)
     if overwatch.is_rank_zero() and hasattr(dataset, 'dataset_statistics'):
@@ -400,7 +408,8 @@ def train(args, cfg):
         tokenizer.save_pretrained(args.work_dir)
         overwatch.info(f'Saved tokenizer to {args.work_dir}')
     if hasattr(cfg.runner, 'metric'):
-        cfg.runner.metric.run_dir = args.work_dir
+        cfg.runner.metric.run_dir = log_dir
+    cfg.runner.checkpoint_run_dir = args.work_dir
     cfg.runner.cfg = cfg
     cfg.runner.args = args
     if args.resume_from is not None:

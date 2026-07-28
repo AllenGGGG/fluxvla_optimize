@@ -88,6 +88,8 @@ class FSDPTrainRunner(BaseTrainRunner):
                  sharding_strategy: str = 'hybrid-shard',
                  change_key_name: bool = False,
                  tokenizer: Optional[Dict] = None,
+                 save_pt_checkpoints: bool = True,
+                 checkpoint_run_dir: Optional[str] = None,
                  resume_from: Optional[str] = None,
                  args=None,
                  *_unused_args,
@@ -116,6 +118,8 @@ class FSDPTrainRunner(BaseTrainRunner):
             grad_accumulation_steps=grad_accumulation_steps,
             evaluator=evaluator,
             tokenizer=tokenizer,
+            save_pt_checkpoints=save_pt_checkpoints,
+            checkpoint_run_dir=checkpoint_run_dir,
             resume_from=resume_from)
         self.cfg = cfg
         self.args = args
@@ -206,7 +210,7 @@ class FSDPTrainRunner(BaseTrainRunner):
             # before calling full_optim_state_dict
             # This is critical after resume, as different ranks might have
             # different optimizer states if loading failed on some ranks
-            if self.optimizer is not None:
+            if self.save_pt_checkpoints and self.optimizer is not None:
                 # Ensure all ranks have completed the same number of optimizer
                 # steps by synchronizing before gathering the full state
                 dist.barrier()
@@ -220,16 +224,14 @@ class FSDPTrainRunner(BaseTrainRunner):
                 checkpoint_dir = os.path.join(run_dir, 'checkpoints')
                 os.makedirs(checkpoint_dir, exist_ok=True)
                 if train_loss is None:
-                    checkpoint_path = os.path.join(
-                        checkpoint_dir,
-                        f'step-{global_step:06d}-epoch-{epoch:02d}-loss=inf.pt'  # noqa: E231, E501
-                    )
+                    checkpoint_stem = (
+                        f'step-{global_step:06d}-epoch-{epoch:02d}-loss=inf')
                 else:
-                    checkpoint_path = (
-                        os.path.join(
-                            checkpoint_dir,
-                            f'step-{global_step:06d}-epoch-{epoch:02d}-loss={train_loss:.4f}.pt'  # noqa: E231, E501
-                        ))
+                    checkpoint_stem = (
+                        f'step-{global_step:06d}-epoch-{epoch:02d}-loss={train_loss:.4f}'  # noqa: E501
+                    )
+                checkpoint_path = os.path.join(checkpoint_dir,
+                                               checkpoint_stem + '.pt')
 
                 # Prepare checkpoint dictionary
                 checkpoint_dict = {
@@ -249,23 +251,30 @@ class FSDPTrainRunner(BaseTrainRunner):
                     checkpoint_dict[
                         'optimizer_state_dict'] = full_optimizer_state_dict
 
-                # Save Checkpoint & Copy Latest to `latest-checkpoint.pt`
-                torch.save(checkpoint_dict, checkpoint_path)
+                if self.save_pt_checkpoints:
+                    torch.save(checkpoint_dict, checkpoint_path)
 
                 # Save model weights as safetensors for fast loading
-                safetensors_path = checkpoint_path.replace(
-                    '.pt', '.safetensors')
+                safetensors_path = os.path.join(
+                    checkpoint_dir, checkpoint_stem + '.safetensors')
                 self._save_model_safetensors(model_state_dicts,
                                              safetensors_path)
                 overwatch.info(f'Saved safetensors at: {safetensors_path}')
 
-                # Create symlink to latest checkpoint
-                latest_ckpt_link = os.path.join(checkpoint_dir,
-                                                'latest-checkpoint.pt')
-                if os.path.islink(latest_ckpt_link) or os.path.exists(
-                        latest_ckpt_link):
-                    os.remove(latest_ckpt_link)
-                os.symlink(os.path.abspath(checkpoint_path), latest_ckpt_link)
+                if self.save_pt_checkpoints:
+                    latest_ckpt_link = os.path.join(checkpoint_dir,
+                                                    'latest-checkpoint.pt')
+                    if os.path.islink(latest_ckpt_link) or os.path.exists(
+                            latest_ckpt_link):
+                        os.remove(latest_ckpt_link)
+                    os.symlink(
+                        os.path.abspath(checkpoint_path), latest_ckpt_link)
+                else:
+                    latest_ckpt_link = os.path.join(checkpoint_dir,
+                                                    'latest-checkpoint.pt')
+                    if os.path.islink(latest_ckpt_link) or os.path.exists(
+                            latest_ckpt_link):
+                        os.remove(latest_ckpt_link)
 
                 latest_sf_link = os.path.join(checkpoint_dir,
                                               'latest-checkpoint.safetensors')
@@ -485,9 +494,9 @@ class FSDPTrainRunner(BaseTrainRunner):
             f'         |-> Max Steps = {num_training_steps}\n\n'  # noqa: E221, E501
         )
 
-    def clip_grad_norm(self) -> None:
+    def clip_grad_norm(self) -> torch.Tensor:
         # Note =>> FSDP uses a custom `clip_grad_norm_` function; requires *uniform grad dtype*  # noqa: E501
-        self.vla.clip_grad_norm_(max_norm=self.max_grad_norm)
+        return self.vla.clip_grad_norm_(max_norm=self.max_grad_norm)
 
     def _load_model_state(self, checkpoint_model_state: dict) -> None:
         """Load FSDP model state from checkpoint.

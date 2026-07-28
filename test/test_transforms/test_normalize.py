@@ -55,6 +55,28 @@ class TestNormalizeStatesAndActions(unittest.TestCase):
             [[-0.5, 0.5, 0.0, 0.0], [0.5, -0.5, 0.0, 0.0]],
             atol=1e-6)
 
+    def test_state_padding_dimensions_remain_zero(self):
+        transform = NormalizeStatesAndActions(
+            state_key='proprio',
+            action_key=None,
+            state_dim=32,
+            norm_type='min_max',
+            state_norm_mask=[True] * 28 + [False] * 4)
+        data = {
+            'states': np.zeros(32, dtype=np.float32),
+            'stats': {
+                'proprio': {
+                    'min': [0.0] * 32,
+                    'max': [1.0] * 28 + [0.0] * 4,
+                },
+            },
+        }
+
+        output = transform(data)
+
+        np.testing.assert_allclose(output['states'][:28], -1.0, atol=1e-6)
+        np.testing.assert_array_equal(output['states'][28:], 0.0)
+
 
 if __name__ == '__main__':
     unittest.main()

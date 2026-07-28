@@ -48,6 +48,17 @@ class TestAddStateGaussianNoise(unittest.TestCase):
         out = transform({'states': states})
         self.assertEqual(out['states'].shape, states.shape)
 
+    def test_per_dimension_std_preserves_padding(self):
+        np.random.seed(0)
+        transform = AddStateGaussianNoise(
+            noise_std=[0.01] * 28 + [0.0] * 4, prob=1.0)
+        states = np.zeros(32, dtype=np.float32)
+
+        out = transform({'states': states})
+
+        self.assertTrue(np.any(out['states'][:28] != 0.0))
+        np.testing.assert_array_equal(out['states'][28:], 0.0)
+
 
 if __name__ == '__main__':
     unittest.main()

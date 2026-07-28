@@ -20,7 +20,7 @@ import os
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import numpy as np
 import torch
@@ -91,6 +91,8 @@ class BaseTrainRunner(ABC):
                  grad_accumulation_steps: int = 1,
                  evaluator: Optional[Dict] = None,
                  tokenizer: Optional[Dict] = None,
+                 save_pt_checkpoints: bool = True,
+                 checkpoint_run_dir: Optional[str] = None,
                  resume_from: Optional[str] = None):
         from ..utils.builder import (build_collator_from_cfg,
                                      build_metric_from_cfg, build_vla_from_cfg)
@@ -158,6 +160,8 @@ class BaseTrainRunner(ABC):
         else:
             self.tokenizer = None
 
+        self.save_pt_checkpoints = bool(save_pt_checkpoints)
+        self.checkpoint_run_dir = checkpoint_run_dir
         # Initialize training state
         self.current_epoch = 0
         self.steps_per_epoch = None  # Determined at runtime
@@ -351,8 +355,8 @@ class BaseTrainRunner(ABC):
         ...
 
     @abstractmethod
-    def clip_grad_norm(self):
-        """Clip gradient norm. Must be implemented by subclasses."""
+    def clip_grad_norm(self) -> Optional[torch.Tensor]:
+        """Clip gradients and return their norm before clipping."""
         ...
 
     @abstractmethod
@@ -537,25 +541,46 @@ class BaseTrainRunner(ABC):
 
     def _cleanup_old_checkpoints(self, checkpoint_dir: str):
         """Clean up old checkpoint files, keeping only the most recent ones."""
-        ckpt_files = sorted(
-            [
-                f for f in os.listdir(checkpoint_dir)
-                if f.endswith('.pt') and f != 'latest-checkpoint.pt'
-            ],
-            key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
-        if len(ckpt_files) > self.max_keep_ckpts:
-            for old_ckpt in ckpt_files[:-self.max_keep_ckpts]:
+        if not self.save_pt_checkpoints:
+            for filename in os.listdir(checkpoint_dir):
+                if filename.endswith('.pt') or filename == 'latest-checkpoint.pt':
+                    pt_path = os.path.join(checkpoint_dir, filename)
+                    if os.path.exists(pt_path) or os.path.islink(pt_path):
+                        os.remove(pt_path)
+                        overwatch.info(
+                            f'Removed disabled .pt checkpoint file: {filename}')
+
+        ckpt_stems = {}
+        for filename in os.listdir(checkpoint_dir):
+            if filename.startswith('latest-checkpoint.'):
+                continue
+            if filename.endswith('.pt'):
+                stem = filename[:-len('.pt')]
+            elif filename.endswith('.safetensors'):
+                stem = filename[:-len('.safetensors')]
+            else:
+                continue
+            path = os.path.join(checkpoint_dir, filename)
+            ckpt_stems[stem] = max(
+                ckpt_stems.get(stem, 0.0), os.path.getmtime(path))
+
+        ordered_stems = [
+            stem for stem, _ in sorted(
+                ckpt_stems.items(), key=lambda item: item[1])
+        ]
+        if len(ordered_stems) > self.max_keep_ckpts:
+            for old_stem in ordered_stems[:-self.max_keep_ckpts]:
                 try:
-                    os.remove(os.path.join(checkpoint_dir, old_ckpt))
-                    overwatch.info(f'Removed old checkpoint: {old_ckpt}')
-                    sf_file = old_ckpt.replace('.pt', '.safetensors')
-                    sf_path = os.path.join(checkpoint_dir, sf_file)
-                    if os.path.exists(sf_path):
-                        os.remove(sf_path)
-                        overwatch.info(f'Removed old safetensors: {sf_file}')
+                    for suffix in ('.pt', '.safetensors'):
+                        old_file = old_stem + suffix
+                        old_path = os.path.join(checkpoint_dir, old_file)
+                        if os.path.exists(old_path):
+                            os.remove(old_path)
+                            overwatch.info(
+                                f'Removed old checkpoint file: {old_file}')
                 except Exception as e:
                     overwatch.warning(
-                        f'Failed to remove checkpoint {old_ckpt}: {e}')
+                        f'Failed to remove checkpoint {old_stem}: {e}')
 
     def _resolve_lr_scheduler_cfg(self) -> Dict:
         if self.lr_scheduler_cfg is None:
@@ -937,6 +962,11 @@ class BaseTrainRunner(ABC):
             logged_loss /= dist.get_world_size()
         else:
             logged_loss = loss.detach()
+        self._raise_if_nonfinite(
+            logged_loss,
+            'loss',
+            details_factory=lambda: self._describe_forward_nonfinite(
+                batch, output, loss))
         self.metric.commit(loss=logged_loss, **loss_metrics)
         (loss / self.grad_accumulation_steps).backward()
 
@@ -954,7 +984,12 @@ class BaseTrainRunner(ABC):
             return loss.detach()
 
         # Gradient step with fallback on optimizer state mismatch
-        self.clip_grad_norm()
+        grad_norm = self.clip_grad_norm()
+        if grad_norm is not None:
+            self._raise_if_nonfinite(
+                grad_norm,
+                'gradient norm',
+                details_factory=self._describe_gradient_nonfinite)
         try:
             self.optimizer.step()
         except RuntimeError as e:
@@ -973,6 +1008,101 @@ class BaseTrainRunner(ABC):
                 loss = loss.detach().new_tensor(custom_loss)
 
         return loss
+
+    @staticmethod
+    def _nonfinite_tensor_summary(name: str,
+                                  value: torch.Tensor) -> Optional[str]:
+        if not isinstance(value, torch.Tensor):
+            return None
+        detached = value.detach()
+        finite = torch.isfinite(detached)
+        if finite.all().item():
+            return None
+        nan_count = torch.isnan(detached).sum().item()
+        inf_count = torch.isinf(detached).sum().item()
+        return (f'{name}: shape={tuple(detached.shape)}, dtype={detached.dtype}, '
+                f'nan={nan_count}, inf={inf_count}')
+
+    def _describe_forward_nonfinite(self, batch: Dict, output,
+                                    loss: torch.Tensor) -> str:
+        """Identify whether a failed forward started in inputs or predictions."""
+        findings = []
+        for key in (
+                'states', 'actions', 'images', 'lang_tokens', 'lang_masks',
+                'img_masks', 'action_masks', 'sample_weight'):
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor):
+                summary = self._nonfinite_tensor_summary(f'input.{key}', value)
+                if summary:
+                    findings.append(summary)
+
+        predictions = output.get('predictions') if hasattr(output,
+                                                            'get') else None
+        summary = self._nonfinite_tensor_summary('output.predictions',
+                                                 predictions)
+        if summary:
+            findings.append(summary)
+        summary = self._nonfinite_tensor_summary('local_loss', loss)
+        if summary:
+            findings.append(summary)
+
+        sample_context = []
+        for key in ('task_description', 'prompt'):
+            value = batch.get(key)
+            if isinstance(value, (list, tuple)) and value:
+                sample_context.append(f'{key}[0]={str(value[0])[:160]!r}')
+
+        if not findings:
+            findings.append(
+                'local inputs, predictions, and loss are finite; another rank '
+                'reported the non-finite loss')
+        if sample_context:
+            findings.append(', '.join(sample_context))
+        return '; '.join(findings)
+
+    def _describe_gradient_nonfinite(self) -> str:
+        findings = []
+        for name, parameter in self.vla.named_parameters():
+            if parameter.grad is None:
+                continue
+            summary = self._nonfinite_tensor_summary(f'grad.{name}',
+                                                     parameter.grad)
+            if summary:
+                findings.append(summary)
+                if len(findings) == 8:
+                    findings.append('additional non-finite gradients omitted')
+                    break
+        if not findings:
+            findings.append(
+                'gradient norm is non-finite, but this rank has no locally '
+                'visible non-finite gradient shard')
+        return '; '.join(findings)
+
+    def _raise_if_nonfinite(
+            self,
+            value: torch.Tensor,
+            name: str,
+            details_factory: Optional[Callable[[], str]] = None) -> None:
+        """Stop every rank before an invalid optimizer update can run."""
+        value = torch.as_tensor(value).detach()
+        if torch.isfinite(value).all().item():
+            return
+
+        local_details = (
+            details_factory() if details_factory is not None else
+            f'rank {overwatch.rank()} reported {name}={value}')
+        if dist.is_available() and dist.is_initialized():
+            details = [None] * dist.get_world_size()
+            dist.all_gather_object(details, local_details)
+        else:
+            details = [local_details]
+
+        step = self.metric.global_step + 1
+        raise FloatingPointError(
+            f'Non-finite {name} detected at global step {step}; aborting '
+            'before optimizer.step(). Diagnostics: ' + ' | '.join(
+                f'rank {rank}: {detail}'
+                for rank, detail in enumerate(details)))
 
     def _reinit_optimizer(self):
         """Reinitialize optimizer on state mismatch."""
@@ -999,11 +1129,21 @@ class BaseTrainRunner(ABC):
         else:
             avg_loss = loss_value
 
-        self.save_checkpoint(self.metric.run_dir, self.metric.global_step,
+        self.save_checkpoint(self._get_checkpoint_run_dir(),
+                             self.metric.global_step,
                              self.current_epoch, avg_loss)
         dist.barrier()
 
+    def _get_checkpoint_run_dir(self) -> str:
+        return self.checkpoint_run_dir or self.metric.run_dir
+
     def _get_checkpoint_path(self) -> str:
         """Get latest checkpoint path."""
-        return os.path.join(self.metric.run_dir, 'checkpoints',
-                            'latest-checkpoint.pt')
+        checkpoint_dir = os.path.join(self._get_checkpoint_run_dir(),
+                                      'checkpoints')
+        safetensors_path = os.path.join(checkpoint_dir,
+                                        'latest-checkpoint.safetensors')
+        pt_path = os.path.join(checkpoint_dir, 'latest-checkpoint.pt')
+        if not self.save_pt_checkpoints and os.path.exists(safetensors_path):
+            return safetensors_path
+        return pt_path

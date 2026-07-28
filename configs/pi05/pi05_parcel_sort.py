@@ -165,6 +165,8 @@ train_dataloader = dict(
                 # hand, then move it onto the conveyor belt with the right
                 # hand.") is used as-is; no override needed.
                 transforms=[
+                    # Match the 2026_07_17 checkpoint: raw state padding is
+                    # min-max normalized from 0 to -1 before prompt encoding.
                     dict(
                         type='NormalizeStatesAndActions',
                         action_dim=_MODEL_ACTION_DIM,
@@ -172,8 +174,6 @@ train_dataloader = dict(
                         state_key='proprio',
                         action_key='action',
                         norm_type='min_max',
-                        state_norm_mask=[True] * _JOINT_DIM + [False] *
-                        (_MODEL_ACTION_DIM - _JOINT_DIM),
                         action_norm_mask=[True] * _JOINT_DIM + [False] *
                         (_MODEL_ACTION_DIM - _JOINT_DIM)),
                     dict(type='AddStateGaussianNoise', noise_std=0.01),
