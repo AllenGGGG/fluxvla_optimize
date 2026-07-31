@@ -115,9 +115,7 @@ model = dict(
         vocab_size=257152),
     freeze_llm_backbone=False,
     freeze_vision_backbone=False,
-    pretrained_name_or_path=  # noqa: E251
-    '/data/guohao/FluxVLA_workdirs/checkpoints/2026_07_17/checkpoints/'
-    'step-048300-epoch-07-loss=0.0041.safetensors',  # noqa: E501
+    pretrained_name_or_path='model.safetensors',
     name_mapping={
         'llm_backbone': 'paligemma_with_expert.paligemma.model.language_model',
         'vision_backbone.vision':
@@ -177,15 +175,15 @@ train_dataloader = dict(
                     # --exclude-joint-names ... --pad-to 32`, or
                     # NormalizeStatesAndActions will silently normalize
                     # against the wrong joint's stats.
-                    dict(
-                        type='SelectJointDims',
-                        exclude_joint_names=[
-                            'body_joint1',
-                            'body_joint2',
-                            'head_joint1',
-                            'head_joint2',
-                        ],
-                        pad_to=_MODEL_ACTION_DIM),
+                    # dict(
+                    #     type='SelectJointDims',
+                    #     exclude_joint_names=[
+                    #         'body_joint1',
+                    #         'body_joint2',
+                    #         'head_joint1',
+                    #         'head_joint2',
+                    #     ],
+                    #     pad_to=_MODEL_ACTION_DIM),
                     dict(
                         type='NormalizeStatesAndActions',
                         action_dim=_MODEL_ACTION_DIM,
