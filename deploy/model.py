@@ -25,7 +25,6 @@ import torch
 from fluxvla.engines.runners.base_inference_runner import BaseInferenceRunner
 from fluxvla.engines.utils.root import OPERATORS
 
-from .config import WorkerConfig
 from .utils import MODEL_JOINT_DIM, MODEL_TENSOR_DIM
 
 
@@ -95,7 +94,21 @@ class FluxVLAPolicy(BaseInferenceRunner):
 
     def __init__(
         self,
-        worker_cfg: WorkerConfig,
+        *,
+        model_id: str,
+        inference_config: str,
+        device: str,
+        dtype: str,
+        num_inference_steps_override: int = 0,
+        norm_stats_path: str | None = None,
+        tokenizer_path: str | None = None,
+        rtc_method: str = "none",
+        rtc_execution_horizon: int = 10,
+        rtc_replan_remaining: int = 0,
+        chunk_publish_horizon: int = 0,
+        rtc_publish_horizon: int = 0,
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_schedule: str = "exp",
         log_info: Callable[[str], None] | None = None,
     ) -> None:
         # Imported here (not module level) to keep ROS protocol inspection
@@ -116,29 +129,31 @@ class FluxVLAPolicy(BaseInferenceRunner):
             )
             stage_started = now
 
-        self.cfg = worker_cfg
-        self.device = worker_cfg.device
-        checkpoint_path = Path(worker_cfg.model_id).expanduser().resolve()
-        inference_config_path = Path(worker_cfg.inference_config).expanduser().resolve()
+        self.device = device
+        self.rtc_method = rtc_method
+        self.rtc_execution_horizon = rtc_execution_horizon
+        self.rtc_replan_remaining = rtc_replan_remaining
+        self.chunk_publish_horizon = chunk_publish_horizon
+        self.rtc_publish_horizon = rtc_publish_horizon
+        self.rtc_max_guidance_weight = rtc_max_guidance_weight
+        self.rtc_schedule = rtc_schedule
+
+        checkpoint_path = Path(model_id).expanduser().resolve()
+        inference_config_path = Path(inference_config).expanduser().resolve()
         log_success(
             "paths validated: "
             f"checkpoint={checkpoint_path} inference_config={inference_config_path}"
         )
 
         inference_cfg = Config.fromfile(str(inference_config_path))
-        inference_options = inference_cfg.get('inference_options', {})
-        for name, value in inference_options.items():
-            if hasattr(worker_cfg, name):
-                setattr(worker_cfg, name, value)
-        if worker_cfg.num_inference_steps_override > 0:
+        if num_inference_steps_override > 0:
             inference_cfg.inference_model['num_steps'] = (
-                worker_cfg.num_inference_steps_override)
-        if worker_cfg.tokenizer_path:
-            tokenizer_path = Path(
-                worker_cfg.tokenizer_path).expanduser().resolve()
-            if not tokenizer_path.exists():
+                num_inference_steps_override)
+        if tokenizer_path:
+            tokenizer_path_resolved = Path(tokenizer_path).expanduser().resolve()
+            if not tokenizer_path_resolved.exists():
                 raise FileNotFoundError(
-                    f"tokenizer path does not exist: {tokenizer_path}")
+                    f"tokenizer path does not exist: {tokenizer_path_resolved}")
             if not any(
                     transform.get('type') == 'ProcessPrompts'
                     for transform in inference_cfg.dataset['transforms']):
@@ -147,7 +162,7 @@ class FluxVLAPolicy(BaseInferenceRunner):
                 )
             # PrivateInferenceDataset gives this explicit path precedence over
             # its normal <checkpoint-root>/tokenizer convention.
-            inference_cfg.dataset['tokenizer_path'] = str(tokenizer_path)
+            inference_cfg.dataset['tokenizer_path'] = str(tokenizer_path_resolved)
         norm_type = inference_cfg.dataset['transforms'][0]['norm_type']
         if inference_cfg.denormalize_action['norm_type'] != norm_type:
             raise ValueError(
@@ -155,7 +170,7 @@ class FluxVLAPolicy(BaseInferenceRunner):
             )
         log_success(
             f"inference config loaded: type={inference_cfg.inference_model['type']} "
-            f"norm_type={norm_type} rtc_method={worker_cfg.rtc_method}"
+            f"norm_type={norm_type} rtc_method={rtc_method}"
         )
 
         super().__init__(
@@ -164,19 +179,19 @@ class FluxVLAPolicy(BaseInferenceRunner):
             dataset=copy.deepcopy(inference_cfg.dataset),
             denormalize_action=copy.deepcopy(inference_cfg.denormalize_action),
             operator=dict(type='NullOperator'),
-            mixed_precision_dtype=worker_cfg.dtype,
-            enable_mixed_precision=worker_cfg.device == 'cuda',
+            mixed_precision_dtype=dtype,
+            enable_mixed_precision=device == 'cuda',
         )
         vla_type = type(self.vla).__name__
         log_success(f"model structure built: type={vla_type}")
 
-        if worker_cfg.rtc_method != "none":
-            supported = _RTC_METHOD_SUPPORTED_TYPES.get(worker_cfg.rtc_method, set())
+        if rtc_method != "none":
+            supported = _RTC_METHOD_SUPPORTED_TYPES.get(rtc_method, set())
             if vla_type not in supported:
                 raise ValueError(
-                    f"rtc_method={worker_cfg.rtc_method!r} requires an "
+                    f"rtc_method={rtc_method!r} requires an "
                     f"inference_config whose inference_model.type implements "
-                    f"RTC {worker_cfg.rtc_method!r} (one of {sorted(supported)}), "
+                    f"RTC {rtc_method!r} (one of {sorted(supported)}), "
                     f"but got type={vla_type!r}, which silently ignores "
                     f"prev_actions/prefix_len/rtc_config."
                 )
@@ -188,13 +203,13 @@ class FluxVLAPolicy(BaseInferenceRunner):
         # BaseInferenceRunner.__init__ always derives dataset_statistics.json
         # from ckpt_path's grandparent directory; override with an explicit
         # path here if the caller gave one (e.g. stats live somewhere else).
-        if worker_cfg.norm_stats_path:
-            norm_stats_path = Path(worker_cfg.norm_stats_path).expanduser().resolve()
-            with open(norm_stats_path, 'r', encoding='utf-8') as f:
+        if norm_stats_path:
+            norm_stats_path_resolved = Path(norm_stats_path).expanduser().resolve()
+            with open(norm_stats_path_resolved, 'r', encoding='utf-8') as f:
                 norm_stats = json.load(f)
             self.dataset.norm_stats = norm_stats
             self.denormalize_action.norm_stats = norm_stats
-            log_success(f"norm_stats overridden: path={norm_stats_path}")
+            log_success(f"norm_stats overridden: path={norm_stats_path_resolved}")
         # log_success(f"norm_stats loaded: {self.dataset.norm_stats}")
 
         # run_setup() moves the model to CUDA and sets the global seed; it
@@ -203,7 +218,7 @@ class FluxVLAPolicy(BaseInferenceRunner):
         self.n_action_steps = int(getattr(self.vla, 'n_action_steps', 50))
         log_success(
             "model ready: "
-            f"dtype={worker_cfg.dtype} eval=true action_horizon={self.n_action_steps}"
+            f"dtype={dtype} eval=true action_horizon={self.n_action_steps}"
         )
 
         # Reused (not reimplemented) for RTC prev_actions normalization: the
@@ -242,13 +257,12 @@ class FluxVLAPolicy(BaseInferenceRunner):
         prefix must match -- the exec engine's real unconsumed queue tail,
         not a self-tracked guess (see ``predict_chunk``).
         """
-        cfg = self.cfg
-        if cfg.rtc_method == "none" or guidance_prev is None or not len(
+        if self.rtc_method == "none" or guidance_prev is None or not len(
                 guidance_prev):
             return {}
         previous = self._normalize_prev_actions(guidance_prev)
         if prefix_len is None:
-            prefix_len = cfg.rtc_execution_horizon
+            prefix_len = self.rtc_execution_horizon
         prefix_len = min(prefix_len, len(previous))
         if prefix_len <= 0:
             return {}
@@ -256,13 +270,13 @@ class FluxVLAPolicy(BaseInferenceRunner):
             "prev_actions": torch.from_numpy(previous).unsqueeze(0).to(self.device),
             "prefix_len": prefix_len,
             "rtc_config": {
-                "method": cfg.rtc_method,
+                "method": self.rtc_method,
                 "decay_end": min(
-                    prefix_len + cfg.rtc_execution_horizon,
+                    prefix_len + self.rtc_execution_horizon,
                     len(previous),
                 ),
-                "schedule": cfg.rtc_schedule,
-                "max_guidance_weight": cfg.rtc_max_guidance_weight,
+                "schedule": self.rtc_schedule,
+                "max_guidance_weight": self.rtc_max_guidance_weight,
                 "use_vjp": False,
             },
         }
@@ -383,9 +397,8 @@ class FluxVLAPolicy(BaseInferenceRunner):
         collapsing decay_end onto prefix_len and dropping guidance weight
         straight from 1.0 to 0 with no taper.
         """
-        cfg = self.cfg
         prefix_len = (
-            delay + cfg.rtc_execution_horizon
+            delay + self.rtc_execution_horizon
             if guidance_prev is not None
             else None
         )
@@ -405,10 +418,11 @@ class FluxVLAPolicy(BaseInferenceRunner):
 
 
 def build_predict_fn(
-    worker_cfg: WorkerConfig,
+    *,
     log_info: Callable[[str], None] | None = None,
+    **kwargs: Any,
 ) -> PredictBundle:
-    worker = FluxVLAPolicy(worker_cfg, log_info=log_info)
+    worker = FluxVLAPolicy(log_info=log_info, **kwargs)
     return PredictBundle(
         fn=worker.predict_chunk, n_action_steps=worker.n_action_steps
     )

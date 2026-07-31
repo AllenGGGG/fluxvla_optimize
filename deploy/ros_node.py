@@ -22,8 +22,8 @@ from .config import (
     DEFAULT_INFERENCE_CONFIG,
     DEFAULT_MODEL_ID,
     DEFAULT_TASK,
-    WorkerConfig,
     default_device,
+    load_inference_options,
 )
 from .utils import (
     MODEL_JOINT_DIM,
@@ -174,6 +174,20 @@ class JointInferenceNode(Node):
         self.declare_parameter("norm_stats_path", "")
         self.declare_parameter("tokenizer_path", "")
 
+        # RTC/algorithm knobs default to whatever the selected inference_config
+        # file's inference_options dict says (see configs/pi05/
+        # pi05_parcel_sort_none_pytorch_inference.py); still declared as ROS2
+        # parameters so `-p name:=value` can override them at launch.
+        inference_options = load_inference_options(
+            str(self.get_parameter("inference_config").value)
+        )
+        self._inference_option_names = list(inference_options)
+        for name, default in inference_options.items():
+            self.declare_parameter(name, default)
+
+        # robot_exec_hz is a ROS2/control-loop fact -- it must match the real
+        # control timer frequency below, independent of which model/RTC
+        # config is loaded, so it is never sourced from inference_options.
         self.declare_parameter("robot_exec_hz", 30.0)
         self.declare_parameter("execution_mode", "async")
         self.declare_parameter("auto_start", False)
@@ -234,14 +248,14 @@ class JointInferenceNode(Node):
         self.left_hand_topic = str(value("left_hand_topic"))
         self.right_hand_topic = str(value("right_hand_topic"))
 
-        self.worker_cfg = WorkerConfig(
-            model_id=self.model_id,
-            inference_config=str(value("inference_config")),
-            device=str(value("device")),
-            dtype=str(value("dtype")),
-            norm_stats_path=str(value("norm_stats_path")).strip() or None,
-            tokenizer_path=str(value("tokenizer_path")).strip() or None,
-        )
+        self.inference_config = str(value("inference_config"))
+        self.device = str(value("device"))
+        self.dtype = str(value("dtype"))
+        self.norm_stats_path = str(value("norm_stats_path")).strip() or None
+        self.tokenizer_path = str(value("tokenizer_path")).strip() or None
+
+        for name in self._inference_option_names:
+            setattr(self, name, value(name))
 
     def _create_backend(self) -> InferBackend:
         # Keep ROS protocol inspection importable without a PyTorch installation.
@@ -249,9 +263,20 @@ class JointInferenceNode(Node):
 
         debug = bool(self.get_parameter("debug").value)
         debug_dir = str(self.get_parameter("debug_dir").value)
+        # inference_options-derived kwargs (rtc_method, rtc_execution_horizon,
+        # etc.) are forwarded dynamically from self._inference_option_names --
+        # the same list _read_parameters() used to set these attributes --
+        # so adding a new inference_options field never requires touching
+        # this call site to keep it wired through.
         bundle = build_predict_fn(
-            self.worker_cfg,
+            model_id=self.model_id,
+            inference_config=self.inference_config,
+            device=self.device,
+            dtype=self.dtype,
+            norm_stats_path=self.norm_stats_path,
+            tokenizer_path=self.tokenizer_path,
             log_info=self.get_logger().info,
+            **{name: getattr(self, name) for name in self._inference_option_names},
         )
         predict_fn = bundle.fn
 
@@ -267,24 +292,24 @@ class JointInferenceNode(Node):
 
         bundle.fn = logged_predict
         if self.execution_mode == "serial":
-            if self.worker_cfg.rtc_method != "none":
+            if self.rtc_method != "none":
                 raise ValueError(
                     "serial execution requires rtc_method='none'; RTC needs "
                     "an unconsumed async queue prefix"
                 )
             return SerialInferenceBackend(
                 bundle,
-                publish_horizon=self.worker_cfg.chunk_publish_horizon,
+                publish_horizon=self.chunk_publish_horizon,
             )
 
         return ChunkScheduler(
             bundle,
             ChunkSchedulerConfig(
-                rtc_enabled=self.worker_cfg.rtc_method != "none",
-                execution_horizon=self.worker_cfg.rtc_execution_horizon,
-                replan_remaining=self.worker_cfg.rtc_replan_remaining,
-                publish_horizon=self.worker_cfg.chunk_publish_horizon,
-                rtc_publish_horizon=self.worker_cfg.rtc_publish_horizon,
+                rtc_enabled=self.rtc_method != "none",
+                execution_horizon=self.rtc_execution_horizon,
+                replan_remaining=self.rtc_replan_remaining,
+                publish_horizon=self.chunk_publish_horizon,
+                rtc_publish_horizon=self.rtc_publish_horizon,
                 debug=debug,
                 debug_dir=debug_dir or "/tmp/rtc_debug",
             ),

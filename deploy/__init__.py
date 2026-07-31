@@ -1,6 +1,6 @@
 from typing import Any
 
-__all__ = ["JointInferenceNode", "WorkerConfig"]
+__all__ = ["JointInferenceNode"]
 
 
 def __getattr__(name: str) -> Any:
@@ -8,8 +8,4 @@ def __getattr__(name: str) -> Any:
         from .ros_node import JointInferenceNode
 
         return JointInferenceNode
-    if name == "WorkerConfig":
-        from .config import WorkerConfig
-
-        return WorkerConfig
     raise AttributeError(name)
