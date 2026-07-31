@@ -45,7 +45,11 @@ dataset = dict(
             type='EpisodeMetadataPrompter',
             training=False,
             control_mode='joint',
-            desired_advantage=True),
+            desired_advantage=True,
+            # 1.0 = normal speed, the neutral value in training's
+            # vsta_kwargs.speed_set=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+            # (pi05_parcel_sort_recap.py).
+            desired_speed=1.0),
         dict(type='PreparePromptWithState'),
         dict(
             type='ProcessPrompts',

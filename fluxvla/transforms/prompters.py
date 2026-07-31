@@ -284,24 +284,18 @@ class EpisodeMetadataPrompter:
     marker:
 
         Task: peel vegetables. Subtask: pick up the peeler.
-        Speed: 8000. Advantage: true. Control Mode: joint.
+        Speed: 1.25. Advantage: true. Control Mode: joint.
 
     This is a general-purpose transform (not task/embodiment-specific): the
     same class is used for both training (with dropout) and eval (fixed
     desired values, no dropout) by toggling `training`.
 
     Speed text:
-        Two-step derivation. (1) `VSTADataset` samples a
-        `tempo_speed` multiplier and resamples the action window with it
-        (window-level VSTA augmentation). (2) This transform combines that
-        `tempo_speed` with the episode's *original* length (from
-        `episode_metadata['length']`, i.e. `episodes.jsonl`) to estimate the
-        actual execution length after augmentation:
-            estimated_steps = original_length / tempo_speed
-        (tempo_speed > 1 -> fewer steps -> faster execution, matching the
-        q/p convention used by the VSTA resampler), then buckets it to the
-        nearest `speed_bucket_size` steps. Samples without `tempo_speed` (no
-        VSTA augmentation applied) use `original_length` directly.
+        Read verbatim from `inputs['tempo_speed']` -- the speed multiplier
+        `VSTADataset`/`VSTAPackedParquetDatasetV3` sampled for this window's
+        VSTA augmentation (tempo_speed > 1 -> faster execution). Omitted
+        entirely when `tempo_speed` is absent (no VSTA augmentation applied
+        to this sample).
 
     Advantage text:
         Read verbatim from the per-frame `inputs['advantage']` column (1/0),
@@ -317,32 +311,29 @@ class EpisodeMetadataPrompter:
         training (bool): If True, apply block/field dropout using sampled
             values from `inputs`. If False (eval), use `desired_speed` /
             `desired_advantage` verbatim and never drop anything.
-        speed_bucket_size (int): Bucket width in timesteps for the Speed
-            field (pi0.7 uses 500).
         block_dropout_prob (float): Probability of omitting the entire
             metadata block (training only).
         field_dropout_prob (float): Probability of omitting Speed/Advantage
             individually (training only; Control Mode is never dropped).
         control_mode (str | None): Static text identifier (e.g. 'joint',
             'ee'). If None, the Control Mode field is omitted entirely.
-        desired_speed (int | None): Eval-only fixed Speed bucket value.
+        desired_speed (float | None): Eval-only fixed Speed value (a
+            tempo_speed multiplier, e.g. 1.0 for normal speed).
         desired_advantage (bool | None): Eval-only fixed Advantage value.
         seed (int | None): RNG seed for dropout sampling.
     """
 
     def __init__(self,
                  training: bool = True,
-                 speed_bucket_size: int = 500,
                  block_dropout_prob: float = 0.15,
                  field_dropout_prob: float = 0.05,
                  control_mode: Optional[str] = 'joint',
-                 desired_speed: Optional[int] = None,
+                 desired_speed: Optional[float] = None,
                  desired_advantage: Optional[bool] = None,
                  seed: Optional[int] = None,
                  *args,
                  **kwargs) -> None:
         self.training = training
-        self.speed_bucket_size = speed_bucket_size
         self.block_dropout_prob = block_dropout_prob
         self.field_dropout_prob = field_dropout_prob
         self.control_mode = control_mode
@@ -350,19 +341,12 @@ class EpisodeMetadataPrompter:
         self.desired_advantage = desired_advantage
         self._rng = np.random.default_rng(seed)
 
-    def _speed_bucket(self, inputs: Dict[str, Any]) -> Optional[int]:
+    def _speed_value(self, inputs: Dict[str, Any]) -> Optional[float]:
         if not self.training:
             return self.desired_speed
 
-        episode_metadata = inputs.get('episode_metadata') or {}
-        original_length = episode_metadata.get('length')
-        if original_length is None:
-            return None
-
-        tempo_speed = inputs.get('tempo_speed', 1.0) or 1.0
-        estimated_steps = original_length / tempo_speed
-        bucket = round(estimated_steps / self.speed_bucket_size)
-        return int(bucket) * self.speed_bucket_size
+        tempo_speed = inputs.get('tempo_speed')
+        return float(tempo_speed) if tempo_speed is not None else None
 
     def _advantage(self, inputs: Dict[str, Any]) -> Optional[bool]:
         if not self.training:
@@ -393,9 +377,9 @@ class EpisodeMetadataPrompter:
 
         parts = []
 
-        speed_bucket = self._speed_bucket(inputs)
-        if speed_bucket is not None and self._keep_field():
-            parts.append(f'Speed: {speed_bucket}.')
+        speed_value = self._speed_value(inputs)
+        if speed_value is not None and self._keep_field():
+            parts.append(f'Speed: {speed_value}.')
 
         advantage = self._advantage(inputs)
         if advantage is not None and self._keep_field():
