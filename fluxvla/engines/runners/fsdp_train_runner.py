@@ -142,6 +142,13 @@ class FSDPTrainRunner(BaseTrainRunner):
         self.fsdp_save_policy = FullStateDictConfig(
             offload_to_cpu=True, rank0_only=True)
 
+    def _barrier(self) -> None:
+        """Synchronize ranks with an explicit NCCL device mapping."""
+        if dist.get_backend() == dist.Backend.NCCL:
+            dist.barrier(device_ids=[self.device_id])
+        else:
+            dist.barrier()
+
     def save_checkpoint(
         self,
         run_dir: Path,
@@ -204,7 +211,7 @@ class FSDPTrainRunner(BaseTrainRunner):
             # This prevents AssertionError about different step values across
             # ranks
             # First barrier: ensure all ranks reach this point
-            dist.barrier()
+            self._barrier()
 
             # For FSDP, we need to ensure optimizer states are synchronized
             # before calling full_optim_state_dict
@@ -213,7 +220,7 @@ class FSDPTrainRunner(BaseTrainRunner):
             if self.save_pt_checkpoints and self.optimizer is not None:
                 # Ensure all ranks have completed the same number of optimizer
                 # steps by synchronizing before gathering the full state
-                dist.barrier()
+                self._barrier()
                 full_optimizer_state_dict = FSDP.full_optim_state_dict(
                     self.vla, self.optimizer)
             else:
@@ -451,7 +458,7 @@ class FSDPTrainRunner(BaseTrainRunner):
                     check_fn=check_fn)
 
         # Barrier =>> Sharding takes a minute?
-        dist.barrier()
+        self._barrier()
         # Create Optimizer and LR Scheduler
         # Use base class method to setup optimizer and scheduler
         self._setup_optimizer_and_scheduler(n_train_examples)
@@ -508,7 +515,7 @@ class FSDPTrainRunner(BaseTrainRunner):
             overwatch.info('Loading FSDP model state')
 
         # Synchronize all ranks before loading model state
-        dist.barrier()
+        self._barrier()
 
         # Load model state dict using FSDP state_dict_type
         with FSDP.state_dict_type(self.vla, self.fsdp_state_dict_type,
@@ -528,7 +535,7 @@ class FSDPTrainRunner(BaseTrainRunner):
             self.vla.load_state_dict(checkpoint_model_state, strict=False)
 
         # Synchronize after loading
-        dist.barrier()
+        self._barrier()
 
         if overwatch.is_rank_zero():
             overwatch.info('FSDP model state restored from checkpoint')
@@ -551,7 +558,7 @@ class FSDPTrainRunner(BaseTrainRunner):
 
         # Synchronize all ranks before loading optimizer state
         # This ensures all ranks are at the same point
-        dist.barrier()
+        self._barrier()
 
         # Load full optimizer state dict on rank 0, then shard it
         full_osd = checkpoint_optimizer_state
@@ -571,7 +578,7 @@ class FSDPTrainRunner(BaseTrainRunner):
         self.optimizer_state_loaded = True
 
         # Synchronize after loading to ensure all ranks have loaded
-        dist.barrier()
+        self._barrier()
 
         if overwatch.is_rank_zero():
             overwatch.info('FSDP optimizer state restored from checkpoint')

@@ -12,17 +12,17 @@ usage() {
 Usage: bash scripts/train.sh [options] [--cfg-options key=value ...]
 
 Defaults:
-  dataset roots      /data/guohao/FluxVLA_workdirs/dataset/2026_07_23
-                     /data/guohao/FluxVLA_workdirs/dataset/2026_07_24
-                     /data/guohao/FluxVLA_workdirs/dataset/2026_07_25
-                     /data/guohao/FluxVLA_workdirs/dataset/2026_07_27
+  dataset roots      /data/guohao/FluxVLA_workdirs/dataset/2026_07_27
+                     /data/guohao/FluxVLA_workdirs/dataset/2026_07_29
+                     /data/guohao/FluxVLA_workdirs/dataset/2026_07_30
+                     /data/guohao/FluxVLA_workdirs/dataset/2026_07_31
   base model dir     /home/guohao/FluxVLA/checkpoints/pi05_base
-  base weights       /home/guohao/FluxVLA/workdirs/checkpoints/2026_07_27/checkpoints/step-005672-epoch-01-loss=0.0090.safetensors
-  checkpoint dir     /data/guohao/FluxVLA_workdirs/checkpoints/2026_07_27_resume
-  log dir            /data/guohao/FluxVLA_workdirs/logs/2026_07_27_resume
+  base weights       /home/guohao/FluxVLA/workdirs/checkpoints/2026_07_30/checkpoints/step-009324-epoch-02-loss=0.0053.safetensors
+  checkpoint dir     /data/guohao/FluxVLA_workdirs/checkpoints/2026_07_31
+  log dir            /data/guohao/FluxVLA_workdirs/logs/2026_07_31
   batch size         32
-  max epochs         5
-  learning rate      2e-5
+  max epochs         7
+  learning rate      1e-5
   keep checkpoints   5
   checkpoint format  safetensors only
 
@@ -55,18 +55,18 @@ EOF
 
 CONFIG="configs/pi05/pi05_parcel_sort.py"
 DATASET_ROOTS=(
-  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_23"
-  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_24"
-  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_25"
   "/data/guohao/FluxVLA_workdirs/dataset/2026_07_27"
+  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_29"
+  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_30"
+  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_31"
 )
 BASE_MODEL_DIR="/home/guohao/FluxVLA/checkpoints/pi05_base"
-BASE_WEIGHTS="/home/guohao/FluxVLA/workdirs/checkpoints/2026_07_27/checkpoints/step-005672-epoch-01-loss=0.0090.safetensors"
-WORK_DIR="/data/guohao/FluxVLA_workdirs/checkpoints/2026_07_27_resume"
-LOG_DIR="/data/guohao/FluxVLA_workdirs/logs/2026_07_27_resume"
+BASE_WEIGHTS="/home/guohao/FluxVLA/workdirs/checkpoints/2026_07_30/checkpoints/step-009324-epoch-02-loss=0.0053.safetensors"
+WORK_DIR="/data/guohao/FluxVLA_workdirs/checkpoints/2026_07_31"
+LOG_DIR="/data/guohao/FluxVLA_workdirs/logs/2026_07_31"
 BATCH_SIZE=32
-MAX_EPOCHS=5
-LEARNING_RATE="2e-5"
+MAX_EPOCHS=7
+LEARNING_RATE="1e-5"
 MAX_KEEP_CKPTS=5
 SAVE_PT=false
 SAVE_EPOCH_INTERVAL=1
@@ -237,6 +237,10 @@ export PATH="${FLUXVLA_ENV_PREFIX}/bin:${PATH}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES_VALUE}"
 export WANDB_MODE="${WANDB_MODE_VALUE}"
+export WANDB_SILENT="${WANDB_SILENT:-true}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-3}"
 
 RESUME_ARGS=()
 if [[ -n "${RESUME_FROM}" ]]; then

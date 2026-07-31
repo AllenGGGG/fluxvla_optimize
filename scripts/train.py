@@ -19,6 +19,11 @@ import os
 import random
 import socket
 import sys
+import warnings
+
+from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+warnings.filterwarnings('ignore', category=UnsupportedFieldAttributeWarning)
 
 import draccus
 import numpy as np
