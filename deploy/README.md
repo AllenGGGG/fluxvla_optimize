@@ -58,25 +58,17 @@ denormalization use the training statistics.
 The node starts with command publication disabled. It refuses to enable unless:
 
 - `/fsm_state` is `4` (`MOVEJ` in the WBC controller's published state codes);
-- WBC `movej_interpolation_type` is `none` for 30 Hz streaming targets;
 - the WBC and both hand-controller `joints` parameters exactly match the
   deployment order;
 - no other node publishes any of the three command topics;
 - all three cameras and all 32 physical joints are present and fresh;
 - model outputs are finite and within the configured normalized envelope.
 
-With `MANAGE_WBC_INTERPOLATION=true`, the node saves the live WBC interpolation
-value, temporarily sets it to `none` through the ROS parameter service, and
-verifies the read-back before publishing. On a normal shutdown it restores the
-original value. No files under `~/fa_w2_ws` are modified, and this package never
-sends `/fsm_command`. If the controller leaves MOVEJ, its interpolation mode
-changes, an input becomes stale, or an action fails validation, publication
-pauses immediately.
-
-For a learned 30 Hz position stream, `none` is required because each new sample
-would otherwise restart interpolation. The runtime override is intentionally
-temporary so the control stack's persistent configuration remains available to
-other workflows.
+The deployment node does not read or modify WBC `movej_interpolation_type`.
+Interpolation behavior is controlled entirely by the WBC controller's own
+ros2_control YAML configuration. This package never sends `/fsm_command`.
+If the controller leaves MOVEJ, an input becomes stale, or an action fails
+validation, publication pauses immediately.
 
 ## Run
 

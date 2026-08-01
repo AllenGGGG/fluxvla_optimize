@@ -12,8 +12,6 @@ import rclpy
 from PIL import Image
 
 from rclpy.node import Node
-from rclpy.parameter import Parameter
-from rclpy.parameter_client import AsyncParameterClient
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, JointState
 from std_msgs.msg import Float64MultiArray, Int32
@@ -102,9 +100,6 @@ class JointInferenceNode(Node):
         self._last_rerun_chunk_id: int | None = None
         self._wbc_fsm_state: int | None = None
         self._held_joint_positions: dict[str, float] | None = None
-        self._wbc_original_interpolation_type: str | None = None
-        self._wbc_override_applied = False
-        self._wbc_interpolation_ready = self._configure_wbc_interpolation()
         self._backend: InferBackend = self._create_backend()
         self.get_logger().info(
             f"[startup] inference backend created: "
@@ -161,6 +156,7 @@ class JointInferenceNode(Node):
         self.get_logger().info(
             f"[startup] Inference node ready: "
             f"model_dim={MODEL_JOINT_DIM} wbc_dim={len(WBC_JOINT_NAMES)}; "
+            f"control_rate={self.robot_exec_hz:g}Hz; "
             f"{start_mode}; "
             f"total={time.perf_counter() - startup_started:.2f}s"
         )
@@ -191,7 +187,6 @@ class JointInferenceNode(Node):
         self.declare_parameter("robot_exec_hz", 30.0)
         self.declare_parameter("execution_mode", "async")
         self.declare_parameter("auto_start", False)
-        self.declare_parameter("wbc_controller_node", "/ocs2_wbc_controller")
 
         self.declare_parameter("debug", False)
         self.declare_parameter("debug_dir", "")
@@ -234,7 +229,6 @@ class JointInferenceNode(Node):
                 f"{self.execution_mode!r}"
             )
         self.auto_start = bool(value("auto_start"))
-        self.wbc_controller_node = str(value("wbc_controller_node"))
 
         self.rerun_enabled = bool(value("rerun_enabled"))
 
@@ -342,9 +336,7 @@ class JointInferenceNode(Node):
             if self._inference_enabled:
                 return
             error = None
-            if not self._wbc_interpolation_ready:
-                error = "WBC interpolation setup failed"
-            elif self._wbc_fsm_state != WBC_FSM_MOVEJ:
+            if self._wbc_fsm_state != WBC_FSM_MOVEJ:
                 error = (
                     "WBC is not in MOVEJ: "
                     f"fsm_state={self._wbc_fsm_state}, expected={WBC_FSM_MOVEJ}"
@@ -559,76 +551,4 @@ class JointInferenceNode(Node):
             except Exception as exc:
                 self.get_logger().warn(f"Failed to stop inference backend: {exc}")
             self._rerun.close()
-            self._restore_wbc_interpolation()
         return super().destroy_node()
-
-    def _configure_wbc_interpolation(self) -> bool:
-        """Set WBC interpolation to none for this process and remember its value."""
-        self._wbc_param_client = AsyncParameterClient(self, self.wbc_controller_node)
-        try:
-            if not self._wbc_param_client.wait_for_services(timeout_sec=2.0):
-                raise TimeoutError("WBC parameter service is unavailable")
-            get_future = self._wbc_param_client.get_parameters(
-                ["movej_interpolation_type"]
-            )
-            rclpy.spin_until_future_complete(self, get_future, timeout_sec=2.0)
-            if not get_future.done():
-                raise TimeoutError("timed out reading WBC interpolation")
-            original = get_future.result().values[0].string_value.strip()
-            if not original:
-                raise RuntimeError("WBC returned an empty interpolation value")
-            self._wbc_original_interpolation_type = original
-            self.get_logger().info(
-                f"[startup] WBC interpolation original value={original!r}"
-            )
-            if original.lower() == "none":
-                return True
-
-            set_future = self._wbc_param_client.set_parameters_atomically(
-                [Parameter("movej_interpolation_type", value="none")]
-            )
-            rclpy.spin_until_future_complete(self, set_future, timeout_sec=2.0)
-            if not set_future.done():
-                raise TimeoutError("timed out setting WBC interpolation to 'none'")
-            result = set_future.result().result
-            if not result.successful:
-                raise RuntimeError(result.reason or "controller rejected parameter")
-            self._wbc_override_applied = True
-            self.get_logger().info(
-                "[startup] WBC interpolation temporarily set to 'none'"
-            )
-            return True
-        except Exception as exc:
-            self.get_logger().error(
-                "WBC interpolation setup failed: "
-                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-            )
-            return False
-
-    def _restore_wbc_interpolation(self) -> None:
-        if not self._wbc_override_applied:
-            return
-        original = self._wbc_original_interpolation_type
-        try:
-            if original is None or not rclpy.ok():
-                raise RuntimeError("ROS shutdown started before restore")
-            if not self._wbc_param_client.wait_for_services(timeout_sec=2.0):
-                raise TimeoutError("WBC parameter service is unavailable")
-            future = self._wbc_param_client.set_parameters_atomically(
-                [Parameter("movej_interpolation_type", value=original)]
-            )
-            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
-            if not future.done():
-                raise TimeoutError("timed out restoring original value")
-            result = future.result().result
-            if not result.successful:
-                raise RuntimeError(result.reason or "controller rejected restore")
-            self._wbc_override_applied = False
-            self.get_logger().info(
-                f"WBC interpolation restored to original value {original!r}"
-            )
-        except Exception as exc:
-            self.get_logger().warn(
-                "Could not restore WBC interpolation: "
-                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-            )

@@ -397,7 +397,7 @@ ROS_PARAMS=(
 
 echo "control    : auto_start=$AUTO_START; send /xr/controller_state=15/16 to start/pause"
 echo "rerun      : $RERUN_LABEL"
-echo "WBC stream : temporarily sets movej_interpolation_type='none'"
+echo "WBC stream : uses the controller's configured movej_interpolation_type"
 
 # The selected config resolves pretrained_name_or_path/tokenizer
 # paths (e.g. 'checkpoints/pi05_base') relative to the process cwd, matching
