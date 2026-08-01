@@ -14,8 +14,8 @@ CONFIG_DIR="$PACKAGE_PARENT/configs/pi05"
 
 # Checkpoint selection. Change these two values to use another root/default run.
 CHECKPOINT_BASE_DIR="${PISTAR_CHECKPOINT_BASE_DIR:-/home/fiveages/Downloads/load}"
-DEFAULT_CHECKPOINT_NAME="${PISTAR_CHECKPOINT_NAME:-2026_07_25}"
-DEFAULT_MODEL_BASENAME="${PISTAR_MODEL_BASENAME:-step-020165-epoch-05-loss=0.0041.safetensors}"
+DEFAULT_CHECKPOINT_NAME="${PISTAR_CHECKPOINT_NAME:-2026_07_30}"
+DEFAULT_MODEL_BASENAME="${PISTAR_MODEL_BASENAME:-step-020600-epoch-04-loss=0.0036.safetensors}"
 DEFAULT_EXECUTION_MODE="${PISTAR_EXECUTION_MODE:-async}"
 DEFAULT_RTC_MODE="${PISTAR_RTC_MODE:-guidance}"
 DEFAULT_ACCELERATION="${PISTAR_ACCELERATION:-triton}"
@@ -397,7 +397,6 @@ ROS_PARAMS=(
 
 echo "control    : auto_start=$AUTO_START; send /xr/controller_state=15/16 to start/pause"
 echo "rerun      : $RERUN_LABEL"
-echo "WBC stream : uses the controller's configured movej_interpolation_type"
 
 # The selected config resolves pretrained_name_or_path/tokenizer
 # paths (e.g. 'checkpoints/pi05_base') relative to the process cwd, matching

@@ -80,3 +80,6 @@ AGENTS.md
 .cursorignore
 .cursorindexingignore
 FluxBisim/
+
+# Ignore local Conda environment archives
+/deploy/fluxvla_infer_conda_*.tar.gz

@@ -131,16 +131,9 @@ inference_model = dict(
     ori_action_dim=_JOINT_DIM,
 )
 
-# Same transform pipeline as pi05_parcel_sort_recap.py's training dataset
-# (norm_type, EpisodeMetadataPrompter's advantage-conditioning text), reused
-# verbatim via PrivateInferenceDataset (fluxvla/datasets/
-# parquet_dataset.py:531) so a training-side transform change propagates
-# automatically instead of drifting. desired_advantage=True is a static
-# eval-time prompt condition, not a runtime toggle -- see deploy/model.py's
-# predict_chunk, which used to switch this via a CFG dual-pass; that
-# mechanism is gone, replaced by this transform matching training's own
-# "Advantage: true/false." text exactly (see
-# fluxvla/transforms/prompters.py's EpisodeMetadataPrompter).
+# Keep the original parcel-sort inference prompt used by the legacy
+# checkpoints: task description + state, with no speed/advantage/control-mode
+# metadata appended before tokenization.
 dataset = dict(
     type='PrivateInferenceDataset',
     img_keys=[
@@ -158,15 +151,6 @@ dataset = dict(
             norm_type=_NORM_TYPE,
             action_norm_mask=[True] * _JOINT_DIM + [False] *
             (_MODEL_ACTION_DIM - _JOINT_DIM)),
-        dict(
-            type='EpisodeMetadataPrompter',
-            training=False,
-            control_mode='joint',
-            desired_advantage=True,
-            # 1.0 = normal speed, the neutral value in training's
-            # vsta_kwargs.speed_set=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
-            # (pi05_parcel_sort_recap.py).
-            desired_speed=1.0),
         dict(type='PreparePromptWithState'),
         dict(
             type='ProcessPrompts',

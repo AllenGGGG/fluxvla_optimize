@@ -581,6 +581,9 @@ class PrivateInferenceDataset:
             Defaults to 180.
         use_quantiles (bool): Whether to use quantiles for normalization.
             Defaults to True.
+        tokenizer_path (str, optional): Explicit tokenizer directory for the
+            ProcessPrompts transform. When unset, the tokenizer is loaded from
+            ``<model_path>/tokenizer``.
     """
 
     def __init__(self,
@@ -592,11 +595,25 @@ class PrivateInferenceDataset:
                  resize_size: int = 224,
                  max_len: int = 180,
                  use_quantiles=True,
-                 embodiment_id: int = None) -> None:
+                 embodiment_id: int = None,
+                 tokenizer_path: str = None) -> None:
         from fluxvla.engines import build_transform_from_cfg
         self.transforms = list()
         for transform in transforms:
-            transform['model_path'] = model_path
+            if (tokenizer_path is not None
+                    and transform.get('type') == 'ProcessPrompts'):
+                tokenizer_cfg = transform.get('tokenizer')
+                if not isinstance(tokenizer_cfg, dict):
+                    raise ValueError(
+                        'ProcessPrompts must define a tokenizer config when '
+                        'tokenizer_path is provided')
+                tokenizer_cfg['model_path'] = tokenizer_path
+                # ProcessPrompts gives its top-level model_path precedence and
+                # appends '/tokenizer', so omit it for an explicit tokenizer
+                # directory.
+                transform.pop('model_path', None)
+            else:
+                transform['model_path'] = model_path
             self.transforms.append(build_transform_from_cfg(transform))
         if isinstance(norm_stats, str):
             with open(norm_stats, 'r', encoding='utf-8') as f:

@@ -25,10 +25,6 @@ _PROMPT_MAX_LEN = 200
 # Keep preprocessing and the static CUDA Graph on the same fixed prompt size
 # used by training. The prompt text and valid token count may vary, while both
 # paths retain the same 200-row padded attention/KV layout.
-#
-# This redefines dataset.transforms wholesale (mmengine replaces lists, not
-# deep-merges them), so EpisodeMetadataPrompter must be repeated here too --
-# see the base pytorch config's comment for why desired_advantage=True.
 dataset = dict(
     transforms=[
         dict(
@@ -41,15 +37,6 @@ dataset = dict(
             action_norm_mask=[True] * _JOINT_DIM + [False] *
             (_MODEL_ACTION_DIM - _JOINT_DIM),
         ),
-        dict(
-            type='EpisodeMetadataPrompter',
-            training=False,
-            control_mode='joint',
-            desired_advantage=True,
-            # 1.0 = normal speed, the neutral value in training's
-            # vsta_kwargs.speed_set=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
-            # (pi05_parcel_sort_recap.py).
-            desired_speed=1.0),
         dict(type='PreparePromptWithState'),
         dict(
             type='ProcessPrompts',
