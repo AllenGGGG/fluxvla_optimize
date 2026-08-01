@@ -69,6 +69,8 @@ class PackedParquetDatasetV3(ParquetDatasetV3):
         video_tolerance_s (float): Max allowed distance (seconds) between the
             requested timestamp and the decoded frame.
         video_backend (str): torchvision video backend. Defaults to ``pyav``.
+        use_advantage (bool): See ``ParquetDatasetV3.__init__``. Forwarded
+            unchanged.
     """
 
     def __init__(self,
@@ -82,7 +84,8 @@ class PackedParquetDatasetV3(ParquetDatasetV3):
                  window_start_idx: int = 1,
                  use_delta: bool = False,
                  video_tolerance_s: float = 0.1,
-                 video_backend: str = 'pyav') -> None:
+                 video_backend: str = 'pyav',
+                 use_advantage: bool = True) -> None:
         super().__init__(
             data_root_path=data_root_path,
             transforms=transforms,
@@ -91,6 +94,7 @@ class PackedParquetDatasetV3(ParquetDatasetV3):
             use_delta=use_delta,
             statistic_name=statistic_name,
             window_start_idx=window_start_idx,
+            use_advantage=use_advantage,
         )
         for root, info in zip(self.data_root_path, self.info):
             version = info.get('codebase_version')

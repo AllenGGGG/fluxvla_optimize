@@ -118,6 +118,8 @@ class ParquetDatasetV3(ParquetDataset):
     ``meta/episodes/*.parquet`` and ``stats.json``.
     """
 
+    _ADVANTAGE_COLUMN = 'advantage'
+
     def __init__(self,
                  data_root_path: Union[str, List[str]],
                  transforms: List[Dict],
@@ -128,7 +130,8 @@ class ParquetDatasetV3(ParquetDataset):
                  window_start_idx: int = 1,
                  frame_window_size: int = 1,
                  frame_sample_stride: int = 1,
-                 expose_index: bool = False) -> None:
+                 expose_index: bool = False,
+                 use_advantage: bool = True) -> None:
         """Initialize a parquet dataset backed by LeRobot v3 metadata.
 
         Args:
@@ -151,6 +154,17 @@ class ParquetDatasetV3(ParquetDataset):
                 frames should span a longer temporal window.
             expose_index (bool): Whether to expose the concatenated row index
                 to transforms for offline sample weighting.
+            use_advantage (bool): If True (default), every data_root_path
+                must have an `advantage` parquet column -- raises at load
+                time if any root is missing it. Without this check, a root
+                missing the column would silently train part of the batch
+                with no advantage supervision: `concatenate_datasets` fills
+                the missing values with None instead of erroring, and
+                EpisodeMetadataPrompter already treats None as "omit the
+                Advantage field". If False, the `advantage` column (if
+                present) is dropped from every root before concatenation,
+                and EpisodeMetadataPrompter should be configured with
+                `use_advantage=False` to match.
         """
         Dataset.__init__(self)
         self.action_window_size = action_window_size
@@ -204,6 +218,19 @@ class ParquetDatasetV3(ParquetDataset):
         dataset_sizes = []
         for root in data_root:
             hf_dataset = load_dataset('parquet', data_dir=root, split='train')
+            has_advantage = self._ADVANTAGE_COLUMN in hf_dataset.column_names
+            if use_advantage and not has_advantage:
+                raise ValueError(
+                    f'{root} has no {self._ADVANTAGE_COLUMN!r} column, but '
+                    f'use_advantage=True requires every data_root_path to have '
+                    f'it -- concatenate_datasets silently fills missing values '
+                    f'with None instead of erroring, so without this check '
+                    f'part of the batch would train with no advantage '
+                    f'supervision and nothing would tell you. Either record '
+                    f'the column or set use_advantage=False.')
+            if not use_advantage and has_advantage:
+                hf_dataset = hf_dataset.remove_columns(
+                    self._ADVANTAGE_COLUMN)
             dataset_sizes.append(len(hf_dataset))
             datasets.append(hf_dataset)
         self.dataset_cumulative_sizes = np.cumsum([0] + dataset_sizes)

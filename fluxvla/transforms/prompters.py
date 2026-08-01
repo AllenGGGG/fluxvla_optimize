@@ -320,6 +320,12 @@ class EpisodeMetadataPrompter:
         desired_speed (float | None): Eval-only fixed Speed value (a
             tempo_speed multiplier, e.g. 1.0 for normal speed).
         desired_advantage (bool | None): Eval-only fixed Advantage value.
+        use_speed (bool): If False, never read/emit the Speed field,
+            regardless of what `inputs` contains -- for datasets/runs that
+            don't carry a meaningful `tempo_speed` signal.
+        use_advantage (bool): If False, never read/emit the Advantage
+            field, regardless of what `inputs` contains -- for
+            datasets/runs that don't carry a meaningful `advantage` signal.
         seed (int | None): RNG seed for dropout sampling.
     """
 
@@ -330,6 +336,8 @@ class EpisodeMetadataPrompter:
                  control_mode: Optional[str] = 'joint',
                  desired_speed: Optional[float] = None,
                  desired_advantage: Optional[bool] = None,
+                 use_speed: bool = True,
+                 use_advantage: bool = True,
                  seed: Optional[int] = None,
                  *args,
                  **kwargs) -> None:
@@ -339,9 +347,13 @@ class EpisodeMetadataPrompter:
         self.control_mode = control_mode
         self.desired_speed = desired_speed
         self.desired_advantage = desired_advantage
+        self.use_speed = use_speed
+        self.use_advantage = use_advantage
         self._rng = np.random.default_rng(seed)
 
     def _speed_value(self, inputs: Dict[str, Any]) -> Optional[float]:
+        if not self.use_speed:
+            return None
         if not self.training:
             return self.desired_speed
 
@@ -349,13 +361,13 @@ class EpisodeMetadataPrompter:
         return float(tempo_speed) if tempo_speed is not None else None
 
     def _advantage(self, inputs: Dict[str, Any]) -> Optional[bool]:
+        if not self.use_advantage:
+            return None
         if not self.training:
             return self.desired_advantage
 
         advantage = inputs.get('advantage')
-        if advantage is None:
-            return None
-        return bool(advantage)
+        return bool(advantage) if advantage is not None else None
 
     def _keep_field(self) -> bool:
         if not self.training:

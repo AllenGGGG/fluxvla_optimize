@@ -168,6 +168,11 @@ train_dataloader = dict(
                 window_start_idx=1,
                 vsta_kwargs=dict(
                     speed_set=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0]),
+                # Require every data_root_path to have a real `advantage`
+                # parquet column; raises at load time (naming the offending
+                # root) instead of silently training part of the batch with
+                # no advantage supervision.
+                use_advantage=True,
                 transforms=[
                     # WARNING: if you change exclude_joint_names/pad_to
                     # below, meta/stats.json must be recomputed with the
@@ -199,7 +204,9 @@ train_dataloader = dict(
                     dict(
                         type='EpisodeMetadataPrompter',
                         training=True,
-                        control_mode='joint'),
+                        control_mode='joint',
+                        use_speed=True,
+                        use_advantage=True),
                     dict(type='PreparePromptWithState'),
                     dict(
                         type='ProcessPrompts',

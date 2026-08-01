@@ -161,6 +161,11 @@ train_dataloader = dict(
                 action_key='action',
                 statistic_name='private',
                 window_start_idx=1,
+                # This dataset predates advantage recording and has no
+                # `advantage` parquet column; this config also never uses
+                # EpisodeMetadataPrompter, so there's no advantage signal
+                # to require.
+                use_advantage=False,
                 # Dataset's own task text ("Pick up the parcel with the left
                 # hand, then move it onto the conveyor belt with the right
                 # hand.") is used as-is; no override needed.
