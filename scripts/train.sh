@@ -12,19 +12,7 @@ usage() {
 Usage: bash scripts/train.sh [options] [--cfg-options key=value ...]
 
 Defaults:
-  dataset roots      /data/guohao/FluxVLA_workdirs/dataset/2026_07_27
-                     /data/guohao/FluxVLA_workdirs/dataset/2026_07_29
-                     /data/guohao/FluxVLA_workdirs/dataset/2026_07_30
-                     /data/guohao/FluxVLA_workdirs/dataset/2026_07_31
-  base model dir     /home/guohao/FluxVLA/checkpoints/pi05_base
-  base weights       /home/guohao/FluxVLA/workdirs/checkpoints/2026_07_30/checkpoints/step-009324-epoch-02-loss=0.0053.safetensors
-  checkpoint dir     /data/guohao/FluxVLA_workdirs/checkpoints/2026_07_31
-  log dir            /data/guohao/FluxVLA_workdirs/logs/2026_07_31
-  batch size         32
-  max epochs         7
-  learning rate      1e-5
-  keep checkpoints   5
-  checkpoint format  safetensors only
+  Defaults are defined in the variables below.
 
 Options:
   --dataset PATH[,PATH...]    Dataset root(s). Each root must contain meta/.
@@ -55,17 +43,19 @@ EOF
 
 CONFIG="configs/pi05/pi05_parcel_sort.py"
 DATASET_ROOTS=(
+  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_24"
+  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_25"
   "/data/guohao/FluxVLA_workdirs/dataset/2026_07_27"
-  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_29"
+  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_28"
   "/data/guohao/FluxVLA_workdirs/dataset/2026_07_30"
-  "/data/guohao/FluxVLA_workdirs/dataset/2026_07_31"
+  "/data/guohao/FluxVLA_workdirs/dataset/2026_08_03"
 )
 BASE_MODEL_DIR="/home/guohao/FluxVLA/checkpoints/pi05_base"
-BASE_WEIGHTS="/home/guohao/FluxVLA/workdirs/checkpoints/2026_07_30/checkpoints/step-009324-epoch-02-loss=0.0053.safetensors"
-WORK_DIR="/data/guohao/FluxVLA_workdirs/checkpoints/2026_07_31"
-LOG_DIR="/data/guohao/FluxVLA_workdirs/logs/2026_07_31"
+BASE_WEIGHTS="/home/guohao/FluxVLA/workdirs/checkpoints/2026_08_01/checkpoints/step-034220-epoch-05-loss=0.0028.safetensors"
+WORK_DIR="/data/guohao/FluxVLA_workdirs/checkpoints/2026_08_03"
+LOG_DIR="/data/guohao/FluxVLA_workdirs/logs/2026_08_03"
 BATCH_SIZE=32
-MAX_EPOCHS=7
+MAX_EPOCHS=5
 LEARNING_RATE="1e-5"
 MAX_KEEP_CKPTS=5
 SAVE_PT=false
