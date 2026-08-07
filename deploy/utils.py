@@ -6,6 +6,7 @@ Shared by ``model.py``, ``ros_node.py``, and ``rerun_visualizer.py``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -56,6 +57,20 @@ MODEL_JOINT_NAMES = (
 )
 MODEL_JOINT_DIM = len(MODEL_JOINT_NAMES)
 MODEL_TENSOR_DIM = 32
+HAND_JOINT_DIM = len(LEFT_HAND_JOINT_NAMES)
+
+# The fully closed targets used by the parcel-sort demonstrations.  These are
+# robot-space joint positions (not normalized model values) in the hand joint
+# order above.  Keeping one canonical vector for both hands also avoids using
+# isolated dataset outliers as physical joint limits.
+DEFAULT_HAND_CLOSED_POSITIONS = (
+    0.99,
+    1.39,
+    0.504,
+    0.504,
+    0.504,
+    0.504,
+)
 
 # Verified against /ocs2_wbc_controller's live `joints` parameter.
 WBC_JOINT_NAMES = (
@@ -80,3 +95,40 @@ class JointCommands:
     wbc: np.ndarray
     left_hand: np.ndarray
     right_hand: np.ndarray
+
+
+def snap_hand_joints_closed(
+    actions: np.ndarray,
+    *,
+    threshold: float,
+    closed_positions: Sequence[float] = DEFAULT_HAND_CLOSED_POSITIONS,
+) -> np.ndarray:
+    """Snap confident hand-joint predictions to their fully closed targets.
+
+    ``actions`` may be one action or an arbitrary leading batch/horizon shape;
+    only its final 12 values (left hand x6, right hand x6) are changed.  Values
+    at or below the threshold remain continuous so the model can still open a
+    hand and make small approach adjustments.
+    """
+
+    result = np.asarray(actions).copy()
+    if result.shape[-1] != MODEL_JOINT_DIM:
+        raise ValueError(
+            f"actions must end in {MODEL_JOINT_DIM} joints, got {result.shape}"
+        )
+    if not np.isfinite(threshold):
+        raise ValueError(f"hand close threshold must be finite, got {threshold}")
+
+    closed = np.asarray(closed_positions, dtype=result.dtype)
+    if closed.shape != (HAND_JOINT_DIM,):
+        raise ValueError(
+            f"closed hand positions must have shape ({HAND_JOINT_DIM},), "
+            f"got {closed.shape}"
+        )
+    if not np.isfinite(closed).all():
+        raise ValueError("closed hand positions contain NaN or Inf")
+
+    for hand_slice in (slice(16, 22), slice(22, 28)):
+        hand = result[..., hand_slice]
+        result[..., hand_slice] = np.where(hand > threshold, closed, hand)
+    return result

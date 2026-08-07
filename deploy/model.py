@@ -17,7 +17,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -25,7 +25,12 @@ import torch
 from fluxvla.engines.runners.base_inference_runner import BaseInferenceRunner
 from fluxvla.engines.utils.root import OPERATORS
 
-from .utils import MODEL_JOINT_DIM, MODEL_TENSOR_DIM
+from .utils import (
+    DEFAULT_HAND_CLOSED_POSITIONS,
+    MODEL_JOINT_DIM,
+    MODEL_TENSOR_DIM,
+    snap_hand_joints_closed,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +114,8 @@ class FluxVLAPolicy(BaseInferenceRunner):
         rtc_publish_horizon: int = 0,
         rtc_max_guidance_weight: float = 10.0,
         rtc_schedule: str = "exp",
+        hand_close_threshold: float = 0.25,
+        hand_closed_positions: Sequence[float] = DEFAULT_HAND_CLOSED_POSITIONS,
         log_info: Callable[[str], None] | None = None,
     ) -> None:
         # Imported here (not module level) to keep ROS protocol inspection
@@ -137,6 +144,10 @@ class FluxVLAPolicy(BaseInferenceRunner):
         self.rtc_publish_horizon = rtc_publish_horizon
         self.rtc_max_guidance_weight = rtc_max_guidance_weight
         self.rtc_schedule = rtc_schedule
+        self.hand_close_threshold = float(hand_close_threshold)
+        self.hand_closed_positions = tuple(
+            float(value) for value in hand_closed_positions
+        )
 
         checkpoint_path = Path(model_id).expanduser().resolve()
         inference_config_path = Path(inference_config).expanduser().resolve()
@@ -218,7 +229,9 @@ class FluxVLAPolicy(BaseInferenceRunner):
         self.n_action_steps = int(getattr(self.vla, 'n_action_steps', 50))
         log_success(
             "model ready: "
-            f"dtype={dtype} eval=true action_horizon={self.n_action_steps}"
+            f"dtype={dtype} eval=true action_horizon={self.n_action_steps}; "
+            f"hand_close_threshold={self.hand_close_threshold:g} "
+            f"hand_closed_positions={list(self.hand_closed_positions)}"
         )
 
         # Reused (not reimplemented) for RTC prev_actions normalization: the
@@ -371,7 +384,15 @@ class FluxVLAPolicy(BaseInferenceRunner):
                 f"expected {MODEL_JOINT_DIM} or {MODEL_TENSOR_DIM}, "
                 f"got shape {actions.shape}"
             )
-        return actions
+        # Hand commands in the demonstrations are effectively binary, while
+        # the flow model may emit an in-between value.  Snap confident closing
+        # predictions after denormalization and before queueing so RTC history
+        # matches the command that is actually sent to the robot.
+        return snap_hand_joints_closed(
+            actions,
+            threshold=self.hand_close_threshold,
+            closed_positions=self.hand_closed_positions,
+        )
 
     def _predict_once(self, obs: dict[str, Any], **rtc_kwargs: Any) -> np.ndarray:
         inputs = self._preprocess(obs)

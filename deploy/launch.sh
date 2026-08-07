@@ -4,6 +4,8 @@
 set -euo pipefail
 # Control (environment overrides are useful for isolated startup checks).
 AUTO_START="${PISTAR_AUTO_START:-true}"
+HAND_CLOSE_THRESHOLD="${PISTAR_HAND_CLOSE_THRESHOLD:-0.25}"
+HAND_CLOSED_POSITIONS="${PISTAR_HAND_CLOSED_POSITIONS:-[0.99,1.39,0.504,0.504,0.504,0.504]}"
 
 PYTHON_BIN="$HOME/runtime/miniforge3/envs/fluxvla_infer/bin/python"
 
@@ -297,9 +299,6 @@ TASK="Pick up the parcel with the left hand, then move it onto the conveyor belt
 DEVICE="cuda"
 DTYPE="bf16"
 
-# Debug
-DEBUG=false
-DEBUG_DIR="/tmp/rtc_debug"
 RERUN_ENABLED="${PISTAR_RERUN_ENABLED:-true}"
 case "$AUTO_START" in
   true|false) ;;
@@ -330,6 +329,7 @@ echo "rtc        : $RTC_LABEL"
 echo "accel      : $ACCELERATION_LABEL"
 echo "config     : $INFERENCE_CONFIG"
 echo "control    : auto_start=$AUTO_START"
+echo "hand snap  : threshold=$HAND_CLOSE_THRESHOLD closed=$HAND_CLOSED_POSITIONS"
 echo "rerun      : $RERUN_LABEL"
 echo "======================================="
 
@@ -387,10 +387,10 @@ ROS_PARAMS=(
 
   # Control
   -p "auto_start:=$AUTO_START"
+  -p "hand_close_threshold:=$HAND_CLOSE_THRESHOLD"
+  -p "hand_closed_positions:=$HAND_CLOSED_POSITIONS"
 
-  # Debug
-  -p "debug:=$DEBUG"
-  -p "debug_dir:=$DEBUG_DIR"
+  # Visualization
   -p "rerun_enabled:=$RERUN_ENABLED"
 
 )

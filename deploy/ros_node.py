@@ -24,6 +24,7 @@ from .config import (
     load_inference_options,
 )
 from .utils import (
+    DEFAULT_HAND_CLOSED_POSITIONS,
     MODEL_JOINT_DIM,
     MODEL_JOINT_NAMES,
     MODEL_TENSOR_DIM,
@@ -187,9 +188,11 @@ class JointInferenceNode(Node):
         self.declare_parameter("robot_exec_hz", 30.0)
         self.declare_parameter("execution_mode", "async")
         self.declare_parameter("auto_start", False)
+        self.declare_parameter("hand_close_threshold", 0.25)
+        self.declare_parameter(
+            "hand_closed_positions", list(DEFAULT_HAND_CLOSED_POSITIONS)
+        )
 
-        self.declare_parameter("debug", False)
-        self.declare_parameter("debug_dir", "")
         self.declare_parameter("rerun_enabled", True)
 
         self.declare_parameter(
@@ -229,6 +232,10 @@ class JointInferenceNode(Node):
                 f"{self.execution_mode!r}"
             )
         self.auto_start = bool(value("auto_start"))
+        self.hand_close_threshold = float(value("hand_close_threshold"))
+        self.hand_closed_positions = [
+            float(position) for position in value("hand_closed_positions")
+        ]
 
         self.rerun_enabled = bool(value("rerun_enabled"))
 
@@ -255,8 +262,6 @@ class JointInferenceNode(Node):
         # Keep ROS protocol inspection importable without a PyTorch installation.
         from .model import build_predict_fn
 
-        debug = bool(self.get_parameter("debug").value)
-        debug_dir = str(self.get_parameter("debug_dir").value)
         # inference_options-derived kwargs (rtc_method, rtc_execution_horizon,
         # etc.) are forwarded dynamically from self._inference_option_names --
         # the same list _read_parameters() used to set these attributes --
@@ -269,6 +274,8 @@ class JointInferenceNode(Node):
             dtype=self.dtype,
             norm_stats_path=self.norm_stats_path,
             tokenizer_path=self.tokenizer_path,
+            hand_close_threshold=self.hand_close_threshold,
+            hand_closed_positions=self.hand_closed_positions,
             log_info=self.get_logger().info,
             **{name: getattr(self, name) for name in self._inference_option_names},
         )
@@ -304,8 +311,6 @@ class JointInferenceNode(Node):
                 replan_remaining=self.rtc_replan_remaining,
                 publish_horizon=self.chunk_publish_horizon,
                 rtc_publish_horizon=self.rtc_publish_horizon,
-                debug=debug,
-                debug_dir=debug_dir or "/tmp/rtc_debug",
             ),
             robot_exec_hz=self.robot_exec_hz,
         )

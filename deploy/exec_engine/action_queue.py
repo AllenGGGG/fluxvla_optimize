@@ -79,7 +79,3 @@ class ActionQueue:
                 logger.warning(
                     "Entire chunk consumed by delay (%d steps) — queue empty after merge", delay
                 )
-            logger.debug(
-                "Queue replaced: delay=%d clamped=%d remaining=%d",
-                delay, clamped, len(self.queue),
-            )

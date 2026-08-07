@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import time
 from threading import Event, Lock, Thread
@@ -12,10 +11,7 @@ import numpy as np
 
 from .action_queue import ActionQueue
 from .config import ChunkSchedulerConfig
-from .visualizer import RTCDebugVisualizer
 from .latency_tracker import LatencyTracker
-
-logger = logging.getLogger(__name__)
 
 
 _IDLE_SLEEP_S: float = 0.01
@@ -53,9 +49,6 @@ class ChunkScheduler:
         decay taper -- or ``None`` on the first call).
         The returned dict must contain:
           ``"chunk"``: np.ndarray (T, A) — raw action array for RTC guidance
-        Optional keys:
-          ``"_step_info"``: list[tuple[float, float, float]] — (time, weight, err_norm) per denoising step
-
     Args:
         predict_fn: Callable following the protocol above.
         cfg: ChunkSchedulerConfig.
@@ -85,12 +78,6 @@ class ChunkScheduler:
         self._next_chunk_id = 0
         self._action_chunk_id: int | None = None
         self.n_action_steps: int = int(getattr(predict_fn, "n_action_steps", 1) or 1)
-
-        debug_dir = cfg.debug_dir
-        self._chunk_debugger: RTCDebugVisualizer | None = (
-            RTCDebugVisualizer(debug_dir, cfg.execution_horizon)
-            if cfg.debug else None
-        )
 
     # ------------------------------------------------------------------
     # Properties
@@ -143,28 +130,18 @@ class ChunkScheduler:
             target=target, daemon=True, name="ChunkScheduler"
         )
         self._scheduler_thread.start()
-        logger.info("Chunk scheduler thread started")
 
     def stop(self) -> None:
-        logger.info("Stopping chunk scheduler thread")
         self._shutdown_event.set()
         self._policy_active.clear()
         if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
             self._scheduler_thread.join(timeout=_JOIN_TIMEOUT_S)
-            if self._scheduler_thread.is_alive():
-                logger.warning("Scheduler thread did not join within %.1f s — it may still be finishing", _JOIN_TIMEOUT_S)
-            else:
-                logger.info("Chunk scheduler thread stopped")
         self._scheduler_thread = None
-        if self._chunk_debugger is not None:
-            self._chunk_debugger.close()
 
     def pause(self) -> None:
-        logger.info("Chunk scheduler paused")
         self._policy_active.clear()
 
     def resume(self) -> None:
-        logger.info("Chunk scheduler resumed")
         self._policy_active.set()
 
     def reset(self) -> None:
@@ -211,16 +188,13 @@ class ChunkScheduler:
         obs: dict,
         generation: int,
         queue: ActionQueue,
-        chunk2_start: int,
-        prev_full: np.ndarray | None,
         delay: int,
         guidance_prev: np.ndarray | None,
         merge_delay: int,
         t0: float,
         latency_tracker: LatencyTracker,
-        time_per_step: float,
     ) -> bool:
-        """Call predict_fn, merge the result into ``queue``, and record debug info.
+        """Call predict_fn and merge the result into ``queue``.
 
         Shared by both the RTC and plain scheduler loops so the staleness
         check under ``_lifecycle_lock`` (discarding results made obsolete by
@@ -245,11 +219,6 @@ class ChunkScheduler:
             chunk_np = chunk_np[:publish_horizon]
         if not np.isfinite(chunk_np).all():
             raise ValueError("predict_fn returned NaN/Inf in chunk")
-        step_info = result.get("_step_info")
-        chunk_nortc = (
-            np.asarray(result["_chunk_nortc"], dtype=np.float32)
-            if "_chunk_nortc" in result else None
-        )
         with self._lifecycle_lock:
             result_is_current = (
                 generation == self._generation
@@ -260,46 +229,17 @@ class ChunkScheduler:
                 return False
 
             elapsed = time.perf_counter() - t0
-            new_delay = math.ceil(elapsed / time_per_step)
             latency_tracker.add(elapsed)
             self._next_chunk_id += 1
             chunk_id = self._next_chunk_id
             items = [(chunk_id, action) for action in chunk_np]
             queue.merge(chunk_np, items, merge_delay)
 
-        if self._chunk_debugger is not None and prev_full is not None:
-            self._chunk_debugger.record(
-                prev_full, chunk_np, chunk_nortc, delay,
-                chunk2_start=chunk2_start,
-                step_info=step_info,
-            )
-
-        logger.debug(
-            "Chunk scheduled: latency=%.3fs measured_delay=%d applied_delay=%d qsize=%d",
-            elapsed, new_delay, merge_delay, queue.qsize(),
-        )
-        # merge_delay was chosen *before* this call using the latency
-        # tracker's p95 estimate (or 0 in plain mode) -- it cannot know this
-        # specific call's real elapsed time. If new_delay (measured from what
-        # actually just happened) exceeds merge_delay by more than one step,
-        # the splice consumed fewer stale rows than it should have: the
-        # robot re-executes a short already-elapsed stretch of the old
-        # trajectory, which shows up as a stutter/backtrack rather than a
-        # hard glitch. Surfaced as its own line so it's grep-able without
-        # wading through every debug-level chunk log.
-        if new_delay > merge_delay + 1:
-            logger.warning(
-                "Splice underestimated inference delay: measured_delay=%d > "
-                "applied_delay=%d (latency=%.3fs) -- new chunk's first "
-                "%d step(s) overlap already-elapsed time",
-                new_delay, merge_delay, elapsed, new_delay - merge_delay,
-            )
         return True
 
     def _scheduler_loop_plain(self) -> None:
         """Non-RTC path: produce the next chunk only once the queue drains."""
         latency_tracker = LatencyTracker()
-        time_per_step = 1.0 / max(self._robot_exec_hz, 1e-6)
         while not self._shutdown_event.is_set():
             if not self._policy_active.is_set():
                 time.sleep(_IDLE_SLEEP_S)
@@ -320,13 +260,11 @@ class ChunkScheduler:
                 continue
 
             t0 = time.perf_counter()
-            chunk2_start, prev_full, _prev_left_over = queue.snapshot()
 
             self._predict_and_merge(
-                obs, generation, queue, chunk2_start, prev_full,
+                obs, generation, queue,
                 delay=0, guidance_prev=None, merge_delay=0,
                 t0=t0, latency_tracker=latency_tracker,
-                time_per_step=time_per_step,
             )
 
     def _scheduler_loop_rtc(self) -> None:
@@ -351,7 +289,7 @@ class ChunkScheduler:
 
             latency = latency_tracker.p95()
             delay = math.ceil(latency / time_per_step) if latency else 0
-            chunk2_start, prev_full, prev_left_over = queue.snapshot()
+            _, _, prev_left_over = queue.snapshot()
 
             # Keep enough old actions for the measured inference delay, the
             # RTC handoff window, and a trailing horizon of real data for
@@ -383,8 +321,7 @@ class ChunkScheduler:
             )
 
             self._predict_and_merge(
-                obs, generation, queue, chunk2_start, prev_full,
+                obs, generation, queue,
                 delay=delay, guidance_prev=guidance_prev, merge_delay=delay,
                 t0=t0, latency_tracker=latency_tracker,
-                time_per_step=time_per_step,
             )

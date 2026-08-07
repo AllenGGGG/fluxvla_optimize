@@ -4,7 +4,7 @@ Deliberately excludes RTC guidance parameters (schedule/max_guidance_weight) --
 those belong to fluxvla's own ``rtc_config`` dict (see ``deploy/model.py``'s
 ``_build_rtc_kwargs``), not to this scheduler. This dataclass only carries
 what ``ChunkScheduler`` itself consumes: how much of the queue's tail to
-treat as RTC prefix context, and debug output.
+treat as RTC prefix context.
 """
 
 from __future__ import annotations
@@ -30,10 +30,6 @@ class ChunkSchedulerConfig:
     publish_horizon: int = 0
     # RTC-specific override. 0 means publish the full model chunk.
     rtc_publish_horizon: int = 0
-
-    # Debug collection (zero overhead when disabled).
-    debug: bool = False
-    debug_dir: str = "/tmp/rtc_debug"
 
     def __post_init__(self) -> None:
         if self.execution_horizon <= 0:

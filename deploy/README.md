@@ -29,6 +29,14 @@ is combined with those four held targets and published as:
 /right_hand_controller/target_joint_position Float64MultiArray[6]
 ```
 
+After action denormalization, each hand joint predicted above
+`hand_close_threshold` (default `0.25`) is snapped to its corresponding fully
+closed target (default `[0.99, 1.39, 0.504, 0.504, 0.504, 0.504]`). Values at
+or below the threshold remain continuous, so opening is unaffected. The
+launcher exposes these as `PISTAR_HAND_CLOSE_THRESHOLD` and
+`PISTAR_HAND_CLOSED_POSITIONS`; the snapping happens before action queueing so
+RTC sees the same commands that the controllers receive.
+
 This order matches the live WBC `joints` parameter and the controller source in
 `~/fa_w2_ws`.
 
