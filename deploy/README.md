@@ -118,13 +118,17 @@ the CUDA Toolkit), and builds FluxVLA's custom CUDA extensions against the
 host's mounted CUDA Toolkit. See the root [`README.md`](../README.md#本分支allen_infer快速上手)
 for the full breakdown and the host-side CUDA Toolkit prerequisite.
 
-All deployment parameters are grouped at the top of `launch.sh`. Edit those
-values directly when changing the model, inference mode, or safety thresholds,
-then run:
+The launcher prompts for the robot control frequency and, when asynchronous RTC
+is enabled, the RTC execution horizon. They can also be supplied without
+editing the script through `PISTAR_ROBOT_HZ` and
+`PISTAR_RTC_EXECUTION_HORIZON`, for example:
 
 ```bash
-./launch.sh
+PISTAR_ROBOT_HZ=45 PISTAR_RTC_EXECUTION_HORIZON=15 ./launch.sh
 ```
+
+`PISTAR_RTC_EXECUTION_HORIZON` is ignored in serial execution and when RTC is
+disabled, because those paths do not use an RTC handoff window.
 
 The launch script opens a live Rerun Viewer. It shows every compressed frame
 from the head and wrist cameras plus measured and commanded joint-position

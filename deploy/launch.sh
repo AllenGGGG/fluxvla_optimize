@@ -21,6 +21,8 @@ DEFAULT_MODEL_BASENAME="${PISTAR_MODEL_BASENAME:-step-020238-epoch-03-loss=0.004
 DEFAULT_EXECUTION_MODE="${PISTAR_EXECUTION_MODE:-async}"
 DEFAULT_RTC_MODE="${PISTAR_RTC_MODE:-guidance}"
 DEFAULT_ACCELERATION="${PISTAR_ACCELERATION:-triton}"
+DEFAULT_ROBOT_HZ="${PISTAR_ROBOT_HZ:-30.0}"
+DEFAULT_RTC_EXECUTION_HORIZON="${PISTAR_RTC_EXECUTION_HORIZON:-10}"
 
 die() {
   echo "ERROR: $*" >&2
@@ -294,7 +296,27 @@ esac
 [[ -f "$INFERENCE_CONFIG" ]] || die "推理配置不存在: $INFERENCE_CONFIG"
 
 # Model and execution
-ROBOT_HZ=30.0
+prompt_with_default ROBOT_HZ "机器人控制频率 Hz" "$DEFAULT_ROBOT_HZ"
+if ! [[ "$ROBOT_HZ" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || \
+   [[ "$ROBOT_HZ" =~ ^0*([.]0*)?$ ]]; then
+  die "机器人控制频率必须是正数，当前值: $ROBOT_HZ"
+fi
+
+# rtc_execution_horizon is consumed only by the asynchronous RTC scheduler.
+# Serial execution forces RTC off, and async+none uses the plain scheduler, so
+# overriding the value in either mode would be misleading and has no effect.
+RTC_HORIZON_ACTIVE=false
+RTC_EXECUTION_HORIZON="$DEFAULT_RTC_EXECUTION_HORIZON"
+if [[ "$EXECUTION_MODE" == "async" && "$RTC_MODE" != "none" ]]; then
+  RTC_HORIZON_ACTIVE=true
+  prompt_with_default RTC_EXECUTION_HORIZON \
+    "RTC 衔接/衰减 horizon（控制步数）" \
+    "$DEFAULT_RTC_EXECUTION_HORIZON"
+  if ! [[ "$RTC_EXECUTION_HORIZON" =~ ^[0-9]+$ ]] || \
+     (( 10#$RTC_EXECUTION_HORIZON <= 0 )); then
+    die "RTC horizon 必须是正整数，当前值: $RTC_EXECUTION_HORIZON"
+  fi
+fi
 TASK="Pick up the parcel with the left hand, then move it onto the conveyor belt with the right hand."
 DEVICE="cuda"
 DTYPE="bf16"
@@ -328,6 +350,12 @@ echo "execution  : $EXECUTION_LABEL"
 echo "rtc        : $RTC_LABEL"
 echo "accel      : $ACCELERATION_LABEL"
 echo "config     : $INFERENCE_CONFIG"
+echo "robot hz   : $ROBOT_HZ"
+if [[ "$RTC_HORIZON_ACTIVE" == "true" ]]; then
+  echo "rtc horizon: $RTC_EXECUTION_HORIZON steps"
+else
+  echo "rtc horizon: inactive (RTC is off)"
+fi
 echo "control    : auto_start=$AUTO_START"
 echo "hand snap  : threshold=$HAND_CLOSE_THRESHOLD closed=$HAND_CLOSED_POSITIONS"
 echo "rerun      : $RERUN_LABEL"
@@ -394,6 +422,12 @@ ROS_PARAMS=(
   -p "rerun_enabled:=$RERUN_ENABLED"
 
 )
+
+if [[ "$RTC_HORIZON_ACTIVE" == "true" ]]; then
+  ROS_PARAMS+=(
+    -p "rtc_execution_horizon:=$RTC_EXECUTION_HORIZON"
+  )
+fi
 
 echo "control    : auto_start=$AUTO_START; send /xr/controller_state=15/16 to start/pause"
 echo "rerun      : $RERUN_LABEL"
