@@ -11,6 +11,7 @@ import numpy as np
 import rclpy
 from PIL import Image
 
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, JointState
@@ -185,7 +186,14 @@ class JointInferenceNode(Node):
         # robot_exec_hz is a ROS2/control-loop fact -- it must match the real
         # control timer frequency below, independent of which model/RTC
         # config is loaded, so it is never sourced from inference_options.
-        self.declare_parameter("robot_exec_hz", 30.0)
+        # dynamic_typing=True: `-p robot_exec_hz:=30` (no decimal point) is
+        # parsed by ROS2 as INTEGER, which a fixed DOUBLE declaration rejects
+        # outright during node construction.
+        self.declare_parameter(
+            "robot_exec_hz",
+            30.0,
+            ParameterDescriptor(dynamic_typing=True),
+        )
         self.declare_parameter("execution_mode", "async")
         self.declare_parameter("auto_start", False)
         self.declare_parameter("hand_close_threshold", 0.25)
@@ -223,8 +231,14 @@ class JointInferenceNode(Node):
 
         self.model_id = str(value("model_id"))
         self.task = str(value("task"))
-        self.robot_exec_hz = float(value("robot_exec_hz"))
-        self.step_interval_s = 1.0 / max(self.robot_exec_hz, 1e-6)
+
+        robot_exec_hz_value = value("robot_exec_hz")
+        if isinstance(robot_exec_hz_value, bool):
+            raise ValueError("robot_exec_hz must be a finite positive number")
+        self.robot_exec_hz = float(robot_exec_hz_value)
+        if not np.isfinite(self.robot_exec_hz) or self.robot_exec_hz <= 0:
+            raise ValueError("robot_exec_hz must be a finite positive number")
+        self.step_interval_s = 1.0 / self.robot_exec_hz
         self.execution_mode = str(value("execution_mode")).strip().lower()
         if self.execution_mode not in {"async", "serial"}:
             raise ValueError(

@@ -8,6 +8,7 @@ HAND_CLOSE_THRESHOLD="${PISTAR_HAND_CLOSE_THRESHOLD:-0.25}"
 HAND_CLOSED_POSITIONS="${PISTAR_HAND_CLOSED_POSITIONS:-[0.99,1.39,0.504,0.504,0.504,0.504]}"
 
 PYTHON_BIN="$HOME/runtime/miniforge3/envs/fluxvla_infer/bin/python"
+[[ -x "$PYTHON_BIN" ]] || { echo "ERROR: Python 不可执行: $PYTHON_BIN" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_NAME="$(basename "$SCRIPT_DIR")"
@@ -301,6 +302,16 @@ if ! [[ "$ROBOT_HZ" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || \
    [[ "$ROBOT_HZ" =~ ^0*([.]0*)?$ ]]; then
   die "机器人控制频率必须是正数，当前值: $ROBOT_HZ"
 fi
+# ROS 2 infers CLI parameter types from the text after `:=`. An integral
+# value typed without a decimal point (e.g. "30") would be inferred as
+# INTEGER instead of DOUBLE, so force a decimal-point float here.
+ROBOT_HZ_ROS="$($PYTHON_BIN -c \
+  'import math, sys
+value = float(sys.argv[1])
+if not math.isfinite(value) or value <= 0:
+    raise SystemExit(1)
+print(repr(value))' "$ROBOT_HZ" 2>/dev/null)" || \
+  die "机器人控制频率必须是有限正数: $ROBOT_HZ"
 
 # rtc_execution_horizon is consumed only by the asynchronous RTC scheduler.
 # Serial execution forces RTC off, and async+none uses the plain scheduler, so
@@ -336,7 +347,6 @@ esac
 ROS_SETUP="/opt/ros/jazzy/setup.bash"
 CONTROL_WS_SETUP="$HOME/fa_w2_ws/install/setup.bash"
 
-[[ -x "$PYTHON_BIN" ]] || die "Python 不可执行: $PYTHON_BIN"
 [[ -f "$ROS_SETUP" ]] || die "ROS setup 不存在: $ROS_SETUP"
 [[ -f "$CONTROL_WS_SETUP" ]] || die "控制工作区 setup 不存在: $CONTROL_WS_SETUP"
 
@@ -407,7 +417,7 @@ ROS_PARAMS=(
   -p "tokenizer_path:=$TOKENIZER_PATH"
 
   # Model and execution
-  -p "robot_exec_hz:=$ROBOT_HZ"
+  -p "robot_exec_hz:=$ROBOT_HZ_ROS"
   -p "execution_mode:=$EXECUTION_MODE"
   -p "task:=$TASK"
   -p "device:=$DEVICE"
