@@ -41,9 +41,9 @@ RIGHT_HAND_JOINT_NAMES = (
     "right_hand_pinky_joint",
 )
 
-# Fixed model action/state order, shared by the LeRobot feature metadata and
-# pi05_parcel_sort.py -- the single source of truth ros_node.py's
-# _build_sample/build_joint_commands read from.
+# Fixed model action/state order shared by the parcel-sort inference configs.
+# ros_node.py's _build_sample/build_joint_commands use this as their source of
+# truth.
 MODEL_JOINT_NAMES = (
     "body_joint3", "body_joint4",
     "left_joint1", "left_joint2", "left_joint3", "left_joint4",

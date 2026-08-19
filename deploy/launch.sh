@@ -2,6 +2,8 @@
 # Launch guarded FluxVLA PI0.5 joint-space inference.
 
 set -euo pipefail
+# Keep the deployment checkout free of generated __pycache__/*.pyc files.
+export PYTHONDONTWRITEBYTECODE=1
 # Control (environment overrides are useful for isolated startup checks).
 AUTO_START="${PISTAR_AUTO_START:-true}"
 HAND_CLOSE_THRESHOLD="${PISTAR_HAND_CLOSE_THRESHOLD:-0.25}"
@@ -259,24 +261,24 @@ fi
 if [[ "$ACCELERATION" == "custom" ]]; then
     CUSTOM_CONFIG=""
     prompt_with_default CUSTOM_CONFIG "Inference config 路径" \
-      "$CONFIG_DIR/pi05_parcel_sort_none_triton_inference.py"
+      "$CONFIG_DIR/none/triton_inference.py"
     CUSTOM_CONFIG="${CUSTOM_CONFIG/#\~/$HOME}"
     if [[ "$CUSTOM_CONFIG" != /* ]]; then
       CUSTOM_CONFIG="$PACKAGE_PARENT/$CUSTOM_CONFIG"
     fi
     INFERENCE_CONFIG="$CUSTOM_CONFIG"
 elif [[ "$RTC_MODE" == "guidance" && "$ACCELERATION" == "triton" ]]; then
-  INFERENCE_CONFIG="$CONFIG_DIR/pi05_parcel_sort_guidance_triton_inference.py"
+  INFERENCE_CONFIG="$CONFIG_DIR/guidance/triton_inference.py"
 elif [[ "$RTC_MODE" == "guidance" ]]; then
-  INFERENCE_CONFIG="$CONFIG_DIR/pi05_parcel_sort_guidance_pytorch_inference.py"
+  INFERENCE_CONFIG="$CONFIG_DIR/guidance/pytorch_inference.py"
 elif [[ "$RTC_MODE" == "prefix" && "$ACCELERATION" == "triton" ]]; then
-  INFERENCE_CONFIG="$CONFIG_DIR/pi05_parcel_sort_prefix_triton_inference.py"
+  INFERENCE_CONFIG="$CONFIG_DIR/prefix/triton_inference.py"
 elif [[ "$RTC_MODE" == "prefix" ]]; then
-  INFERENCE_CONFIG="$CONFIG_DIR/pi05_parcel_sort_prefix_pytorch_inference.py"
+  INFERENCE_CONFIG="$CONFIG_DIR/prefix/pytorch_inference.py"
 elif [[ "$ACCELERATION" == "triton" ]]; then
-  INFERENCE_CONFIG="$CONFIG_DIR/pi05_parcel_sort_none_triton_inference.py"
+  INFERENCE_CONFIG="$CONFIG_DIR/none/triton_inference.py"
 else
-  INFERENCE_CONFIG="$CONFIG_DIR/pi05_parcel_sort_none_pytorch_inference.py"
+  INFERENCE_CONFIG="$CONFIG_DIR/none/pytorch_inference.py"
 fi
 
 case "$RTC_MODE" in

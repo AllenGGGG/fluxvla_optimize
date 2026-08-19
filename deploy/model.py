@@ -5,7 +5,7 @@ normalization, prompt building, action denormalization) go through
 ``self.dataset``/``self.denormalize_action`` (built by
 ``BaseInferenceRunner.__init__`` via ``fluxvla.engines``'
 ``build_dataset_from_cfg``/``build_transform_from_cfg`` reading
-``configs/pi05/pi05_parcel_sort_none_pytorch_inference.py``) - the exact same
+``configs/pi05/none/pytorch_inference.py``) - the exact same
 ``fluxvla.transforms`` classes used by training. There is no hand-rolled
 normalize/denormalize/prompt-building code in this file.
 """

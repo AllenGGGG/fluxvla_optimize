@@ -1,7 +1,8 @@
 # fluxvla_deploy
 
-Guarded ROS2 deployment for the AccVLA PI0.5 parcel-sorting policy trained by
-`~/accvla/configs/pi05/pi05_parcel_sort.py`.
+Guarded ROS2 deployment for the AccVLA PI0.5 parcel-sorting policy. Runtime
+model and preprocessing settings live in
+`configs/pi05/{none,guidance,prefix}/`.
 
 ## Joint contract
 
@@ -80,43 +81,9 @@ validation, publication pauses immediately.
 
 ## Run
 
-Use one Python environment containing ROS2 Jazzy `rclpy`, AccVLA dependencies,
-PyTorch, OpenCV, MMEngine, safetensors, and the pinned visualization packages.
-
-**x86_64 (with an x86 ROS2 install to set up):**
-
-```bash
-conda activate fluxvla_infer
-bash scripts/install_env.sh real-only --with-ros2
-```
-
-`--with-ros2` installs the same ML dependencies as `scripts/install_env.sh
-real-only`, then adds the pinned visualization packages above and installs
-ROS2 Jazzy (`ros-jazzy-ros-base`) via apt if `rclpy` isn't already importable.
-Set `ROS2_INSTALL=never` to only check, or `ROS2_INSTALL=always` to force a
-reinstall; installing ROS2 runs `apt-get` as root and adds the ros2.org apt
-source system-wide. There used to be a separate `deploy/install_env.sh` for
-this; it's been folded into `scripts/install_env.sh` so there's a single
-installer for both training and deploy.
-
-**ARM/Jetson AGX Orin (`allen_agx_orin` container, ROS2 Jazzy already
-installed system-wide):**
-
-```bash
-bash scripts/install_env_orin.sh
-```
-
-`scripts/install_env.sh` pulls PyTorch from `download.pytorch.org`, which has
-no aarch64 wheels — it cannot install on Jetson. `install_env_orin.sh` is a
-separate script for this platform: it provisions a Python 3.12 conda env
-(matching the system ROS2 install's `rclpy` ABI — `rclpy` cannot be installed
-via pip, so the interpreter version must match exactly), installs
-PyTorch/torchvision/torchaudio/triton from the Jetson community wheel index
-(`pypi.jetson-ai-lab.io`), installs cuDNN/libopenblas into the container (the
-default cuDNN install path usually isn't bind-mounted from the host, unlike
-the CUDA Toolkit), and builds FluxVLA's custom CUDA extensions against the
-host's mounted CUDA Toolkit. See the root [`README.md`](../README.md#本分支allen_infer快速上手)
-for the full breakdown and the host-side CUDA Toolkit prerequisite.
+新设备的 CUDA、Python、FluxVLA 扩展和 ROS 2 装机步骤统一维护在根目录
+[`README.md`](../README.md#新设备装机)。完成安装并 source ROS 2 与机器人工作区后，
+从项目根目录运行 `./deploy/launch.sh`。
 
 The launcher prompts for the robot control frequency and, when asynchronous RTC
 is enabled, the RTC execution horizon. They can also be supplied without
@@ -155,12 +122,12 @@ the guidance update. Available built-in combinations are:
 
 | RTC | Acceleration | `INFERENCE_CONFIG` |
 |---|---|---|
-| `guidance` | Triton + CUDA Graph | `pi05_parcel_sort_guidance_triton_inference.py` |
-| `guidance` | PyTorch | `pi05_parcel_sort_guidance_pytorch_inference.py` |
-| `prefix` | Triton + CUDA Graph | `pi05_parcel_sort_prefix_triton_inference.py` |
-| `prefix` | PyTorch | `pi05_parcel_sort_prefix_pytorch_inference.py` |
-| off | Triton + CUDA Graph | `pi05_parcel_sort_none_triton_inference.py` |
-| off | PyTorch | `pi05_parcel_sort_none_pytorch_inference.py` |
+| `guidance` | Triton + CUDA Graph | `guidance/triton_inference.py` |
+| `guidance` | PyTorch | `guidance/pytorch_inference.py` |
+| `prefix` | Triton + CUDA Graph | `prefix/triton_inference.py` |
+| `prefix` | PyTorch | `prefix/pytorch_inference.py` |
+| off | Triton + CUDA Graph | `none/triton_inference.py` |
+| off | PyTorch | `none/pytorch_inference.py` |
 
 A mismatched custom config fails fast at startup instead of silently running
 unguided.

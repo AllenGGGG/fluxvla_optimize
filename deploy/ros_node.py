@@ -173,8 +173,8 @@ class JointInferenceNode(Node):
         self.declare_parameter("tokenizer_path", "")
 
         # RTC/algorithm knobs default to whatever the selected inference_config
-        # file's inference_options dict says (see configs/pi05/
-        # pi05_parcel_sort_none_pytorch_inference.py); still declared as ROS2
+        # file's inference_options dict says (see configs/pi05/none/
+        # pytorch_inference.py); still declared as ROS2
         # parameters so `-p name:=value` can override them at launch.
         inference_options = load_inference_options(
             str(self.get_parameter("inference_config").value)

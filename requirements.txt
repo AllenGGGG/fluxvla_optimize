@@ -1,5 +1,0 @@
-# Full FluxVLA dependency set.
-# Install CUDA PyTorch first, or use scripts/install_env.sh.
--r requirements-base.txt
--r requirements-sim.txt
--r requirements-real.txt

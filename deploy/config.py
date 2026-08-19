@@ -15,7 +15,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INFERENCE_CONFIG = os.environ.get(
     "PISTAR_INFERENCE_CONFIG",
     str(_REPO_ROOT /
-        "configs/pi05/pi05_parcel_sort_none_pytorch_inference.py"),
+        "configs/pi05/none/pytorch_inference.py"),
 )
 DEFAULT_TASK = (
     "Pick up the parcel with the left hand, then move it onto the conveyor "
@@ -51,9 +51,9 @@ def load_inference_options(inference_config_path: str) -> dict:
     rtc_execution_horizon, rtc_replan_remaining, chunk_publish_horizon,
     rtc_publish_horizon, rtc_max_guidance_weight, rtc_schedule,
     num_inference_steps_override) -- see VALID_RTC_METHODS above and
-    configs/pi05/pi05_parcel_sort_none_pytorch_inference.py's
-    inference_options, which every other pi05_parcel_sort_*_inference.py
-    inherits via _base_.
+    configs/pi05/none/pytorch_inference.py's
+    inference_options, which the other parcel-sort inference configs inherit
+    via _base_.
     """
     from mmengine import Config
 

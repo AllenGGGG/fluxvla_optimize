@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-ENV_MODE="full"
-PROFILE="auto"
+ENV_MODE="real-only"
+PROFILE="cu128"
 DRY_RUN=0
 SKIP_AV=0
 SKIP_FLASH_ATTN=0
@@ -24,7 +24,7 @@ SKIP_PROJECT=0
 SKIP_BUILD_TOOLS=0
 SKIP_EGL_SETUP=0
 FLUXVLA_CONDA_ENV_NAME="${FLUXVLA_CONDA_ENV_NAME:-fluxvla}"
-FLUXVLA_PYTHON_VERSION="${FLUXVLA_PYTHON_VERSION:-3.12}"
+FLUXVLA_PYTHON_VERSION="${FLUXVLA_PYTHON_VERSION:-3.12.13}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -65,7 +65,7 @@ FLASH_ATTN_WHEEL_BASE_URLS="${FLASH_ATTN_WHEEL_BASE_URLS:-}"
 FLUXVLA_EGL_SETUP="${FLUXVLA_EGL_SETUP:-auto}"
 FLUXVLA_EGL_VENDOR_FILE="${FLUXVLA_EGL_VENDOR_FILE:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
 FLUXVLA_EGL_APT_PACKAGES="${FLUXVLA_EGL_APT_PACKAGES:-libegl1 libglvnd0 libopengl0 libegl-dev libgl1-mesa-dev libx11-dev libglew-dev libosmesa6-dev}"
-FLUXVLA_ROBOCASA_INSTALL="${FLUXVLA_ROBOCASA_INSTALL:-auto}"
+FLUXVLA_ROBOCASA_INSTALL="${FLUXVLA_ROBOCASA_INSTALL:-never}"
 FLUXVLA_ROBOCASA_SRC_ROOT="${FLUXVLA_ROBOCASA_SRC_ROOT:-${PROJECT_ROOT}/src}"
 FLUXVLA_GROOT_REPO="${FLUXVLA_GROOT_REPO:-https://github.com/NVIDIA/Isaac-GR00T.git}"
 FLUXVLA_GROOT_REF="${FLUXVLA_GROOT_REF:-4af2b622892f7dcb5aae5a3fb70bcb02dc217b96}"
@@ -73,49 +73,38 @@ FLUXVLA_GROOT_DIR="${FLUXVLA_GROOT_DIR:-${FLUXVLA_ROBOCASA_SRC_ROOT}/Isaac-GR00T
 FLUXVLA_ROBOCASA_GR1_REPO="${FLUXVLA_ROBOCASA_GR1_REPO:-https://github.com/robocasa/robocasa-gr1-tabletop-tasks.git}"
 FLUXVLA_ROBOCASA_GR1_REF="${FLUXVLA_ROBOCASA_GR1_REF:-4840e671596f93ca03651524b9f72ffb1aadfeff}"
 FLUXVLA_ROBOCASA_GR1_DIR="${FLUXVLA_ROBOCASA_GR1_DIR:-${FLUXVLA_ROBOCASA_SRC_ROOT}/robocasa-gr1-tabletop-tasks}"
-FLUXVLA_ROBOCASA_ASSETS="${FLUXVLA_ROBOCASA_ASSETS:-always}"
+FLUXVLA_ROBOCASA_ASSETS="${FLUXVLA_ROBOCASA_ASSETS:-never}"
 FLUXVLA_ROBOCASA_ASSET_ENDPOINT="${FLUXVLA_ROBOCASA_ASSET_ENDPOINT:-${HF_ENDPOINT:-https://hf-mirror.com}}"
 FLUXVLA_ROBOCASA_ASSET_CACHE="${FLUXVLA_ROBOCASA_ASSET_CACHE:-/tmp/robocasa-assets}"
 
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/install_env.sh [sim-only|real-only|full] [options]
+  bash scripts/install_env.sh [real-only] [options]
 
 Environment modes:
-  sim-only   Install training + simulation dependencies.
   real-only  Install training + real-robot / remote inference dependencies.
-  full       Install all dependencies. Default.
+             This is the default and only supported mode on this branch.
 
-Aliases:
-  sim        Same as sim-only.
+Alias:
   real       Same as real-only.
 
 Options:
-  --profile auto|cu124|cu128  GPU profile. auto prefers the current CUDA
-                              toolkit / nvcc version: CUDA >= 12.8 selects
-                              cu128, otherwise cu124. Driver CUDA and GPU
-                              generation are fallback signals only.
+  --profile cu128             Install the verified PyTorch 2.8.0 + CUDA 12.8
+                              + Triton 3.4.0 inference environment.
   --env-name NAME             Conda env to create (if it doesn't exist yet)
                               and activate/install into, unless a non-base
                               conda env is already active. Default: fluxvla.
   --python-version VERSION    Python version for a newly created env.
-                              Default: 3.12. Ignored if the target env
+                              Default: 3.12.13. Ignored if the target env
                               already exists or a non-base env is active.
   --dry-run                   Print commands without executing them.
   --skip-av                   Skip av installation.
   --skip-flash-attn           Skip FlashAttention wheel installation.
   --skip-project              Skip editable FluxVLA installation.
   --skip-build-tools          Skip cmake/ninja preflight check.
-  --skip-egl-setup            Skip LIBERO / MuJoCo EGL system setup.
-  --with-robocasa             Install RoboCasa source checkouts even in
-                              real-only mode.
-  --skip-robocasa             Skip Isaac-GR00T / RoboCasa GR1 source checkout
-                              installation.
-  --with-robocasa-assets      Force RoboCasa tabletop simulator asset download
-                              when RoboCasa source checkouts are installed.
-  --skip-robocasa-assets      Skip RoboCasa asset download. --skip-robocasa
-                              also skips asset download.
+  --skip-egl-setup            Accepted for backward compatibility; the
+                              real-only profile does not configure simulators.
   -h, --help                  Show this help.
 
 Environment variables:
@@ -124,7 +113,7 @@ Environment variables:
   FLUXVLA_CONDA_ENV_NAME
                       Same as --env-name. Default: fluxvla.
   FLUXVLA_PYTHON_VERSION
-                      Same as --python-version. Default: 3.12.
+                      Same as --python-version. Default: 3.12.13.
   PIP_INDEX_MODE      pip index selection mode when PIP_INDEX_URLS is not set.
                       auto: use your pip config if it defines an index;
                       otherwise probe PyPI and mirrors by response time.
@@ -194,50 +183,16 @@ Environment variables:
   FLASH_ATTN_CUDA_TAG Override the auto-detected CUDA wheel tag, e.g. cu12.
   FLUXVLA_WHEEL_CACHE Directory for cached release wheels. Default:
                       ~/.cache/fluxvla/wheels.
-  FLUXVLA_EGL_SETUP   LIBERO / MuJoCo EGL setup mode for sim/full installs.
-                      auto: probe EGL first, then try system setup if needed.
-                      always: run the EGL check strictly and fail if broken.
-                      never: skip EGL setup. Default: auto.
-  FLUXVLA_EGL_VENDOR_FILE
-                      NVIDIA GLVND EGL vendor JSON path. Default:
-                      /usr/share/glvnd/egl_vendor.d/10_nvidia.json.
-  FLUXVLA_EGL_APT_PACKAGES
-                      Space-separated apt packages for EGL / OSMesa setup.
   FLUXVLA_ROBOCASA_INSTALL
-                      RoboCasa source checkout mode: auto, always, or never.
-                      auto installs for sim-only/full and skips real-only.
-                      Default: auto.
-  FLUXVLA_ROBOCASA_SRC_ROOT
-                      Directory containing RoboCasa source checkouts. Default:
-                      ./src under the FluxVLA repository.
-  FLUXVLA_GROOT_REPO, FLUXVLA_GROOT_REF, FLUXVLA_GROOT_DIR
-                      Isaac-GR00T repository, pinned ref, and checkout path.
-  FLUXVLA_ROBOCASA_GR1_REPO, FLUXVLA_ROBOCASA_GR1_REF,
-  FLUXVLA_ROBOCASA_GR1_DIR
-                      RoboCasa GR1 task repository, pinned ref, and checkout
-                      path.
+                      Must be never. RoboCasa support is unavailable.
   FLUXVLA_ROBOCASA_ASSETS
-                      RoboCasa asset download mode: always or never. Default:
-                      always. Assets are downloaded only when RoboCasa source
-                      checkouts are installed.
-  FLUXVLA_ROBOCASA_ASSET_ENDPOINT
-                      Hugging Face endpoint for RoboCasa asset downloads.
-                      Default: HF_ENDPOINT if set, otherwise
-                      https://hf-mirror.com.
-  FLUXVLA_ROBOCASA_ASSET_CACHE
-                      Local archive cache for RoboCasa asset downloads.
-                      Default: /tmp/robocasa-assets.
+                      Must be never. RoboCasa assets are unavailable.
 
 Examples:
   conda activate fluxvla
-  bash scripts/install_env.sh sim-only
   bash scripts/install_env.sh real-only --profile cu128
-  bash scripts/install_env.sh full --dry-run
-  PIP_INDEX_CANDIDATES="https://mirrors.aliyun.com/pypi/simple https://mirrors.cloud.tencent.com/pypi/simple https://repo.huaweicloud.com/repository/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.bfsu.edu.cn/pypi/web/simple https://pypi.org/simple" bash scripts/install_env.sh full
-  FLUXVLA_EGL_SETUP=always bash scripts/install_env.sh sim-only
-  FLUXVLA_ROBOCASA_SRC_ROOT=/data/src bash scripts/install_env.sh sim-only
-  bash scripts/install_env.sh sim-only --skip-robocasa
-  GH_PROXY_CANDIDATES="https://ghfast.top https://gh.llkk.cc https://gh-proxy.com" bash scripts/install_env.sh full
+  PIP_INDEX_CANDIDATES="https://mirrors.aliyun.com/pypi/simple https://mirrors.cloud.tencent.com/pypi/simple https://repo.huaweicloud.com/repository/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.bfsu.edu.cn/pypi/web/simple https://pypi.org/simple" bash scripts/install_env.sh real-only
+  GH_PROXY_CANDIDATES="https://ghfast.top https://gh.llkk.cc https://gh-proxy.com" bash scripts/install_env.sh real-only
   conda activate fluxvla_infer
   bash scripts/install_env.sh real-only
 EOF
@@ -277,20 +232,20 @@ run_conda_with_timeout() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     sim|sim-only)
-      ENV_MODE="sim-only"
-      shift
+      echo "Simulation support has been removed from this deployment branch." >&2
+      exit 2
       ;;
     real|real-only)
       ENV_MODE="real-only"
       shift
       ;;
     full)
-      ENV_MODE="full"
-      shift
+      echo "The full profile included simulation support and is unavailable; use real-only." >&2
+      exit 2
       ;;
     --profile)
       if [[ $# -lt 2 ]]; then
-        echo "--profile requires a value: auto, cu124, or cu128" >&2
+        echo "--profile requires the value cu128" >&2
         exit 1
       fi
       PROFILE="${2:-}"
@@ -336,16 +291,12 @@ while [[ $# -gt 0 ]]; do
       SKIP_EGL_SETUP=1
       shift
       ;;
-    --with-robocasa)
-      FLUXVLA_ROBOCASA_INSTALL="always"
-      shift
+    --with-robocasa|--with-robocasa-assets)
+      echo "RoboCasa simulation support has been removed from this deployment branch." >&2
+      exit 2
       ;;
     --skip-robocasa)
       FLUXVLA_ROBOCASA_INSTALL="never"
-      shift
-      ;;
-    --with-robocasa-assets)
-      FLUXVLA_ROBOCASA_ASSETS="always"
       shift
       ;;
     --skip-robocasa-assets)
@@ -364,8 +315,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "${PROFILE}" != "auto" && "${PROFILE}" != "cu124" && "${PROFILE}" != "cu128" ]]; then
-  echo "--profile must be one of: auto, cu124, cu128" >&2
+if [[ "${PROFILE}" != "cu128" ]]; then
+  echo "Only --profile cu128 is supported on this inference branch." >&2
   exit 1
 fi
 
@@ -409,26 +360,13 @@ case "${FLUXVLA_EGL_SETUP}" in
     ;;
 esac
 
-case "${FLUXVLA_ROBOCASA_INSTALL}" in
-  auto|always|never)
-    ;;
-  *)
-    echo "FLUXVLA_ROBOCASA_INSTALL must be one of: auto, always, never" >&2
-    exit 1
-    ;;
-esac
-
-case "${FLUXVLA_ROBOCASA_ASSETS}" in
-  always|never)
-    ;;
-  *)
-    echo "FLUXVLA_ROBOCASA_ASSETS must be one of: always, never" >&2
-    exit 1
-    ;;
-esac
-
-if [[ "${FLUXVLA_ROBOCASA_INSTALL}" == "never" ]]; then
-  FLUXVLA_ROBOCASA_ASSETS="never"
+if [[ "${FLUXVLA_ROBOCASA_INSTALL}" != "never" ]]; then
+  echo "RoboCasa support has been removed; FLUXVLA_ROBOCASA_INSTALL must be never." >&2
+  exit 2
+fi
+if [[ "${FLUXVLA_ROBOCASA_ASSETS}" != "never" ]]; then
+  echo "RoboCasa assets have been removed; FLUXVLA_ROBOCASA_ASSETS must be never." >&2
+  exit 2
 fi
 
 detect_gpu_names() {
@@ -527,21 +465,11 @@ has_toolkit_cuda_at_least() {
 }
 
 profile_cuda_version() {
-  local selected="$1"
-  if [[ "${selected}" == "cu128" ]]; then
-    echo "12.8"
-  else
-    echo "12.4"
-  fi
+  echo "12.8"
 }
 
 profile_torch_version() {
-  local selected="$1"
-  if [[ "${selected}" == "cu128" ]]; then
-    echo "2.8"
-  else
-    echo "2.6"
-  fi
+  echo "2.8"
 }
 
 check_cuda_profile_compatibility() {
@@ -560,9 +488,8 @@ check_cuda_profile_compatibility() {
     echo "Error: selected profile ${selected} requires NVIDIA driver support for CUDA ${expected_cuda}+," >&2
     echo "       but nvidia-smi reports CUDA ${driver_cuda}." >&2
     echo "Fix one of these:" >&2
-    echo "  1. Use a compatible wheel profile: bash scripts/install_env.sh ${ENV_MODE} --profile cu124" >&2
-    echo "  2. Upgrade the NVIDIA driver, then rerun with --profile ${selected}" >&2
-    echo "  3. If the wrong torch wheel is already installed, run:" >&2
+    echo "  1. Upgrade the NVIDIA driver, then rerun with --profile ${selected}" >&2
+    echo "  2. If the wrong torch wheel is already installed, run:" >&2
     echo "       python -m pip uninstall -y torch torchvision torchaudio" >&2
     exit 1
   fi
@@ -995,51 +922,8 @@ is_blackwell_gpu() {
   echo "${names}" | grep -Eiq 'rtx[[:space:]]*(50|pro[[:space:]]*50)|geforce[[:space:]]*rtx[[:space:]]*50|blackwell|gb20|gb10'
 }
 
-profile_for_cuda_version() {
-  local version="$1"
-
-  if [[ -z "${version}" ]]; then
-    return 1
-  fi
-  if cuda_version_ge "${version}" "12.8"; then
-    echo "cu128"
-  else
-    echo "cu124"
-  fi
-}
-
 resolve_profile() {
-  if [[ "${PROFILE}" != "auto" ]]; then
-    echo "${PROFILE}"
-    return
-  fi
-
-  local nvcc_cuda toolkit_cuda driver_cuda names caps
-  nvcc_cuda="$(detect_nvcc_cuda_version)"
-  if [[ -n "${nvcc_cuda}" ]]; then
-    profile_for_cuda_version "${nvcc_cuda}"
-    return
-  fi
-
-  toolkit_cuda="$(detect_toolkit_cuda_versions | sort -Vu | tail -n 1)"
-  if [[ -n "${toolkit_cuda}" ]]; then
-    profile_for_cuda_version "${toolkit_cuda}"
-    return
-  fi
-
-  driver_cuda="$(detect_driver_cuda_version)"
-  if [[ -n "${driver_cuda}" ]]; then
-    profile_for_cuda_version "${driver_cuda}"
-    return
-  fi
-
-  names="$(detect_gpu_names)"
-  caps="$(detect_compute_caps)"
-  if is_blackwell_gpu "${names}" "${caps}"; then
-    echo "cu128"
-  else
-    echo "cu124"
-  fi
+  echo "cu128"
 }
 
 python_tag() {
@@ -1173,24 +1057,11 @@ ensure_pip() {
 }
 
 torch_tag_for_profile() {
-  local selected="$1"
-  if [[ "${selected}" == "cu128" ]]; then
-    echo "2.8"
-  else
-    echo "2.6"
-  fi
+  echo "2.8"
 }
 
 cuda_tag_for_profile() {
-  local selected="$1"
-  case "${selected}" in
-    cu124|cu128)
-      echo "cu12"
-      ;;
-    *)
-      echo "${selected%[0-9][0-9]}"
-      ;;
-  esac
+  echo "cu12"
 }
 
 platform_tag() {
@@ -1463,17 +1334,10 @@ pip_install_direct() {
 }
 
 install_torch() {
-  local selected="$1"
   local torch_indexes
-  if [[ "${selected}" == "cu128" ]]; then
-    torch_indexes="${TORCH_INDEX_URLS:-https://download.pytorch.org/whl/cu128}"
-    pip_install_from_indexes "${torch_indexes}" \
-      torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
-  else
-    torch_indexes="${TORCH_INDEX_URLS:-https://download.pytorch.org/whl/cu124}"
-    pip_install_from_indexes "${torch_indexes}" \
-      torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
-  fi
+  torch_indexes="${TORCH_INDEX_URLS:-https://download.pytorch.org/whl/cu128}"
+  pip_install_from_indexes "${torch_indexes}" \
+    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
 }
 
 verify_torch_install() {
@@ -1533,7 +1397,7 @@ if errors:
         + "\nFix:\n"
         + "       python -m pip uninstall -y torch torchvision torchaudio\n"
         + f"       bash scripts/install_env.sh <mode> --profile {selected}\n"
-        + "Or choose --profile cu124 if your driver only supports CUDA 12.4."
+        + "This branch requires the verified CUDA 12.8 environment."
     )
 PY
 }
@@ -1581,22 +1445,9 @@ install_av_with_conda() {
 }
 
 install_requirements() {
-  pip_install_with_mirrors -r "${PROJECT_ROOT}/requirements-base.txt"
-
-  case "${ENV_MODE}" in
-    sim-only)
-      pip_install_with_mirrors -r "${PROJECT_ROOT}/requirements-sim.txt"
-      ;;
-    real-only)
-      pip_install_with_mirrors -r "${PROJECT_ROOT}/requirements-real.txt"
-      check_ros_python_runtime
-      ;;
-    full)
-      pip_install_with_mirrors -r "${PROJECT_ROOT}/requirements-sim.txt"
-      pip_install_with_mirrors -r "${PROJECT_ROOT}/requirements-real.txt"
-      check_ros_python_runtime
-      ;;
-  esac
+  pip_install_with_mirrors \
+    -r "${PROJECT_ROOT}/environment/pip-requirements.txt"
+  check_ros_python_runtime
 }
 
 download_robocasa_assets() {
@@ -2144,7 +1995,7 @@ main() {
   if ! command -v nvidia-smi >/dev/null 2>&1 \
       && ! command -v nvcc >/dev/null 2>&1 \
       && [[ ! -f /usr/local/cuda/version.txt ]]; then
-    echo "Warning: no CUDA toolkit or nvidia-smi signal was found; auto detection uses cu124."
+    echo "Warning: no CUDA toolkit or nvidia-smi signal was found; cu128 cannot be verified."
   fi
 }
 
