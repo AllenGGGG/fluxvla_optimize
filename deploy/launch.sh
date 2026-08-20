@@ -163,6 +163,141 @@ if [[ ! -d "$TOKENIZER_PATH" ]]; then
   TOKENIZER_PATH="${TOKENIZER_CANDIDATES[0]}"
 fi
 
+# TempoVLA Prompt conditioning encodes speed in the task text. Read the exact
+# template and supported speeds from the selected training run so inference
+# matches training. Checkpoints without this metadata keep the original task.
+BASE_TASK="Pick up the parcel with the left hand, then move it onto the conveyor belt with the right hand."
+TASK="$BASE_TASK"
+TEMPO_PROMPT_ENABLED=false
+TEMPO_SPEED=""
+TEMPO_SPEEDS=()
+SPEED_PROMPT_TEMPLATE=""
+TRAINING_CONFIG_JSON="$CHECKPOINT_ROOT/config.json"
+
+if [[ -f "$TRAINING_CONFIG_JSON" ]]; then
+  TEMPO_METADATA_TEXT=""
+  if ! TEMPO_METADATA_TEXT="$(
+    "$PYTHON_BIN" - "$TRAINING_CONFIG_JSON" <<'PY'
+import json
+import sys
+
+
+def find_speed_prompt(node):
+    if isinstance(node, dict):
+        template = node.get('speed_prompt_template')
+        speeds = node.get('tempo_speeds')
+        if isinstance(template, str) and isinstance(speeds, list) and speeds:
+            return template, speeds
+        for value in node.values():
+            found = find_speed_prompt(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = find_speed_prompt(value)
+            if found is not None:
+                return found
+    return None
+
+
+with open(sys.argv[1], 'r', encoding='utf-8') as file:
+    found = find_speed_prompt(json.load(file))
+if found is not None:
+    template, speeds = found
+    print(template)
+    print(' '.join(format(float(speed), 'g') for speed in speeds))
+PY
+  )"; then
+    die "无法读取 checkpoint 训练配置: $TRAINING_CONFIG_JSON"
+  fi
+  mapfile -t TEMPO_METADATA <<< "$TEMPO_METADATA_TEXT"
+  if (( ${#TEMPO_METADATA[@]} >= 2 )) && [[ -n "${TEMPO_METADATA[0]}" ]]; then
+    TEMPO_PROMPT_ENABLED=true
+    SPEED_PROMPT_TEMPLATE="${TEMPO_METADATA[0]}"
+    read -r -a TEMPO_SPEEDS <<< "${TEMPO_METADATA[1]}"
+  fi
+fi
+
+if [[ "$TEMPO_PROMPT_ENABLED" == "true" ]]; then
+  # Prefer 1x when the checkpoint learned it; otherwise use its first speed.
+  DEFAULT_REQUESTED_TEMPO_SPEED="${TEMPO_SPEEDS[0]}"
+  for trained_speed in "${TEMPO_SPEEDS[@]}"; do
+    if [[ "$trained_speed" == "1" ]]; then
+      DEFAULT_REQUESTED_TEMPO_SPEED="$trained_speed"
+      break
+    fi
+  done
+  REQUESTED_TEMPO_SPEED="${PISTAR_TEMPO_SPEED:-$DEFAULT_REQUESTED_TEMPO_SPEED}"
+  if ! REQUESTED_TEMPO_SPEED="$("$PYTHON_BIN" -c \
+      'import sys; print(format(float(sys.argv[1]), "g"))' \
+      "$REQUESTED_TEMPO_SPEED" 2>/dev/null)"; then
+    die "PISTAR_TEMPO_SPEED 必须是数字"
+  fi
+
+  DEFAULT_TEMPO_INDEX=-1
+  for index in "${!TEMPO_SPEEDS[@]}"; do
+    if [[ "${TEMPO_SPEEDS[$index]}" == "$REQUESTED_TEMPO_SPEED" ]]; then
+      DEFAULT_TEMPO_INDEX="$index"
+      break
+    fi
+  done
+  (( DEFAULT_TEMPO_INDEX >= 0 )) || die \
+    "PISTAR_TEMPO_SPEED=$REQUESTED_TEMPO_SPEED 不在训练速度集合: ${TEMPO_SPEEDS[*]}"
+
+  TEMPO_INDEX="$DEFAULT_TEMPO_INDEX"
+  if is_interactive; then
+    echo
+    echo "任务执行倍速（仅提供该权重训练过的速度，* 为默认选择）："
+    for index in "${!TEMPO_SPEEDS[@]}"; do
+      marker=" "
+      [[ "$index" -eq "$DEFAULT_TEMPO_INDEX" ]] && marker="*"
+      speed_label="${TEMPO_SPEEDS[$index]}x"
+      [[ "${TEMPO_SPEEDS[$index]}" == "1" ]] && speed_label="1x（原始倍速）"
+      printf '  %s %d) %s\n' "$marker" "$((index + 1))" "$speed_label"
+    done
+    while true; do
+      choice=""
+      if ! read -r -p "选择序号或直接输入倍速 [$((DEFAULT_TEMPO_INDEX + 1))]: " choice; then
+        choice=""
+      fi
+      choice="${choice:-$((DEFAULT_TEMPO_INDEX + 1))}"
+      if [[ "$choice" =~ ^[0-9]+$ ]] && \
+         (( choice >= 1 && choice <= ${#TEMPO_SPEEDS[@]} )); then
+        TEMPO_INDEX=$((choice - 1))
+        break
+      fi
+
+      normalized_choice=""
+      normalized_choice="$("$PYTHON_BIN" -c \
+        'import sys; print(format(float(sys.argv[1]), "g"))' \
+        "$choice" 2>/dev/null || true)"
+      for index in "${!TEMPO_SPEEDS[@]}"; do
+        if [[ "${TEMPO_SPEEDS[$index]}" == "$normalized_choice" ]]; then
+          TEMPO_INDEX="$index"
+          break 2
+        fi
+      done
+      echo "请输入序号 1-${#TEMPO_SPEEDS[@]} 或训练倍速: ${TEMPO_SPEEDS[*]}"
+    done
+  fi
+
+  TEMPO_SPEED="${TEMPO_SPEEDS[$TEMPO_INDEX]}"
+  TASK="$("$PYTHON_BIN" - "$SPEED_PROMPT_TEMPLATE" "$TEMPO_SPEED" "$BASE_TASK" <<'PY'
+import sys
+
+try:
+    print(sys.argv[1].format(
+        speed=float(sys.argv[2]),
+        task_description=sys.argv[3],
+    ))
+except (KeyError, ValueError) as error:
+    raise SystemExit(f'invalid speed_prompt_template: {error}')
+PY
+  )" || die "config.json 中的 speed_prompt_template 无法解析"
+elif [[ -n "${PISTAR_TEMPO_SPEED:-}" ]]; then
+  die "所选 checkpoint 没有 TempoVLA Prompt 训练配置，不能设置 PISTAR_TEMPO_SPEED"
+fi
+
 EXECUTION_MODE="$DEFAULT_EXECUTION_MODE"
 case "$EXECUTION_MODE" in
   async|serial) ;;
@@ -330,7 +465,6 @@ if [[ "$EXECUTION_MODE" == "async" && "$RTC_MODE" != "none" ]]; then
     die "RTC horizon 必须是正整数，当前值: $RTC_EXECUTION_HORIZON"
   fi
 fi
-TASK="Pick up the parcel with the left hand, then move it onto the conveyor belt with the right hand."
 DEVICE="cuda"
 DTYPE="bf16"
 
@@ -363,6 +497,12 @@ echo "rtc        : $RTC_LABEL"
 echo "accel      : $ACCELERATION_LABEL"
 echo "config     : $INFERENCE_CONFIG"
 echo "robot hz   : $ROBOT_HZ"
+if [[ "$TEMPO_PROMPT_ENABLED" == "true" ]]; then
+  echo "speed      : ${TEMPO_SPEED}x（Prompt 条件）"
+else
+  echo "speed      : 原始 Prompt（该权重无倍速条件）"
+fi
+echo "task prompt: $TASK"
 if [[ "$RTC_HORIZON_ACTIVE" == "true" ]]; then
   echo "rtc horizon: $RTC_EXECUTION_HORIZON steps"
 else
@@ -421,7 +561,8 @@ ROS_PARAMS=(
   # Model and execution
   -p "robot_exec_hz:=$ROBOT_HZ_ROS"
   -p "execution_mode:=$EXECUTION_MODE"
-  -p "task:=$TASK"
+  # JSON quoting keeps a speed prompt such as "Speed: ..." a ROS YAML string.
+  -p "task:=$("$PYTHON_BIN" -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$TASK")"
   -p "device:=$DEVICE"
   -p "dtype:=$DTYPE"
 
