@@ -344,9 +344,12 @@ class NormalizeStatesAndActions:
             that contains the state information.
         action_key (str | None): The key in the data dictionary
             that contains the action information. If None, actions are skipped.
-        state_norm_mask (List[bool], optional): Per-dim mask selecting which
-            `data['states']` entries get normalized (e.g. skip
-            `SelectJointDims` padding dims). Mirrors `action_norm_mask`.
+        state_norm_mask (list[bool] | None): Dimensions of the state to
+            normalize. A target-dimension mask is trimmed to the input state
+            width before optional padding.
+        action_norm_mask (list[bool] | None): Dimensions of the action to
+            normalize. A target-dimension mask is trimmed to the input action
+            width before optional padding.
     """
 
     def __init__(self,
@@ -375,14 +378,16 @@ class NormalizeStatesAndActions:
         self.clip_norm = clip_norm
         self.normalize_states = normalize_states
         if state_norm_mask is not None:
-            assert len(state_norm_mask) == state_dim, \
-                f'State norm mask must be of length {state_dim}'
+            if state_dim is not None:
+                assert len(state_norm_mask) == state_dim, \
+                    'State norm mask must match state_dim'
             self.state_norm_mask = state_norm_mask
         else:
             self.state_norm_mask = None
         if action_norm_mask is not None:
-            assert len(action_norm_mask) == action_dim, \
-                f'Action norm mask must be of length {action_dim}'
+            if action_dim is not None:
+                assert len(action_norm_mask) == action_dim, \
+                    'Action norm mask must match action_dim'
             self.action_norm_mask = action_norm_mask
         else:
             self.action_norm_mask = None
@@ -438,6 +443,7 @@ class NormalizeStatesAndActions:
                            stats: Dict,
                            norm_type: str,
                            norm_mask: List[bool] = None):
+        norm_mask = self._match_norm_mask(norm_mask, x.shape[-1])
         if norm_type == 'none':
             return x
         if norm_type == 'quantile':
@@ -445,6 +451,16 @@ class NormalizeStatesAndActions:
         if norm_type == 'min_max':
             return self._normalize_min_max(x, stats, norm_mask)
         return self._normalize(x, stats, norm_mask)
+
+    @staticmethod
+    def _match_norm_mask(norm_mask: List[bool], input_dim: int):
+        if norm_mask is None:
+            return None
+        if len(norm_mask) < input_dim:
+            raise ValueError(
+                f'Normalization mask has {len(norm_mask)} dimensions, but '
+                f'the input has {input_dim}')
+        return np.asarray(norm_mask[:input_dim], dtype=bool)
 
     def _normalize(self, x, stats: Dict, norm_mask: List[bool] = None):
         if norm_mask is None:

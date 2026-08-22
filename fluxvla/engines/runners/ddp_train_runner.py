@@ -117,6 +117,8 @@ class DDPTrainRunner(BaseTrainRunner):
                  grad_accumulation_steps: int = 1,
                  evaluator: Optional[Dict] = None,
                  tokenizer: Optional[Dict] = None,
+                 save_pt_checkpoints: bool = True,
+                 checkpoint_run_dir: Optional[str] = None,
                  resume_from: Optional[str] = None,
                  static_graph: bool = True,
                  **kwargs) -> None:
@@ -145,6 +147,8 @@ class DDPTrainRunner(BaseTrainRunner):
             grad_accumulation_steps=grad_accumulation_steps,
             evaluator=evaluator,
             tokenizer=tokenizer,
+            save_pt_checkpoints=save_pt_checkpoints,
+            checkpoint_run_dir=checkpoint_run_dir,
             resume_from=resume_from)
 
         self.cfg = cfg
@@ -291,7 +295,7 @@ class DDPTrainRunner(BaseTrainRunner):
         """Clip gradient norm for DDP model."""
         if self.max_grad_norm is None:
             return
-        torch.nn.utils.clip_grad_norm_(
+        return torch.nn.utils.clip_grad_norm_(
             self.vla.parameters(), max_norm=self.max_grad_norm)
 
     def save_checkpoint(
@@ -346,91 +350,103 @@ class DDPTrainRunner(BaseTrainRunner):
             # Create checkpoint filename (unified format)
             step_name = str(global_step).zfill(6)
             epoch_name = str(epoch).zfill(3)
-            checkpoint_name = f'step-{step_name}-epoch-{epoch_name}'
+            checkpoint_stem = f'step-{step_name}-epoch-{epoch_name}'
 
             if train_loss is not None:
                 loss_name = format(train_loss, '.4f')
-                checkpoint_name += f'-loss={loss_name}'
-            checkpoint_name += '.pt'
+                checkpoint_stem += f'-loss={loss_name}'
 
-            checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
+            checkpoint_path = os.path.join(checkpoint_dir,
+                                           checkpoint_stem + '.pt')
 
-            # Prepare checkpoint dictionary
-            checkpoint_dict = {
-                'model': model_state_dict,
-                'global_step': global_step,
-                'epoch': epoch,
-            }
+            if self.save_pt_checkpoints:
+                # Prepare checkpoint dictionary
+                checkpoint_dict = {
+                    'model': model_state_dict,
+                    'global_step': global_step,
+                    'epoch': epoch,
+                }
 
-            # Save optimizer state with parameter name mapping
-            # Fix: Directly save state_index -> param_name mapping dictionary
-            if self.optimizer is not None:
-                optimizer_state = self.optimizer.state_dict()
-                optimizer_state_dict_actual = optimizer_state.get('state', {})
+                # Save optimizer state with parameter name mapping
+                # Fix: Directly save state_index -> param_name mapping
+                # dictionary
+                if self.optimizer is not None:
+                    optimizer_state = self.optimizer.state_dict()
+                    optimizer_state_dict_actual = optimizer_state.get(
+                        'state', {})
 
-                # Get optimizer parameters in order
-                optimizer_params = []
-                for param_group in self.optimizer.param_groups:
-                    optimizer_params.extend(param_group['params'])
+                    # Get optimizer parameters in order
+                    optimizer_params = []
+                    for param_group in self.optimizer.param_groups:
+                        optimizer_params.extend(param_group['params'])
 
-                # Build mapping from parameter data_ptr to name
-                model_state_dict_current = self.vla.module.state_dict()
-                param_ptr_to_name = {}
-                for name, model_param in model_state_dict_current.items():
-                    param_ptr_to_name[model_param.data_ptr()] = name
+                    # Build mapping from parameter data_ptr to name
+                    model_state_dict_current = self.vla.module.state_dict()
+                    param_ptr_to_name = {}
+                    for name, model_param in model_state_dict_current.items():
+                        param_ptr_to_name[model_param.data_ptr()] = name
 
-                # Fix: Build state_index -> param_name mapping dictionary
-                # This allows direct lookup of parameter names by
-                # state_index during loading
-                state_index_to_param_name = {}
-                for state_idx in optimizer_state_dict_actual.keys():
-                    if state_idx < len(optimizer_params):
-                        param = optimizer_params[state_idx]
-                        param_ptr = param.data_ptr()
-                        if param_ptr in param_ptr_to_name:
-                            state_index_to_param_name[
-                                state_idx] = param_ptr_to_name[param_ptr]
+                    # Fix: Build state_index -> param_name mapping dictionary
+                    # This allows direct lookup of parameter names by
+                    # state_index during loading
+                    state_index_to_param_name = {}
+                    for state_idx in optimizer_state_dict_actual.keys():
+                        if state_idx < len(optimizer_params):
+                            param = optimizer_params[state_idx]
+                            param_ptr = param.data_ptr()
+                            if param_ptr in param_ptr_to_name:
+                                state_index_to_param_name[
+                                    state_idx] = param_ptr_to_name[param_ptr]
+                            else:
+                                overwatch.warning(
+                                    f'Could not find name for optimizer '
+                                    f'parameter at index {state_idx}')
                         else:
                             overwatch.warning(
-                                f'Could not find name for optimizer '
-                                f'parameter at index {state_idx}')
-                    else:
-                        overwatch.warning(
-                            f'State index {state_idx} exceeds optimizer '
-                            f'parameter count')
+                                f'State index {state_idx} exceeds optimizer '
+                                f'parameter count')
 
-                overwatch.info(
-                    f'Saving optimizer state: '
-                    f'{len(optimizer_params)} total parameters, '
-                    f'{len(optimizer_state_dict_actual)} states with '
-                    f'gradients, {len(state_index_to_param_name)} names '
-                    f'mapped')
+                    overwatch.info(
+                        f'Saving optimizer state: '
+                        f'{len(optimizer_params)} total parameters, '
+                        f'{len(optimizer_state_dict_actual)} states with '
+                        f'gradients, {len(state_index_to_param_name)} names '
+                        f'mapped')
 
-                checkpoint_dict['optimizer_state_dict'] = optimizer_state
-                # Fix: Save mapping dictionary instead of list
-                checkpoint_dict['optimizer_state_index_to_name'] = (
-                    state_index_to_param_name)
+                    checkpoint_dict['optimizer_state_dict'] = optimizer_state
+                    # Fix: Save mapping dictionary instead of list
+                    checkpoint_dict['optimizer_state_index_to_name'] = (
+                        state_index_to_param_name)
 
-            # Save scheduler state
-            if self.lr_scheduler is not None:
-                checkpoint_dict[
-                    'scheduler_state_dict'] = self.lr_scheduler.state_dict()
+                # Save scheduler state
+                if self.lr_scheduler is not None:
+                    checkpoint_dict[
+                        'scheduler_state_dict'] = self.lr_scheduler.state_dict(
+                        )
 
-            torch.save(checkpoint_dict, checkpoint_path)
-            overwatch.info(f'Saved Checkpoint at: {checkpoint_path}')
+                torch.save(checkpoint_dict, checkpoint_path)
+                overwatch.info(f'Saved Checkpoint at: {checkpoint_path}')
 
             # Save model weights as safetensors for fast loading
-            safetensors_path = checkpoint_path.replace('.pt', '.safetensors')
+            safetensors_path = os.path.join(checkpoint_dir,
+                                            checkpoint_stem + '.safetensors')
             self._save_model_safetensors(model_state_dict, safetensors_path)
             overwatch.info(f'Saved safetensors at: {safetensors_path}')
 
-            # Create/update latest checkpoint symlink
-            latest_ckpt_link = os.path.join(checkpoint_dir,
-                                            'latest-checkpoint.pt')
-            if os.path.exists(latest_ckpt_link) or os.path.islink(
-                    latest_ckpt_link):
-                os.unlink(latest_ckpt_link)
-            os.symlink(os.path.basename(checkpoint_path), latest_ckpt_link)
+            if self.save_pt_checkpoints:
+                latest_ckpt_link = os.path.join(checkpoint_dir,
+                                                'latest-checkpoint.pt')
+                if os.path.exists(latest_ckpt_link) or os.path.islink(
+                        latest_ckpt_link):
+                    os.unlink(latest_ckpt_link)
+                os.symlink(os.path.basename(checkpoint_path),
+                           latest_ckpt_link)
+            else:
+                latest_ckpt_link = os.path.join(checkpoint_dir,
+                                                'latest-checkpoint.pt')
+                if os.path.exists(latest_ckpt_link) or os.path.islink(
+                        latest_ckpt_link):
+                    os.unlink(latest_ckpt_link)
 
             latest_sf_link = os.path.join(checkpoint_dir,
                                           'latest-checkpoint.safetensors')
