@@ -38,6 +38,8 @@
 *.DS_Store
 *.pyc
 Thumbs.db
+__pycache__/
+.pytest_cache/
 
 # Ignore node_modules and dependencies
 node_modules/
@@ -51,6 +53,7 @@ out/
 
 # Ignore work directories
 /work_dirs
+/workdirs
 # Ignore checkpoints folder contents but keep the folder
 checkpoints/*
 !checkpoints/.gitkeep

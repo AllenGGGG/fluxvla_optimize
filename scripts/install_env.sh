@@ -579,6 +579,37 @@ check_cuda_profile_compatibility() {
   fi
 }
 
+configure_cuda_toolkit() {
+  local selected="$1"
+  local expected_cuda candidate candidate_version
+  expected_cuda="$(profile_cuda_version "${selected}")"
+
+  # CUDA extensions must be compiled with the same toolkit version as the
+  # selected PyTorch runtime. Prefer the versioned system toolkit over a
+  # stale nvcc that happens to appear earlier on PATH (for example 11.5).
+  for candidate in "/usr/local/cuda-${expected_cuda}" "${CUDA_HOME:-}"; do
+    [[ -n "${candidate}" && -x "${candidate}/bin/nvcc" ]] || continue
+    candidate_version="$(${candidate}/bin/nvcc --version 2>/dev/null \
+      | sed -n 's/.*release[[:space:]]*\([0-9][0-9.]*\),.*/\1/p' \
+      | head -n 1)"
+    if [[ "${candidate_version}" == "${expected_cuda}" ]]; then
+      export CUDA_HOME="${candidate}"
+      export PATH="${candidate}/bin:${PATH}"
+      if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        export LD_LIBRARY_PATH="${candidate}/lib64:${LD_LIBRARY_PATH}"
+      else
+        export LD_LIBRARY_PATH="${candidate}/lib64"
+      fi
+      echo "Using CUDA toolkit for native extensions: ${CUDA_HOME}"
+      return 0
+    fi
+  done
+
+  echo "Warning: CUDA ${expected_cuda} toolkit was not found at" >&2
+  echo "         /usr/local/cuda-${expected_cuda}; native extension builds" >&2
+  echo "         may fail if the active nvcc version differs from PyTorch." >&2
+}
+
 needs_sim_runtime() {
   [[ "${ENV_MODE}" == "sim-only" || "${ENV_MODE}" == "full" ]]
 }
@@ -2076,6 +2107,7 @@ main() {
   ensure_build_tools
   ensure_pip
   check_cuda_profile_compatibility "${selected}"
+  configure_cuda_toolkit "${selected}"
   install_torch "${selected}"
   verify_torch_install "${selected}"
   install_av

@@ -43,17 +43,17 @@ EOF
 
 CONFIG="configs/pi05/pi05_parcel_sort.py"
 DATASET_ROOTS=(
-  "/data/guohao/FluxVLA_workdirs/dataset/2026_08_14"
-  "/data/guohao/FluxVLA_workdirs/dataset/2026_08_15"
-  "/data/guohao/FluxVLA_workdirs/dataset/2026_08_20"
-  "/data/guohao/FluxVLA_workdirs/dataset/2026_08_21"
+  "/home/guohao/fluxvla_optimize/workdirs/dataset/2026_08_17"
+  "/home/guohao/fluxvla_optimize/workdirs/dataset/2026_08_13"
+  "/home/guohao/fluxvla_optimize/workdirs/dataset/2026_08_22"
+  "/home/guohao/fluxvla_optimize/workdirs/dataset/2026_08_21"
 )
-BASE_MODEL_DIR="/home/guohao/FluxVLA/checkpoints/pi05_base"
-BASE_WEIGHTS="/home/guohao/FluxVLA/workdirs/checkpoints/2026_08_20/checkpoints/step-018135-epoch-05-loss=0.0067.safetensors"
-WORK_DIR="/data/guohao/FluxVLA_workdirs/checkpoints/2026_08_21"
-LOG_DIR="/data/guohao/FluxVLA_workdirs/logs/2026_08_21"
+BASE_MODEL_DIR="/home/guohao/fluxvla_optimize/checkpoints/pi05_base"
+BASE_WEIGHTS="/home/guohao/fluxvla_optimize/workdirs/checkpoints/2026_08_21/checkpoints/step-026075-epoch-07-loss=0.0053.safetensors"
+WORK_DIR="/home/guohao/fluxvla_optimize/workdirs/checkpoints/2026_08_23"
+LOG_DIR="/home/guohao/fluxvla_optimize/workdirs/logs/2026_08_23"
 BATCH_SIZE=32
-MAX_EPOCHS=7
+MAX_EPOCHS=8
 LEARNING_RATE="1e-5"
 MAX_KEEP_CKPTS=7
 SAVE_PT=false

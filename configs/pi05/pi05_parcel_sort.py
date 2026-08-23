@@ -110,7 +110,7 @@ model = dict(
     freeze_llm_backbone=False,
     freeze_vision_backbone=False,
     pretrained_name_or_path=  # noqa: E251
-    './checkpoints/pi05_base/model.safetensors',  # noqa: E501
+    '/home/guohao/fluxvla_optimize/checkpoints/pi05_base/model.safetensors',  # noqa: E501
     name_mapping={
         'llm_backbone': 'paligemma_with_expert.paligemma.model.language_model',
         'vision_backbone.vision':
@@ -148,7 +148,10 @@ train_dataloader = dict(
                 type='PackedParquetDatasetV3',
                 data_root_path=  # noqa: E251
                 [
-                    './work_dirs/dataset/parcel_sort',
+                    '/home/guohao/fluxvla_optimize/workdirs/dataset/2026_08_17',
+                    '/home/guohao/fluxvla_optimize/workdirs/dataset/2026_08_13',
+                    '/home/guohao/fluxvla_optimize/workdirs/dataset/2026_08_22',
+                    '/home/guohao/fluxvla_optimize/workdirs/dataset/2026_08_21',
                 ],
                 video_keys=[
                     'observation.images.base_0_rgb',
@@ -159,6 +162,8 @@ train_dataloader = dict(
                 action_key='action',
                 statistic_name='private',
                 window_start_idx=1,
+                # Train absolute actions, matching the A100 training branch.
+                use_delta=False,
                 # This parcel-sort parquet data has no `advantage` column;
                 # use_advantage's True default would raise at load time.
                 use_advantage=False,
@@ -185,7 +190,7 @@ train_dataloader = dict(
                         tokenizer=dict(
                             type='PretrainedTokenizer',
                             model_path=  # noqa: E251
-                            'checkpoints/pi05_base',  # noqa: E501
+                            '/home/guohao/fluxvla_optimize/checkpoints/pi05_base',  # noqa: E501
                         )),
                     dict(type='ResizeImages', height=224, width=224),
                     dict(
@@ -216,7 +221,7 @@ runner = dict(
     tokenizer=dict(
         type='PretrainedTokenizer',
         model_path=  # noqa: E251
-        'checkpoints/pi05_base',  # noqa: E501
+        '/home/guohao/fluxvla_optimize/checkpoints/pi05_base',  # noqa: E501
     ),
     metric=dict(
         type='VLAMetric',
