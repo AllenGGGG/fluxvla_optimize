@@ -159,6 +159,9 @@ train_dataloader = dict(
                 action_key='action',
                 statistic_name='private',
                 window_start_idx=1,
+                # This parcel-sort parquet data has no `advantage` column;
+                # use_advantage's True default would raise at load time.
+                use_advantage=False,
                 # Dataset's own task text ("Pick up the parcel with the left
                 # hand, then move it onto the conveyor belt with the right
                 # hand.") is used as-is; no override needed.

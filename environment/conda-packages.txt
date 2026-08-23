@@ -1,4 +1,4 @@
-# PI0.5 inference Conda package snapshot captured from:
+# PI0.5 4090 inference Conda package snapshot captured from:
 # /home/fiveages/runtime/miniforge3/envs/fluxvla_infer
 # Format: conda list --export
 # platform: linux-64

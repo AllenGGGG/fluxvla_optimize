@@ -1,4 +1,4 @@
-# PI0.5 parcel-sort real-robot inference dependencies for pip.
+# PI0.5 parcel-sort 4090 real-robot inference dependencies for pip.
 # Versions match /home/fiveages/runtime/miniforge3/envs/fluxvla_infer.
 # Install the CUDA build of PyTorch separately when creating a fresh env.
 

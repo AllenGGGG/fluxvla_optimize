@@ -15,16 +15,16 @@
 
 set -euo pipefail
 
-ENV_MODE="real-only"
-PROFILE="cu128"
+ENV_MODE=""
+PROFILE=""
 DRY_RUN=0
 SKIP_AV=0
 SKIP_FLASH_ATTN=0
 SKIP_PROJECT=0
 SKIP_BUILD_TOOLS=0
 SKIP_EGL_SETUP=0
-FLUXVLA_CONDA_ENV_NAME="${FLUXVLA_CONDA_ENV_NAME:-fluxvla}"
-FLUXVLA_PYTHON_VERSION="${FLUXVLA_PYTHON_VERSION:-3.12.13}"
+FLUXVLA_CONDA_ENV_NAME="${FLUXVLA_CONDA_ENV_NAME:-}"
+FLUXVLA_PYTHON_VERSION="${FLUXVLA_PYTHON_VERSION:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -32,6 +32,8 @@ if [[ -n "${PYTHON:-}" ]]; then
   PYTHON_BIN="${PYTHON}"
 elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
   PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
 else
   PYTHON_BIN="python"
 fi
@@ -80,40 +82,44 @@ FLUXVLA_ROBOCASA_ASSET_CACHE="${FLUXVLA_ROBOCASA_ASSET_CACHE:-/tmp/robocasa-asse
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/install_env.sh [real-only] [options]
+  bash scripts/install_env.sh [train|inference] [options]
+
+Run without a mode to select the environment interactively.
 
 Environment modes:
-  real-only  Install training + real-robot / remote inference dependencies.
-             This is the default and only supported mode on this branch.
+  train      Install the A100 training environment (Python 3.10,
+             PyTorch 2.6.0 + CUDA 12.4 by default).
+  inference  Install the 4090 real-robot inference environment (Python
+             3.12.13, PyTorch 2.8.0 + CUDA 12.8).
 
-Alias:
-  real       Same as real-only.
+Aliases:
+  infer, real, real-only  Same as inference.
 
 Options:
-  --profile cu128             Install the verified PyTorch 2.8.0 + CUDA 12.8
-                              + Triton 3.4.0 inference environment.
+  --profile cu124|cu128        CUDA/PyTorch profile. train defaults to cu124;
+                              inference only supports cu128.
   --env-name NAME             Conda env to create (if it doesn't exist yet)
-                              and activate/install into, unless a non-base
-                              conda env is already active. Default: fluxvla.
+                              and activate/install into. Defaults:
+                              fluxvla_train or fluxvla_infer by mode.
   --python-version VERSION    Python version for a newly created env.
-                              Default: 3.12.13. Ignored if the target env
-                              already exists or a non-base env is active.
+                              Defaults: 3.10 for train, 3.12.13 for inference.
+                              Ignored if the target env already exists.
   --dry-run                   Print commands without executing them.
   --skip-av                   Skip av installation.
   --skip-flash-attn           Skip FlashAttention wheel installation.
   --skip-project              Skip editable FluxVLA installation.
   --skip-build-tools          Skip cmake/ninja preflight check.
   --skip-egl-setup            Accepted for backward compatibility; the
-                              real-only profile does not configure simulators.
+                              train/inference modes do not configure simulators.
   -h, --help                  Show this help.
 
 Environment variables:
   PYTHON              Python executable to use. Default: $CONDA_PREFIX/bin/python
                       when available, otherwise python.
   FLUXVLA_CONDA_ENV_NAME
-                      Same as --env-name. Default: fluxvla.
+                      Same as --env-name. Defaults are mode-specific.
   FLUXVLA_PYTHON_VERSION
-                      Same as --python-version. Default: 3.12.13.
+                      Same as --python-version. Defaults are mode-specific.
   PIP_INDEX_MODE      pip index selection mode when PIP_INDEX_URLS is not set.
                       auto: use your pip config if it defines an index;
                       otherwise probe PyPI and mirrors by response time.
@@ -189,12 +195,12 @@ Environment variables:
                       Must be never. RoboCasa assets are unavailable.
 
 Examples:
-  conda activate fluxvla
-  bash scripts/install_env.sh real-only --profile cu128
-  PIP_INDEX_CANDIDATES="https://mirrors.aliyun.com/pypi/simple https://mirrors.cloud.tencent.com/pypi/simple https://repo.huaweicloud.com/repository/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.bfsu.edu.cn/pypi/web/simple https://pypi.org/simple" bash scripts/install_env.sh real-only
-  GH_PROXY_CANDIDATES="https://ghfast.top https://gh.llkk.cc https://gh-proxy.com" bash scripts/install_env.sh real-only
-  conda activate fluxvla_infer
-  bash scripts/install_env.sh real-only
+  bash scripts/install_env.sh train
+  bash scripts/install_env.sh inference
+  bash scripts/install_env.sh train --env-name fluxvla_train --profile cu124
+  bash scripts/install_env.sh inference --env-name fluxvla_infer --profile cu128
+  PIP_INDEX_MODE=official bash scripts/install_env.sh train
+  GH_PROXY_CANDIDATES="https://ghfast.top https://gh.llkk.cc https://gh-proxy.com" bash scripts/install_env.sh inference
 EOF
 }
 
@@ -235,17 +241,21 @@ while [[ $# -gt 0 ]]; do
       echo "Simulation support has been removed from this deployment branch." >&2
       exit 2
       ;;
-    real|real-only)
-      ENV_MODE="real-only"
+    train)
+      ENV_MODE="train"
+      shift
+      ;;
+    infer|inference|real|real-only)
+      ENV_MODE="inference"
       shift
       ;;
     full)
-      echo "The full profile included simulation support and is unavailable; use real-only." >&2
+      echo "The full profile included simulation support and is unavailable; use train or inference." >&2
       exit 2
       ;;
     --profile)
       if [[ $# -lt 2 ]]; then
-        echo "--profile requires the value cu128" >&2
+        echo "--profile requires the value cu124 or cu128" >&2
         exit 1
       fi
       PROFILE="${2:-}"
@@ -315,8 +325,60 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "${PROFILE}" != "cu128" ]]; then
-  echo "Only --profile cu128 is supported on this inference branch." >&2
+if [[ -z "${ENV_MODE}" ]]; then
+  while true; do
+    echo "请选择要安装的环境："
+    echo "  1) 训练环境（A100 / Python 3.10 / PyTorch 2.6 / CUDA 12.4）"
+    echo "  2) 推理环境（4090 / Python 3.12.13 / PyTorch 2.8 / CUDA 12.8）"
+    if ! read -r -p "请输入选项 [1/2]: " selection; then
+      echo "未读取到选择，请重新运行并选择 1 或 2。" >&2
+      exit 1
+    fi
+    case "${selection}" in
+      1|train)
+        ENV_MODE="train"
+        break
+        ;;
+      2|infer|inference)
+        ENV_MODE="inference"
+        break
+        ;;
+      *)
+        echo "无效选项：${selection}，请输入 1 或 2。" >&2
+        ;;
+    esac
+  done
+fi
+
+if [[ -z "${PROFILE}" ]]; then
+  if [[ "${ENV_MODE}" == "train" ]]; then
+    PROFILE="cu124"
+  else
+    PROFILE="cu128"
+  fi
+fi
+
+if [[ -z "${FLUXVLA_CONDA_ENV_NAME}" ]]; then
+  if [[ "${ENV_MODE}" == "train" ]]; then
+    FLUXVLA_CONDA_ENV_NAME="fluxvla_train"
+  else
+    FLUXVLA_CONDA_ENV_NAME="fluxvla_infer"
+  fi
+fi
+if [[ -z "${FLUXVLA_PYTHON_VERSION}" ]]; then
+  if [[ "${ENV_MODE}" == "train" ]]; then
+    FLUXVLA_PYTHON_VERSION="3.10"
+  else
+    FLUXVLA_PYTHON_VERSION="3.12.13"
+  fi
+fi
+
+if [[ "${PROFILE}" != "cu124" && "${PROFILE}" != "cu128" ]]; then
+  echo "--profile must be one of: cu124, cu128" >&2
+  exit 1
+fi
+if [[ "${ENV_MODE}" == "inference" && "${PROFILE}" != "cu128" ]]; then
+  echo "The inference environment requires --profile cu128." >&2
   exit 1
 fi
 
@@ -465,11 +527,21 @@ has_toolkit_cuda_at_least() {
 }
 
 profile_cuda_version() {
-  echo "12.8"
+  local selected="$1"
+  if [[ "${selected}" == "cu128" ]]; then
+    echo "12.8"
+  else
+    echo "12.4"
+  fi
 }
 
 profile_torch_version() {
-  echo "2.8"
+  local selected="$1"
+  if [[ "${selected}" == "cu128" ]]; then
+    echo "2.8"
+  else
+    echo "2.6"
+  fi
 }
 
 check_cuda_profile_compatibility() {
@@ -923,7 +995,7 @@ is_blackwell_gpu() {
 }
 
 resolve_profile() {
-  echo "cu128"
+  echo "${PROFILE}"
 }
 
 python_tag() {
@@ -1008,6 +1080,11 @@ find_conda_bin() {
 }
 
 ensure_pip() {
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "+ ensure pip for ${PYTHON_BIN}"
+    return
+  fi
+
   if "${PYTHON_BIN}" -m pip --version >/dev/null 2>&1; then
     return
   fi
@@ -1057,7 +1134,12 @@ ensure_pip() {
 }
 
 torch_tag_for_profile() {
-  echo "2.8"
+  local selected="$1"
+  if [[ "${selected}" == "cu128" ]]; then
+    echo "2.8"
+  else
+    echo "2.6"
+  fi
 }
 
 cuda_tag_for_profile() {
@@ -1334,10 +1416,17 @@ pip_install_direct() {
 }
 
 install_torch() {
+  local selected="$1"
   local torch_indexes
-  torch_indexes="${TORCH_INDEX_URLS:-https://download.pytorch.org/whl/cu128}"
-  pip_install_from_indexes "${torch_indexes}" \
-    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+  if [[ "${selected}" == "cu128" ]]; then
+    torch_indexes="${TORCH_INDEX_URLS:-https://download.pytorch.org/whl/cu128}"
+    pip_install_from_indexes "${torch_indexes}" \
+      torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+  else
+    torch_indexes="${TORCH_INDEX_URLS:-https://download.pytorch.org/whl/cu124}"
+    pip_install_from_indexes "${torch_indexes}" \
+      torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+  fi
 }
 
 verify_torch_install() {
@@ -1397,7 +1486,7 @@ if errors:
         + "\nFix:\n"
         + "       python -m pip uninstall -y torch torchvision torchaudio\n"
         + f"       bash scripts/install_env.sh <mode> --profile {selected}\n"
-        + "This branch requires the verified CUDA 12.8 environment."
+        + "Select the profile matching the target environment."
     )
 PY
 }
@@ -1445,9 +1534,14 @@ install_av_with_conda() {
 }
 
 install_requirements() {
-  pip_install_with_mirrors \
-    -r "${PROJECT_ROOT}/environment/pip-requirements.txt"
-  check_ros_python_runtime
+  if [[ "${ENV_MODE}" == "train" ]]; then
+    pip_install_with_mirrors \
+      -r "${PROJECT_ROOT}/environment/pip-requirements-train.txt"
+  else
+    pip_install_with_mirrors \
+      -r "${PROJECT_ROOT}/environment/pip-requirements.txt"
+    check_ros_python_runtime
+  fi
 }
 
 download_robocasa_assets() {
@@ -1523,18 +1617,18 @@ if missing:
         "Warning: missing ROS Python runtime package(s): "
         + ", ".join(missing)
     )
-    print("         Re-run `bash scripts/install_env.sh real-only` or install them with pip.")
+    print("         Re-run `bash scripts/install_env.sh inference` or install them with pip.")
 
-if importlib.util.find_spec("rospy") is None:
-    setup = "/opt/ros/noetic/setup.bash"
+if importlib.util.find_spec("rclpy") is None:
+    setup = "/opt/ros/jazzy/setup.bash"
     if os.path.exists(setup):
         print(
-            "Warning: rospy is not visible in this Python environment. "
+            "Warning: rclpy is not visible in this Python environment. "
             f"Run `source {setup}` before launching real-robot inference."
         )
     else:
         print(
-            "Warning: rospy is not installed or not visible. Install ROS Noetic "
+            "Warning: rclpy is not installed or not visible. Install ROS 2 Jazzy "
             "and source its setup.bash before real-robot inference."
         )
 PY
@@ -1744,6 +1838,13 @@ install_flash_attn() {
     return
   fi
 
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "+ select FlashAttention ${FLASH_ATTN_VERSION} wheel for ${PYTHON_BIN} and ${1}"
+    echo "+ ${PYTHON_BIN} -m pip install --no-deps <matching-wheel>"
+    echo "+ verify_flash_attn"
+    return
+  fi
+
   local selected="$1"
   local tag abi torch_tag cuda_tag detected_torch_tag detected_cuda_tag
   local torch_source cuda_source
@@ -1790,13 +1891,6 @@ install_flash_attn() {
   echo "  cuda tag: ${cuda_tag} (${cuda_source})"
   echo "  cxx11 ABI: ${abi}"
   echo "  platform: ${platform}"
-
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    echo "+ flash_attn_installed_matches || find_local_flash_attn_wheel ${wheel_name} || download_via_proxy ${wheel_url}"
-    echo "+ ${PYTHON_BIN} -m pip install --no-deps <cached_wheel>"
-    echo "+ verify_flash_attn"
-    return
-  fi
 
   if flash_attn_installed_matches; then
     verify_flash_attn
@@ -1891,11 +1985,16 @@ EOF
 
 ensure_conda_env() {
   if [[ -n "${CONDA_PREFIX:-}" && "${CONDA_PREFIX}" == */envs/* ]]; then
-    echo "Using already-activated conda env: ${CONDA_PREFIX}"
-    return
+    if [[ "$(basename "${CONDA_PREFIX}")" == "${FLUXVLA_CONDA_ENV_NAME}" ]]; then
+      echo "Using already-activated conda env: ${CONDA_PREFIX}"
+      PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+      return
+    fi
+    echo "Active conda env '${CONDA_PREFIX}' does not match ${ENV_MODE} target" >&2
+    echo "  '${FLUXVLA_CONDA_ENV_NAME}'; switching to the target environment." >&2
   fi
 
-  if [[ -n "${CONDA_PREFIX:-}" ]]; then
+  if [[ -n "${CONDA_PREFIX:-}" && "${CONDA_PREFIX}" != */envs/* ]]; then
     echo "Active conda env (${CONDA_PREFIX}) looks like the base environment;" >&2
     echo "  FluxVLA should not be installed into base. Creating/activating" >&2
     echo "  '${FLUXVLA_CONDA_ENV_NAME}' instead." >&2
@@ -1923,6 +2022,7 @@ ensure_conda_env() {
 
   if [[ "${DRY_RUN}" == "1" ]]; then
     echo "+ conda activate ${FLUXVLA_CONDA_ENV_NAME}"
+    PYTHON_BIN="${env_prefix}/bin/python"
     return
   fi
 
@@ -1956,6 +2056,8 @@ main() {
   PIP_INDEX_URLS="$(resolve_pip_index_urls)"
 
   echo "Environment mode: ${ENV_MODE}"
+  echo "Conda environment: ${FLUXVLA_CONDA_ENV_NAME}"
+  echo "Python version for new environment: ${FLUXVLA_PYTHON_VERSION}"
   echo "Detected GPUs: ${names:-unknown}"
   echo "Detected compute capabilities: ${caps:-unknown}"
   echo "Detected CUDA versions: ${cuda_versions:-unknown}"
@@ -1970,13 +2072,6 @@ main() {
   echo "pip index probe timeout: ${PIP_INDEX_PROBE_TIMEOUT}s"
   echo "conda command timeout: ${CONDA_INSTALL_TIMEOUT}s"
   echo "av installer: ${FLUXVLA_AV_INSTALLER}"
-  echo "RoboCasa source install: ${FLUXVLA_ROBOCASA_INSTALL}"
-  if needs_robocasa_sources; then
-    echo "RoboCasa asset download: ${FLUXVLA_ROBOCASA_ASSETS}"
-  else
-    echo "RoboCasa asset download: never (RoboCasa source checkout skipped)"
-  fi
-  echo "RoboCasa source root: ${FLUXVLA_ROBOCASA_SRC_ROOT}"
 
   ensure_build_tools
   ensure_pip
@@ -1990,12 +2085,14 @@ main() {
   install_flash_attn "${selected}"
   install_project
   verify_project_import
-  print_wandb_guidance
+  if [[ "${ENV_MODE}" == "train" ]]; then
+    print_wandb_guidance
+  fi
 
   if ! command -v nvidia-smi >/dev/null 2>&1 \
       && ! command -v nvcc >/dev/null 2>&1 \
       && [[ ! -f /usr/local/cuda/version.txt ]]; then
-    echo "Warning: no CUDA toolkit or nvidia-smi signal was found; cu128 cannot be verified."
+    echo "Warning: no CUDA toolkit or nvidia-smi signal was found; ${selected} cannot be verified."
   fi
 }
 

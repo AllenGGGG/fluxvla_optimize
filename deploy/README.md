@@ -82,7 +82,7 @@ validation, publication pauses immediately.
 ## Run
 
 新设备的 CUDA、Python、FluxVLA 扩展和 ROS 2 装机步骤统一维护在根目录
-[`README.md`](../README.md#新设备装机)。完成安装并 source ROS 2 与机器人工作区后，
+[`README.md`](../README.md#环境安装)。完成安装并 source ROS 2 与机器人工作区后，
 从项目根目录运行 `./deploy/launch.sh`。
 
 The launcher prompts for the robot control frequency and, when asynchronous RTC
@@ -91,7 +91,7 @@ editing the script through `PISTAR_ROBOT_HZ` and
 `PISTAR_RTC_EXECUTION_HORIZON`, for example:
 
 ```bash
-PISTAR_ROBOT_HZ=45 PISTAR_RTC_EXECUTION_HORIZON=15 ./launch.sh
+PISTAR_ROBOT_HZ=45 PISTAR_RTC_EXECUTION_HORIZON=15 ./deploy/launch.sh
 ```
 
 `PISTAR_RTC_EXECUTION_HORIZON` is ignored in serial execution and when RTC is
@@ -104,7 +104,7 @@ the Viewer or a visualization error does not stop inference or command safety
 checks. Recordings are not written to disk.
 
 The default task text is the parcel-sorting instruction used by the dataset.
-With `AUTO_START=true`, inference starts when all camera and joint inputs are
+With `PISTAR_AUTO_START=true`, inference starts when all camera and joint inputs are
 ready. Set it to `false` to require `/xr/controller_state=15`; use value `16`
 to pause.
 
