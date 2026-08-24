@@ -82,13 +82,15 @@ FLUXVLA_ROBOCASA_ASSET_CACHE="${FLUXVLA_ROBOCASA_ASSET_CACHE:-/tmp/robocasa-asse
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/install_env.sh [train|inference] [options]
+  bash scripts/install_env.sh [train|ppu|inference] [options]
 
 Run without a mode to select the environment interactively.
 
 Environment modes:
   train      Install the A100 training environment (Python 3.10,
              PyTorch 2.6.0 + CUDA 12.4 by default).
+  ppu        Install the PPU training environment through the dedicated
+             scripts/install_env_ppu.sh installer.
   inference  Install the 4090 real-robot inference environment (Python
              3.12.13, PyTorch 2.8.0 + CUDA 12.8).
 
@@ -97,12 +99,13 @@ Aliases:
 
 Options:
   --profile cu124|cu128        CUDA/PyTorch profile. train defaults to cu124;
-                              inference only supports cu128.
+                              inference only supports cu128. Not used by PPU.
   --env-name NAME             Conda env to create (if it doesn't exist yet)
                               and activate/install into. Defaults:
-                              fluxvla_train or fluxvla_infer by mode.
+                              fluxvla_train, fluxvla, or fluxvla_infer by mode.
   --python-version VERSION    Python version for a newly created env.
-                              Defaults: 3.10 for train, 3.12.13 for inference.
+                              Defaults: 3.10 for train, 3.12 for PPU, and
+                              3.12.13 for inference.
                               Ignored if the target env already exists.
   --dry-run                   Print commands without executing them.
   --skip-av                   Skip av installation.
@@ -196,6 +199,7 @@ Environment variables:
 
 Examples:
   bash scripts/install_env.sh train
+  bash scripts/install_env.sh ppu
   bash scripts/install_env.sh inference
   bash scripts/install_env.sh train --env-name fluxvla_train --profile cu124
   bash scripts/install_env.sh inference --env-name fluxvla_infer --profile cu128
@@ -245,12 +249,16 @@ while [[ $# -gt 0 ]]; do
       ENV_MODE="train"
       shift
       ;;
+    ppu)
+      ENV_MODE="ppu"
+      shift
+      ;;
     infer|inference|real|real-only)
       ENV_MODE="inference"
       shift
       ;;
     full)
-      echo "The full profile included simulation support and is unavailable; use train or inference." >&2
+      echo "The full profile included simulation support and is unavailable; use train, ppu, or inference." >&2
       exit 2
       ;;
     --profile)
@@ -330,8 +338,9 @@ if [[ -z "${ENV_MODE}" ]]; then
     echo "请选择要安装的环境："
     echo "  1) 训练环境（A100 / Python 3.10 / PyTorch 2.6 / CUDA 12.4）"
     echo "  2) 推理环境（4090 / Python 3.12.13 / PyTorch 2.8 / CUDA 12.8）"
-    if ! read -r -p "请输入选项 [1/2]: " selection; then
-      echo "未读取到选择，请重新运行并选择 1 或 2。" >&2
+    echo "  3) 训练环境（PPU / Python 3.12 / PPU PyTorch 2.8）"
+    if ! read -r -p "请输入选项 [1/2/3]: " selection; then
+      echo "未读取到选择，请重新运行并选择 1、2 或 3。" >&2
       exit 1
     fi
     case "${selection}" in
@@ -343,11 +352,40 @@ if [[ -z "${ENV_MODE}" ]]; then
         ENV_MODE="inference"
         break
         ;;
+      3|ppu)
+        ENV_MODE="ppu"
+        break
+        ;;
       *)
-        echo "无效选项：${selection}，请输入 1 或 2。" >&2
+        echo "无效选项：${selection}，请输入 1、2 或 3。" >&2
         ;;
     esac
   done
+fi
+
+if [[ "${ENV_MODE}" == "ppu" ]]; then
+  if [[ -n "${PROFILE}" ]]; then
+    echo "--profile is not used by the PPU installer." >&2
+    exit 1
+  fi
+  if [[ "${SKIP_AV}" == "1" ]]; then
+    echo "PyAV is required by PPU training and cannot be skipped." >&2
+    exit 1
+  fi
+  PPU_INSTALL_ARGS=()
+  if [[ -n "${FLUXVLA_CONDA_ENV_NAME}" ]]; then
+    PPU_INSTALL_ARGS+=(--env-name "${FLUXVLA_CONDA_ENV_NAME}")
+  fi
+  if [[ -n "${FLUXVLA_PYTHON_VERSION}" ]]; then
+    PPU_INSTALL_ARGS+=(--python-version "${FLUXVLA_PYTHON_VERSION}")
+  fi
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    PPU_INSTALL_ARGS+=(--dry-run)
+  fi
+  if [[ "${SKIP_PROJECT}" == "1" ]]; then
+    PPU_INSTALL_ARGS+=(--skip-project)
+  fi
+  exec bash "${SCRIPT_DIR}/install_env_ppu.sh" "${PPU_INSTALL_ARGS[@]}"
 fi
 
 if [[ -z "${PROFILE}" ]]; then
